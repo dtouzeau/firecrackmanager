@@ -1,0 +1,25 @@
+[Unit]
+Description=FireCrackManager - MicroVM Management Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/firecrackmanager
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/firecrackmanager /run
+PrivateTmp=true
+
+# Required for creating TAP devices and bridges
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL
+
+[Install]
+WantedBy=multi-user.target
