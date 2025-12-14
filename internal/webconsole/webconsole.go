@@ -83,6 +83,12 @@ func (wc *WebConsole) handleAssets(w http.ResponseWriter, r *http.Request) {
 	case "material-icons.ttf":
 		w.Header().Set("Content-Type", "font/ttf")
 		w.Write(assets.MaterialIconsTTF)
+	case "material-symbols-outlined.css":
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Write([]byte(assets.MaterialSymbolsCSS))
+	case "material-symbols-outlined.ttf":
+		w.Header().Set("Content-Type", "font/ttf")
+		w.Write(assets.MaterialSymbolsTTF)
 	case "apexcharts.min.js":
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Write([]byte(ApexChartsJS))
@@ -1610,6 +1616,9 @@ function clearSearch() {
     document.getElementById('vmFilterOS').value = '';
     isSearchActive = false;
     document.getElementById('searchResultInfo').style.display = 'none';
+    // Reset cache to force full re-render after search
+    vmDataCache = {};
+    vmListFirstLoad = true;
     loadVMs();
 }
 
@@ -1624,6 +1633,9 @@ async function applySearch() {
     if (!query && !status && !networkId && !vmGroupId && !os) {
         isSearchActive = false;
         document.getElementById('searchResultInfo').style.display = 'none';
+        // Reset cache to force full re-render after search
+        vmDataCache = {};
+        vmListFirstLoad = true;
         loadVMs();
         return;
     }
@@ -1667,7 +1679,7 @@ function renderVMList(vms) {
         return ` + "`" + `
         <tr>
             <td>
-                <span class="material-icons" style="font-size: 18px; color: ${statusColor}; vertical-align: middle; margin-right: 6px;">computer</span>
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 -960 960 960" style="vertical-align: middle; margin-right: 6px; fill: ${statusColor};"><path d="M280-332h260q37.8 0 63.9-26.61t26.1-64.5Q630-461 602.94-487T538-513h-9l-1-9q-7-48-43.26-79-36.27-31-84.62-31Q362-632 331-611.5 300-591 283-557l-3 5-6 1q-43.79 1.83-73.89 33.48Q170-485.88 170-441.86 170-396 202.08-364q32.09 32 77.92 32Zm0-60q-21.25 0-35.62-14.32Q230-420.65 230-441.82q0-21.18 14.38-35.68Q258.75-492 280-492h40q0-33.14 23.4-56.57T399.9-572q33.1 0 56.6 23.43T480-492v40h60q13 0 21.5 8.5T570-422q0 13-8.5 21.5T540-392H280Zm8 352v-60h62v-104H100q-24 0-42-18t-18-42v-436q0-24 18-42t42-18h600q24 0 42 18t18 42v436q0 24-18 42t-42 18H450v104h61v60H288Zm572-369v-451H204v-60h656q24 0 42 18t18 42v451h-60ZM100-264h600v-436H100v436Zm300-218Z"/></svg>
                 <a href="/vms/${vm.id}">${vm.name}</a>${osInfo}
                 ${vm.autorun ? '<span class="material-icons" style="font-size: 14px; color: var(--primary); vertical-align: middle; margin-left: 4px;" title="Autorun enabled">auto_mode</span>' : ''}
             </td>
@@ -1732,35 +1744,27 @@ async function loadSearchFilters() {
     }
 }
 
-async function loadVMs() {
-    // Skip refresh if search is active or action menu is open
-    if (isSearchActive || openMenuVmId !== null) {
-        return;
-    }
+// Cache for VM data to enable incremental updates (avoid table blink)
+let vmDataCache = {};
+let vmListFirstLoad = true;
 
-    const { ok, data } = await apiCall('/api/vms');
-    if (!ok) return;
-
-    const tbody = document.getElementById('vmList');
-    if (!data.vms || data.vms.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><span class="material-icons">memory</span><p>No virtual machines</p></td></tr>';
-        return;
-    }
-
-    tbody.innerHTML = data.vms.map(vm => ` + "`" + `
-        <tr>
+function createVMRow(vm) {
+    const statusColor = getStatusColor(vm.status);
+    return ` + "`" + `
+        <tr data-vm-id="${vm.id}">
             <td>
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 -960 960 960" style="vertical-align: middle; margin-right: 6px; fill: ${statusColor};" class="vm-status-icon"><path d="M280-332h260q37.8 0 63.9-26.61t26.1-64.5Q630-461 602.94-487T538-513h-9l-1-9q-7-48-43.26-79-36.27-31-84.62-31Q362-632 331-611.5 300-591 283-557l-3 5-6 1q-43.79 1.83-73.89 33.48Q170-485.88 170-441.86 170-396 202.08-364q32.09 32 77.92 32Zm0-60q-21.25 0-35.62-14.32Q230-420.65 230-441.82q0-21.18 14.38-35.68Q258.75-492 280-492h40q0-33.14 23.4-56.57T399.9-572q33.1 0 56.6 23.43T480-492v40h60q13 0 21.5 8.5T570-422q0 13-8.5 21.5T540-392H280Zm8 352v-60h62v-104H100q-24 0-42-18t-18-42v-436q0-24 18-42t42-18h600q24 0 42 18t18 42v436q0 24-18 42t-42 18H450v104h61v60H288Zm572-369v-451H204v-60h656q24 0 42 18t18 42v451h-60ZM100-264h600v-436H100v436Zm300-218Z"/></svg>
                 <a href="/vms/${vm.id}">${vm.name}</a>
                 ${vm.autorun ? '<span class="material-icons" style="font-size: 14px; color: var(--primary); vertical-align: middle; margin-left: 4px;" title="Autorun enabled">auto_mode</span>' : ''}
             </td>
-            <td>${vm.vcpu}</td>
-            <td>${vm.memory_mb} MB</td>
-            <td>
+            <td class="vm-vcpu">${vm.vcpu}</td>
+            <td class="vm-memory">${vm.memory_mb} MB</td>
+            <td class="vm-status-cell">
                 <span class="badge badge-${vm.status === 'running' ? 'success' : vm.status === 'error' ? 'danger' : 'warning'}">
                     ${vm.status}
                 </span>
             </td>
-            <td>${vm.ip_address || '-'}</td>
+            <td class="vm-ip">${vm.ip_address || '-'}</td>
             <td id="ping-${vm.id}">
                 ${vm.ip_address && vm.status === 'running'
                     ? '<span class="material-icons" style="color: var(--text-secondary); animation: spin 1s linear infinite;">sync</span>'
@@ -1818,7 +1822,136 @@ async function loadVMs() {
                 </div>
             </td>
         </tr>
-    ` + "`" + `).join('');
+    ` + "`" + `;
+}
+
+function updateVMRow(row, vm, oldVm) {
+    // Only update cells that changed to avoid blinking
+    const statusColor = getStatusColor(vm.status);
+
+    // Update status icon color if status changed
+    if (oldVm.status !== vm.status) {
+        const icon = row.querySelector('.vm-status-icon');
+        if (icon) icon.style.fill = statusColor;
+
+        // Update status badge
+        const statusCell = row.querySelector('.vm-status-cell');
+        if (statusCell) {
+            statusCell.innerHTML = ` + "`" + `<span class="badge badge-${vm.status === 'running' ? 'success' : vm.status === 'error' ? 'danger' : 'warning'}">${vm.status}</span>` + "`" + `;
+        }
+
+        // Update action buttons (start/stop)
+        const dropdown = row.querySelector('.action-dropdown');
+        if (dropdown) {
+            const firstBtn = dropdown.querySelector('.action-dropdown-item');
+            if (firstBtn) {
+                if (vm.status === 'running') {
+                    firstBtn.className = 'action-dropdown-item danger';
+                    firstBtn.innerHTML = '<span class="material-icons">stop</span> Stop VM';
+                    firstBtn.onclick = () => { stopVM(vm.id); closeAllMenus(); };
+                } else {
+                    firstBtn.className = 'action-dropdown-item success';
+                    firstBtn.innerHTML = '<span class="material-icons">play_arrow</span> Start VM';
+                    firstBtn.onclick = () => { startVM(vm.id); closeAllMenus(); };
+                }
+            }
+            // Update disabled states
+            dropdown.querySelectorAll('.action-dropdown-item').forEach(btn => {
+                const text = btn.textContent.trim();
+                if (text.includes('Console')) {
+                    btn.disabled = vm.status !== 'running';
+                } else if (text.includes('Edit') || text.includes('Change Password') || text.includes('Disks') || text.includes('Networks') || text.includes('Duplicate') || text.includes('Export') || text.includes('Delete')) {
+                    btn.disabled = vm.status === 'running';
+                } else if (text.includes('Snapshots')) {
+                    btn.disabled = vm.status !== 'running' || !vm.snapshot_type;
+                }
+            });
+        }
+    }
+
+    // Update IP address if changed
+    if (oldVm.ip_address !== vm.ip_address) {
+        const ipCell = row.querySelector('.vm-ip');
+        if (ipCell) ipCell.textContent = vm.ip_address || '-';
+    }
+
+    // Update vcpu if changed
+    if (oldVm.vcpu !== vm.vcpu) {
+        const vcpuCell = row.querySelector('.vm-vcpu');
+        if (vcpuCell) vcpuCell.textContent = vm.vcpu;
+    }
+
+    // Update memory if changed
+    if (oldVm.memory_mb !== vm.memory_mb) {
+        const memCell = row.querySelector('.vm-memory');
+        if (memCell) memCell.textContent = vm.memory_mb + ' MB';
+    }
+}
+
+async function loadVMs() {
+    // Skip refresh if search is active or action menu is open
+    if (isSearchActive || openMenuVmId !== null) {
+        return;
+    }
+
+    const { ok, data } = await apiCall('/api/vms');
+    if (!ok) return;
+
+    const tbody = document.getElementById('vmList');
+
+    // Handle empty state
+    if (!data.vms || data.vms.length === 0) {
+        if (Object.keys(vmDataCache).length > 0 || vmListFirstLoad) {
+            tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><span class="material-icons">memory</span><p>No virtual machines</p></td></tr>';
+            vmDataCache = {};
+            vmListFirstLoad = false;
+        }
+        return;
+    }
+
+    // Build new VM map
+    const newVMs = {};
+    data.vms.forEach(vm => { newVMs[vm.id] = vm; });
+
+    // First load or major change - render everything
+    if (vmListFirstLoad || Object.keys(vmDataCache).length === 0) {
+        tbody.innerHTML = data.vms.map(vm => createVMRow(vm)).join('');
+        vmDataCache = newVMs;
+        vmListFirstLoad = false;
+    } else {
+        // Incremental update
+        const currentIds = new Set(Object.keys(newVMs));
+        const cachedIds = new Set(Object.keys(vmDataCache));
+
+        // Remove deleted VMs
+        for (const id of cachedIds) {
+            if (!currentIds.has(id)) {
+                const row = tbody.querySelector(` + "`" + `tr[data-vm-id="${id}"]` + "`" + `);
+                if (row) row.remove();
+            }
+        }
+
+        // Add new VMs
+        for (const id of currentIds) {
+            if (!cachedIds.has(id)) {
+                const temp = document.createElement('tbody');
+                temp.innerHTML = createVMRow(newVMs[id]);
+                tbody.appendChild(temp.firstElementChild);
+            }
+        }
+
+        // Update existing VMs
+        for (const id of currentIds) {
+            if (cachedIds.has(id)) {
+                const row = tbody.querySelector(` + "`" + `tr[data-vm-id="${id}"]` + "`" + `);
+                if (row) {
+                    updateVMRow(row, newVMs[id], vmDataCache[id]);
+                }
+            }
+        }
+
+        vmDataCache = newVMs;
+    }
 
     // Check reachability for running VMs with IP addresses
     for (const vm of data.vms) {
@@ -8301,12 +8434,13 @@ func (wc *WebConsole) renderVMGroupsPage() string {
                     <th>Name</th>
                     <th>Description</th>
                     <th>VMs</th>
+                    <th>Autorun</th>
                     <th>Permissions</th>
                     <th>Actions</th>
                 </tr>
             </thead>
             <tbody id="vmGroupsTable">
-                <tr><td colspan="6">Loading...</td></tr>
+                <tr><td colspan="7">Loading...</td></tr>
             </tbody>
         </table>
     </div>
@@ -8331,6 +8465,13 @@ func (wc *WebConsole) renderVMGroupsPage() string {
             <div class="form-group">
                 <label>Color</label>
                 <input type="color" id="groupColor" value="#3498db">
+            </div>
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="groupAutorun">
+                    <span>Autorun</span>
+                </label>
+                <small style="color: var(--text-secondary); display: block; margin-top: 4px;">All VMs in this group will start automatically when FireCrackManager starts</small>
             </div>
             <div class="form-actions">
                 <button type="button" class="btn btn-secondary" onclick="closeModal('createGroupModal')">Cancel</button>
@@ -8366,6 +8507,13 @@ func (wc *WebConsole) renderVMGroupsPage() string {
                 <div class="form-group">
                     <label>Color</label>
                     <input type="color" id="editGroupColor">
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="editGroupAutorun">
+                        <span>Autorun</span>
+                    </label>
+                    <small style="color: var(--text-secondary); display: block; margin-top: 4px;">All VMs in this group will start automatically when FireCrackManager starts</small>
                 </div>
                 <div class="form-actions">
                     <button type="button" class="btn btn-danger" onclick="deleteVMGroup()">Delete Group</button>
@@ -8429,6 +8577,12 @@ func (wc *WebConsole) renderVMGroupsPage() string {
 .inline-form select { flex: 1; }
 .color-badge { width: 20px; height: 20px; border-radius: 4px; display: inline-block; }
 .search-box input { padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px; width: 200px; }
+.checkbox-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.checkbox-label input { width: 18px; height: 18px; cursor: pointer; }
+.autorun-toggle { cursor: pointer; }
+.autorun-toggle .material-icons { font-size: 20px; }
+.autorun-toggle.active { color: var(--success); }
+.autorun-toggle:not(.active) { color: var(--text-secondary); }
 </style>
 
 <script>
@@ -8454,7 +8608,7 @@ function renderVMGroups() {
 
     const tbody = document.getElementById('vmGroupsTable');
     if (filtered.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6">No VM groups found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7">No VM groups found</td></tr>';
         return;
     }
 
@@ -8464,6 +8618,11 @@ function renderVMGroups() {
             <td>${g.name}</td>
             <td>${g.description || '-'}</td>
             <td>${g.vm_count || 0}</td>
+            <td>
+                <span class="autorun-toggle ${g.autorun ? 'active' : ''}" onclick="toggleAutorun('${g.id}', ${!g.autorun})" title="${g.autorun ? 'Autorun enabled - click to disable' : 'Autorun disabled - click to enable'}">
+                    <span class="material-icons">${g.autorun ? 'play_circle' : 'play_circle_outline'}</span>
+                </span>
+            </td>
             <td>${g.permission_count || 0}</td>
             <td>
                 <button class="btn btn-sm" onclick="editVMGroup('${g.id}')">
@@ -8483,7 +8642,8 @@ async function createVMGroup(e) {
     const { ok, data } = await apiCall('/api/vmgroups', 'POST', {
         name: document.getElementById('groupName').value,
         description: document.getElementById('groupDescription').value,
-        color: document.getElementById('groupColor').value
+        color: document.getElementById('groupColor').value,
+        autorun: document.getElementById('groupAutorun').checked
     });
 
     if (ok) {
@@ -8509,6 +8669,7 @@ async function editVMGroup(id) {
     document.getElementById('editGroupName').value = data.name;
     document.getElementById('editGroupDescription').value = data.description || '';
     document.getElementById('editGroupColor').value = data.color || '#3498db';
+    document.getElementById('editGroupAutorun').checked = data.autorun || false;
 
     // Load VMs and permissions
     loadAllVMs();
@@ -8533,7 +8694,8 @@ async function updateVMGroup(e) {
     const { ok, data } = await apiCall('/api/vmgroups/' + id, 'PUT', {
         name: document.getElementById('editGroupName').value,
         description: document.getElementById('editGroupDescription').value,
-        color: document.getElementById('editGroupColor').value
+        color: document.getElementById('editGroupColor').value,
+        autorun: document.getElementById('editGroupAutorun').checked
     });
 
     if (ok) {
@@ -8663,6 +8825,25 @@ async function removePermission(groupId) {
         loadVMGroups();
     } else {
         alert(data.error || 'Failed to remove permission');
+    }
+}
+
+async function toggleAutorun(groupId, enable) {
+    // Get current group data first
+    const groupData = vmGroups.find(g => g.id === groupId);
+    if (!groupData) return;
+
+    const { ok, data } = await apiCall('/api/vmgroups/' + groupId, 'PUT', {
+        name: groupData.name,
+        description: groupData.description || '',
+        color: groupData.color || '#3498db',
+        autorun: enable
+    });
+
+    if (ok) {
+        loadVMGroups();
+    } else {
+        alert(data.error || 'Failed to toggle autorun');
     }
 }
 

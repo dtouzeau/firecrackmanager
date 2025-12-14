@@ -2177,6 +2177,7 @@ func (s *Server) handleVMGroups(w http.ResponseWriter, r *http.Request) {
 			Name        string `json:"name"`
 			Description string `json:"description"`
 			Color       string `json:"color"`
+			Autorun     bool   `json:"autorun"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			s.jsonError(w, "Invalid request", http.StatusBadRequest)
@@ -2197,6 +2198,7 @@ func (s *Server) handleVMGroups(w http.ResponseWriter, r *http.Request) {
 			Name:        req.Name,
 			Description: req.Description,
 			Color:       req.Color,
+			Autorun:     req.Autorun,
 		}
 
 		if err := s.db.CreateVMGroup(group); err != nil {
@@ -2383,6 +2385,7 @@ func (s *Server) handleVMGroup(w http.ResponseWriter, r *http.Request) {
 				Name        string `json:"name"`
 				Description string `json:"description"`
 				Color       string `json:"color"`
+				Autorun     *bool  `json:"autorun"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				s.jsonError(w, "Invalid request", http.StatusBadRequest)
@@ -2397,6 +2400,9 @@ func (s *Server) handleVMGroup(w http.ResponseWriter, r *http.Request) {
 			}
 			if req.Color != "" {
 				group.Color = req.Color
+			}
+			if req.Autorun != nil {
+				group.Autorun = *req.Autorun
 			}
 
 			if err := s.db.UpdateVMGroup(group); err != nil {

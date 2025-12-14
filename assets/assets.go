@@ -16,6 +16,9 @@ var XtermAddonFitJS []byte
 //go:embed material-icons.ttf
 var MaterialIconsTTF []byte
 
+//go:embed material-symbols-outlined.ttf
+var MaterialSymbolsTTF []byte
+
 // MaterialIconsCSS returns the CSS for Material Icons with embedded font
 // The font is served at /assets/material-icons.ttf
 var MaterialIconsCSS = `@font-face {
@@ -39,4 +42,32 @@ var MaterialIconsCSS = `@font-face {
   direction: ltr;
   -webkit-font-feature-settings: 'liga';
   -webkit-font-smoothing: antialiased;
+}`
+
+// MaterialSymbolsCSS returns the CSS for Material Symbols Outlined with embedded font
+// The font is served at /assets/material-symbols-outlined.ttf
+var MaterialSymbolsCSS = `@font-face {
+  font-family: 'Material Symbols Outlined';
+  font-style: normal;
+  font-weight: 400;
+  src: url(/assets/material-symbols-outlined.ttf) format('truetype');
+}
+
+.material-symbols-outlined {
+  font-family: 'Material Symbols Outlined';
+  font-weight: normal;
+  font-style: normal;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  font-feature-settings: 'liga';
+  -webkit-font-feature-settings: 'liga';
+  -moz-font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }`

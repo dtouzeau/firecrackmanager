@@ -836,6 +836,41 @@ th {
     transform: scale(1) translateY(0);
     opacity: 1;
 }
+.modal-content form {
+    padding-left: 10px;
+    padding-right: 10px;
+}
+.form-actions {
+    text-align: right;
+    margin-top: 10px;
+    border-top: 1px solid #CCCCCC;
+    padding-top: 5px;
+}
+table.data-table {
+    margin-left: 10px;
+    width: 97%%;
+}
+.page-header {
+    margin-bottom: 5px;
+}
+.card-body p {
+    font-size: 14px;
+}
+tbody a {
+    color: #464646;
+    text-decoration: none;
+}
+tbody a:visited {
+    color: #464646;
+}
+tbody a:hover {
+    font-weight: 700;
+    color: black;
+    text-decoration: none;
+}
+td.actions {
+    vertical-align: middle;
+}
 .modal-header {
     padding: 7px 8px 8px;
     background: linear-gradient(135deg, var(--primary) 0%%,var(--primary-dark) 100%%);

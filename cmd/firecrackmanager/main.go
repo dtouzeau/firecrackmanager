@@ -137,7 +137,7 @@ func main() {
 		logger("Warning: failed to sync VM status: %v", err)
 	}
 
-	// Start autorun VMs
+	// Start autorun VMs (individual VMs with autorun flag)
 	autorunVMs, err := db.ListAutorunVMs()
 	if err != nil {
 		logger("Warning: failed to list autorun VMs: %v", err)
@@ -151,6 +151,40 @@ func main() {
 					db.AddVMLog(vmObj.ID, "error", "Autorun failed: "+err.Error())
 				} else {
 					db.AddVMLog(vmObj.ID, "info", "VM started by autorun")
+				}
+			}
+		}
+	}
+
+	// Start VMs from autorun groups
+	autorunGroups, err := db.ListAutorunVMGroups()
+	if err != nil {
+		logger("Warning: failed to list autorun VM groups: %v", err)
+	} else if len(autorunGroups) > 0 {
+		logger("Processing %d autorun VM group(s)...", len(autorunGroups))
+		startedVMs := make(map[string]bool) // Track already started VMs to avoid duplicates
+		for _, group := range autorunGroups {
+			groupVMs, err := db.GetVMsInGroup(group.ID)
+			if err != nil {
+				logger("  Warning: failed to get VMs in group %s: %v", group.Name, err)
+				continue
+			}
+			if len(groupVMs) == 0 {
+				continue
+			}
+			logger("  Starting %d VM(s) from group '%s'...", len(groupVMs), group.Name)
+			for _, vmObj := range groupVMs {
+				// Skip if already started (either by individual autorun or another group)
+				if startedVMs[vmObj.ID] || vmObj.Status == "running" {
+					continue
+				}
+				logger("    Starting VM: %s (%s)", vmObj.Name, vmObj.ID)
+				if err := vmMgr.StartVM(vmObj.ID); err != nil {
+					logger("    Warning: failed to start VM %s: %v", vmObj.Name, err)
+					db.AddVMLog(vmObj.ID, "error", "Group autorun failed: "+err.Error())
+				} else {
+					db.AddVMLog(vmObj.ID, "info", "VM started by group autorun ("+group.Name+")")
+					startedVMs[vmObj.ID] = true
 				}
 			}
 		}

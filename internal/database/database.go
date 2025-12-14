@@ -188,7 +188,8 @@ type VMGroup struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
 	Description string    `json:"description"`
-	Color       string    `json:"color"` // Hex color for UI display
+	Color       string    `json:"color"`   // Hex color for UI display
+	Autorun     bool      `json:"autorun"` // Auto-start all VMs in this group on startup
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
@@ -500,6 +501,8 @@ func (d *DB) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_vm_group_permissions_vm_group_id ON vm_group_permissions(vm_group_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_vm_group_permissions_group_id ON vm_group_permissions(group_id)`,
+		// VM Groups autorun column
+		`ALTER TABLE vm_groups ADD COLUMN autorun BOOLEAN DEFAULT 0`,
 		// Compressed metrics tables for efficient storage
 		// 10-minute averages for day view
 		`CREATE TABLE IF NOT EXISTS vm_metrics_10min (
@@ -2482,9 +2485,9 @@ func (d *DB) CreateVMGroup(group *VMGroup) error {
 	defer d.mu.Unlock()
 
 	_, err := d.db.Exec(`
-		INSERT INTO vm_groups (id, name, description, color)
-		VALUES (?, ?, ?, ?)`,
-		group.ID, group.Name, group.Description, group.Color)
+		INSERT INTO vm_groups (id, name, description, color, autorun)
+		VALUES (?, ?, ?, ?, ?)`,
+		group.ID, group.Name, group.Description, group.Color, group.Autorun)
 	return err
 }
 
@@ -2495,9 +2498,9 @@ func (d *DB) GetVMGroup(id string) (*VMGroup, error) {
 
 	group := &VMGroup{}
 	err := d.db.QueryRow(`
-		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), created_at, updated_at
+		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), COALESCE(autorun, 0), created_at, updated_at
 		FROM vm_groups WHERE id = ?`, id).Scan(
-		&group.ID, &group.Name, &group.Description, &group.Color, &group.CreatedAt, &group.UpdatedAt)
+		&group.ID, &group.Name, &group.Description, &group.Color, &group.Autorun, &group.CreatedAt, &group.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -2511,9 +2514,9 @@ func (d *DB) GetVMGroupByName(name string) (*VMGroup, error) {
 
 	group := &VMGroup{}
 	err := d.db.QueryRow(`
-		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), created_at, updated_at
+		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), COALESCE(autorun, 0), created_at, updated_at
 		FROM vm_groups WHERE name = ?`, name).Scan(
-		&group.ID, &group.Name, &group.Description, &group.Color, &group.CreatedAt, &group.UpdatedAt)
+		&group.ID, &group.Name, &group.Description, &group.Color, &group.Autorun, &group.CreatedAt, &group.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -2526,7 +2529,7 @@ func (d *DB) ListVMGroups() ([]*VMGroup, error) {
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), created_at, updated_at
+		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), COALESCE(autorun, 0), created_at, updated_at
 		FROM vm_groups ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
@@ -2536,7 +2539,7 @@ func (d *DB) ListVMGroups() ([]*VMGroup, error) {
 	var groups []*VMGroup
 	for rows.Next() {
 		group := &VMGroup{}
-		if err := rows.Scan(&group.ID, &group.Name, &group.Description, &group.Color, &group.CreatedAt, &group.UpdatedAt); err != nil {
+		if err := rows.Scan(&group.ID, &group.Name, &group.Description, &group.Color, &group.Autorun, &group.CreatedAt, &group.UpdatedAt); err != nil {
 			return nil, err
 		}
 		groups = append(groups, group)
@@ -2550,8 +2553,8 @@ func (d *DB) UpdateVMGroup(group *VMGroup) error {
 	defer d.mu.Unlock()
 
 	_, err := d.db.Exec(`
-		UPDATE vm_groups SET name=?, description=?, color=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		group.Name, group.Description, group.Color, group.ID)
+		UPDATE vm_groups SET name=?, description=?, color=?, autorun=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		group.Name, group.Description, group.Color, group.Autorun, group.ID)
 	return err
 }
 
@@ -2590,7 +2593,7 @@ func (d *DB) GetVMGroups(vmID string) ([]*VMGroup, error) {
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT g.id, g.name, COALESCE(g.description, ''), COALESCE(g.color, '#6366f1'), g.created_at, g.updated_at
+		SELECT g.id, g.name, COALESCE(g.description, ''), COALESCE(g.color, '#6366f1'), COALESCE(g.autorun, 0), g.created_at, g.updated_at
 		FROM vm_groups g
 		INNER JOIN vm_group_members m ON g.id = m.vm_group_id
 		WHERE m.vm_id = ?
@@ -2603,7 +2606,31 @@ func (d *DB) GetVMGroups(vmID string) ([]*VMGroup, error) {
 	var groups []*VMGroup
 	for rows.Next() {
 		group := &VMGroup{}
-		if err := rows.Scan(&group.ID, &group.Name, &group.Description, &group.Color, &group.CreatedAt, &group.UpdatedAt); err != nil {
+		if err := rows.Scan(&group.ID, &group.Name, &group.Description, &group.Color, &group.Autorun, &group.CreatedAt, &group.UpdatedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+
+// ListAutorunVMGroups returns all VM groups with autorun enabled
+func (d *DB) ListAutorunVMGroups() ([]*VMGroup, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), COALESCE(autorun, 0), created_at, updated_at
+		FROM vm_groups WHERE autorun = 1 ORDER BY name ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []*VMGroup
+	for rows.Next() {
+		group := &VMGroup{}
+		if err := rows.Scan(&group.ID, &group.Name, &group.Description, &group.Color, &group.Autorun, &group.CreatedAt, &group.UpdatedAt); err != nil {
 			return nil, err
 		}
 		groups = append(groups, group)
