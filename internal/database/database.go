@@ -40,15 +40,37 @@ type VM struct {
 }
 
 type Network struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	BridgeName    string    `json:"bridge_name"`
+	Subnet        string    `json:"subnet"`     // e.g., "192.168.100.0/24"
+	Gateway       string    `json:"gateway"`    // e.g., "192.168.100.1"
+	DHCPStart     string    `json:"dhcp_start"` // e.g., "192.168.100.10"
+	DHCPEnd       string    `json:"dhcp_end"`   // e.g., "192.168.100.254"
+	EnableNAT     bool      `json:"enable_nat"`
+	OutInterface  string    `json:"out_interface"`  // External interface for NAT (e.g., "eth0")
+	MTU           int       `json:"mtu"`            // Bridge MTU (default 1500)
+	STP           bool      `json:"stp"`            // Spanning Tree Protocol enabled
+	BlockExternal bool      `json:"block_external"` // Block all external access by default
+	Status        string    `json:"status"`         // active, inactive
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// FirewallRule represents a firewall rule for network access control
+type FirewallRule struct {
 	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	BridgeName  string    `json:"bridge_name"`
-	Subnet      string    `json:"subnet"`      // e.g., "192.168.100.0/24"
-	Gateway     string    `json:"gateway"`     // e.g., "192.168.100.1"
-	DHCPStart   string    `json:"dhcp_start"`  // e.g., "192.168.100.10"
-	DHCPEnd     string    `json:"dhcp_end"`    // e.g., "192.168.100.254"
-	EnableNAT   bool      `json:"enable_nat"`
-	Status      string    `json:"status"` // active, inactive
+	NetworkID   string    `json:"network_id"`
+	RuleType    string    `json:"rule_type"` // source_ip, port_forward, port_allow
+	SourceIP    string    `json:"source_ip"` // Source IP/CIDR for source_ip rules
+	DestIP      string    `json:"dest_ip"`   // Destination VM IP for port_forward
+	HostPort    int       `json:"host_port"` // External port for port_forward
+	DestPort    int       `json:"dest_port"` // Destination port
+	Protocol    string    `json:"protocol"`  // tcp, udp, all
+	Action      string    `json:"action"`    // allow, forward
+	Description string    `json:"description"`
+	Enabled     bool      `json:"enabled"`
+	Priority    int       `json:"priority"` // Lower = higher priority
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
@@ -66,14 +88,18 @@ type KernelImage struct {
 }
 
 type RootFS struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Path         string    `json:"path"`
-	Size         int64     `json:"size"`
-	Format       string    `json:"format"` // ext4, squashfs
-	BaseImage    string    `json:"base_image"`
-	Checksum     string    `json:"checksum"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Path       string    `json:"path"`
+	Size       int64     `json:"size"`
+	Format     string    `json:"format"` // ext4, squashfs
+	BaseImage  string    `json:"base_image"`
+	Checksum   string    `json:"checksum"`
+	DiskType   string    `json:"disk_type"`   // system, data, unknown
+	InitSystem string    `json:"init_system"` // systemd, openrc, sysvinit, busybox, minimal
+	OSRelease  string    `json:"os_release"`  // OS name from /etc/os-release
+	ScannedAt  time.Time `json:"scanned_at"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 type User struct {
@@ -117,6 +143,18 @@ type VMDisk struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// VMNetwork represents a network interface attached to a VM
+type VMNetwork struct {
+	ID         string    `json:"id"`
+	VMID       string    `json:"vm_id"`
+	NetworkID  string    `json:"network_id"`
+	IfaceIndex int       `json:"iface_index"` // 0=eth0, 1=eth1, etc.
+	MacAddress string    `json:"mac_address"`
+	IPAddress  string    `json:"ip_address"`
+	TapDevice  string    `json:"tap_device"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 // Group represents a privilege group that can access specific VMs
 type Group struct {
 	ID          string    `json:"id"`
@@ -143,6 +181,69 @@ type GroupVM struct {
 	VMID      string    `json:"vm_id"`
 	VMName    string    `json:"vm_name"` // For display purposes
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// VMGroup represents a logical grouping of VMs (e.g., "Production", "Development")
+type VMGroup struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	Color       string    `json:"color"` // Hex color for UI display
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// VMGroupMember links VMs to VM groups
+type VMGroupMember struct {
+	ID        int       `json:"id"`
+	VMGroupID string    `json:"vm_group_id"`
+	VMID      string    `json:"vm_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// VMGroupPermission links user Groups to VM Groups (access control)
+type VMGroupPermission struct {
+	ID          int       `json:"id"`
+	VMGroupID   string    `json:"vm_group_id"`
+	GroupID     string    `json:"group_id"`    // User privilege group
+	Permissions string    `json:"permissions"` // Override permissions: start,stop,console,edit,snapshot,disk (empty = inherit from group)
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// VMSearchParams contains parameters for searching VMs
+type VMSearchParams struct {
+	Query     string `json:"query"`       // General search term
+	Name      string `json:"name"`        // Filter by VM name
+	IPAddress string `json:"ip_address"`  // Filter by IP
+	OS        string `json:"os"`          // Filter by OS (from rootfs os_release)
+	Status    string `json:"status"`      // running, stopped, etc.
+	NetworkID string `json:"network_id"`  // Filter by network
+	RootFSID  string `json:"rootfs_id"`   // Filter by rootfs image
+	KernelID  string `json:"kernel_id"`   // Filter by kernel
+	VMGroupID string `json:"vm_group_id"` // Filter by VM group
+	GroupID   string `json:"group_id"`    // Filter by user group access
+}
+
+// VMMetric stores historical metrics for VMs
+type VMMetric struct {
+	ID         int64     `json:"id"`
+	VMID       string    `json:"vm_id"`
+	CPUPercent float64   `json:"cpu_percent"`
+	MemPercent float64   `json:"mem_percent"`
+	MemUsedMB  int64     `json:"mem_used_mb"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// MigrationKey represents an authentication key for VM migration
+type MigrationKey struct {
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	KeyHash     string     `json:"key_hash"` // SHA-256 hash of the actual key
+	Description string     `json:"description"`
+	AllowPush   bool       `json:"allow_push"` // Allow receiving VMs
+	AllowPull   bool       `json:"allow_pull"` // Allow sending VMs
+	CreatedAt   time.Time  `json:"created_at"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
 }
 
 func New(dbPath string) (*DB, error) {
@@ -220,6 +321,10 @@ func (d *DB) migrate() error {
 			format TEXT NOT NULL DEFAULT 'ext4',
 			base_image TEXT,
 			checksum TEXT,
+			disk_type TEXT DEFAULT '',
+			init_system TEXT DEFAULT '',
+			os_release TEXT DEFAULT '',
+			scanned_at DATETIME,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS users (
@@ -308,6 +413,152 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_group_vms_group_id ON group_vms(group_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_group_vms_vm_id ON group_vms(vm_id)`,
+		// Migration: Add disk scanning columns to rootfs table
+		`ALTER TABLE rootfs ADD COLUMN disk_type TEXT DEFAULT ''`,
+		`ALTER TABLE rootfs ADD COLUMN init_system TEXT DEFAULT ''`,
+		`ALTER TABLE rootfs ADD COLUMN os_release TEXT DEFAULT ''`,
+		`ALTER TABLE rootfs ADD COLUMN scanned_at DATETIME`,
+		// VM metrics table for historical statistics
+		`CREATE TABLE IF NOT EXISTS vm_metrics (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vm_id TEXT NOT NULL,
+			cpu_percent REAL DEFAULT 0,
+			mem_percent REAL DEFAULT 0,
+			mem_used_mb INTEGER DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_metrics_vm_id ON vm_metrics(vm_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_metrics_created_at ON vm_metrics(created_at)`,
+		// Migration keys table for VM migration authentication
+		`CREATE TABLE IF NOT EXISTS migration_keys (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			key_hash TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			allow_push BOOLEAN DEFAULT 1,
+			allow_pull BOOLEAN DEFAULT 1,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			last_used_at DATETIME
+		)`,
+		// Migration: Add bridge management columns to networks table
+		`ALTER TABLE networks ADD COLUMN out_interface TEXT DEFAULT ''`,
+		`ALTER TABLE networks ADD COLUMN mtu INTEGER DEFAULT 1500`,
+		`ALTER TABLE networks ADD COLUMN stp BOOLEAN DEFAULT 0`,
+		`ALTER TABLE networks ADD COLUMN block_external BOOLEAN DEFAULT 0`,
+		// Firewall rules table for network access control
+		`CREATE TABLE IF NOT EXISTS firewall_rules (
+			id TEXT PRIMARY KEY,
+			network_id TEXT NOT NULL,
+			rule_type TEXT NOT NULL,
+			source_ip TEXT DEFAULT '',
+			dest_ip TEXT DEFAULT '',
+			host_port INTEGER DEFAULT 0,
+			dest_port INTEGER DEFAULT 0,
+			protocol TEXT DEFAULT 'tcp',
+			action TEXT DEFAULT 'allow',
+			description TEXT DEFAULT '',
+			enabled BOOLEAN DEFAULT 1,
+			priority INTEGER DEFAULT 100,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_firewall_rules_network_id ON firewall_rules(network_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_firewall_rules_enabled ON firewall_rules(enabled)`,
+		// VM Groups table for logical grouping of VMs
+		`CREATE TABLE IF NOT EXISTS vm_groups (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			description TEXT DEFAULT '',
+			color TEXT DEFAULT '#6366f1',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		// VM Group members - links VMs to VM groups
+		`CREATE TABLE IF NOT EXISTS vm_group_members (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vm_group_id TEXT NOT NULL,
+			vm_id TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (vm_group_id) REFERENCES vm_groups(id) ON DELETE CASCADE,
+			FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE CASCADE,
+			UNIQUE(vm_group_id, vm_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_group_members_vm_group_id ON vm_group_members(vm_group_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_group_members_vm_id ON vm_group_members(vm_id)`,
+		// VM Group permissions - links user Groups to VM Groups
+		`CREATE TABLE IF NOT EXISTS vm_group_permissions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vm_group_id TEXT NOT NULL,
+			group_id TEXT NOT NULL,
+			permissions TEXT DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (vm_group_id) REFERENCES vm_groups(id) ON DELETE CASCADE,
+			FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+			UNIQUE(vm_group_id, group_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_group_permissions_vm_group_id ON vm_group_permissions(vm_group_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_group_permissions_group_id ON vm_group_permissions(group_id)`,
+		// Compressed metrics tables for efficient storage
+		// 10-minute averages for day view
+		`CREATE TABLE IF NOT EXISTS vm_metrics_10min (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vm_id TEXT NOT NULL,
+			cpu_percent REAL DEFAULT 0,
+			mem_percent REAL DEFAULT 0,
+			mem_used_mb INTEGER DEFAULT 0,
+			period_start DATETIME NOT NULL,
+			sample_count INTEGER DEFAULT 1,
+			FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_metrics_10min_vm_id ON vm_metrics_10min(vm_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_metrics_10min_period ON vm_metrics_10min(period_start)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_metrics_10min_unique ON vm_metrics_10min(vm_id, period_start)`,
+		// Hourly averages for week view
+		`CREATE TABLE IF NOT EXISTS vm_metrics_hourly (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vm_id TEXT NOT NULL,
+			cpu_percent REAL DEFAULT 0,
+			mem_percent REAL DEFAULT 0,
+			mem_used_mb INTEGER DEFAULT 0,
+			period_start DATETIME NOT NULL,
+			sample_count INTEGER DEFAULT 1,
+			FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_metrics_hourly_vm_id ON vm_metrics_hourly(vm_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_metrics_hourly_period ON vm_metrics_hourly(period_start)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_metrics_hourly_unique ON vm_metrics_hourly(vm_id, period_start)`,
+		// 14-hour averages for month view
+		`CREATE TABLE IF NOT EXISTS vm_metrics_daily (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vm_id TEXT NOT NULL,
+			cpu_percent REAL DEFAULT 0,
+			mem_percent REAL DEFAULT 0,
+			mem_used_mb INTEGER DEFAULT 0,
+			period_start DATETIME NOT NULL,
+			sample_count INTEGER DEFAULT 1,
+			FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_metrics_daily_vm_id ON vm_metrics_daily(vm_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_metrics_daily_period ON vm_metrics_daily(period_start)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_metrics_daily_unique ON vm_metrics_daily(vm_id, period_start)`,
+		// VM Networks table for multiple network interfaces per VM
+		`CREATE TABLE IF NOT EXISTS vm_networks (
+			id TEXT PRIMARY KEY,
+			vm_id TEXT NOT NULL,
+			network_id TEXT NOT NULL,
+			iface_index INTEGER NOT NULL DEFAULT 0,
+			mac_address TEXT NOT NULL,
+			ip_address TEXT,
+			tap_device TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE CASCADE,
+			FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE,
+			UNIQUE(vm_id, iface_index)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_networks_vm_id ON vm_networks(vm_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_vm_networks_network_id ON vm_networks(network_id)`,
 	}
 
 	for _, migration := range migrations {
@@ -472,10 +723,13 @@ func (d *DB) CreateNetwork(net *Network) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if net.MTU == 0 {
+		net.MTU = 1500
+	}
 	_, err := d.db.Exec(`
-		INSERT INTO networks (id, name, bridge_name, subnet, gateway, dhcp_start, dhcp_end, enable_nat, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		net.ID, net.Name, net.BridgeName, net.Subnet, net.Gateway, net.DHCPStart, net.DHCPEnd, net.EnableNAT, net.Status)
+		INSERT INTO networks (id, name, bridge_name, subnet, gateway, dhcp_start, dhcp_end, enable_nat, out_interface, mtu, stp, block_external, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		net.ID, net.Name, net.BridgeName, net.Subnet, net.Gateway, net.DHCPStart, net.DHCPEnd, net.EnableNAT, net.OutInterface, net.MTU, net.STP, net.BlockExternal, net.Status)
 	return err
 }
 
@@ -486,10 +740,12 @@ func (d *DB) GetNetwork(id string) (*Network, error) {
 	net := &Network{}
 	err := d.db.QueryRow(`
 		SELECT id, name, bridge_name, subnet, gateway, COALESCE(dhcp_start, ''),
-			COALESCE(dhcp_end, ''), enable_nat, status, created_at, updated_at
+			COALESCE(dhcp_end, ''), enable_nat, COALESCE(out_interface, ''), COALESCE(mtu, 1500),
+			COALESCE(stp, 0), COALESCE(block_external, 0), status, created_at, updated_at
 		FROM networks WHERE id = ?`, id).Scan(
 		&net.ID, &net.Name, &net.BridgeName, &net.Subnet, &net.Gateway,
-		&net.DHCPStart, &net.DHCPEnd, &net.EnableNAT, &net.Status, &net.CreatedAt, &net.UpdatedAt)
+		&net.DHCPStart, &net.DHCPEnd, &net.EnableNAT, &net.OutInterface, &net.MTU,
+		&net.STP, &net.BlockExternal, &net.Status, &net.CreatedAt, &net.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -503,10 +759,12 @@ func (d *DB) GetNetworkByName(name string) (*Network, error) {
 	net := &Network{}
 	err := d.db.QueryRow(`
 		SELECT id, name, bridge_name, subnet, gateway, COALESCE(dhcp_start, ''),
-			COALESCE(dhcp_end, ''), enable_nat, status, created_at, updated_at
+			COALESCE(dhcp_end, ''), enable_nat, COALESCE(out_interface, ''), COALESCE(mtu, 1500),
+			COALESCE(stp, 0), COALESCE(block_external, 0), status, created_at, updated_at
 		FROM networks WHERE name = ?`, name).Scan(
 		&net.ID, &net.Name, &net.BridgeName, &net.Subnet, &net.Gateway,
-		&net.DHCPStart, &net.DHCPEnd, &net.EnableNAT, &net.Status, &net.CreatedAt, &net.UpdatedAt)
+		&net.DHCPStart, &net.DHCPEnd, &net.EnableNAT, &net.OutInterface, &net.MTU,
+		&net.STP, &net.BlockExternal, &net.Status, &net.CreatedAt, &net.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -519,7 +777,8 @@ func (d *DB) ListNetworks() ([]*Network, error) {
 
 	rows, err := d.db.Query(`
 		SELECT id, name, bridge_name, subnet, gateway, COALESCE(dhcp_start, ''),
-			COALESCE(dhcp_end, ''), enable_nat, status, created_at, updated_at
+			COALESCE(dhcp_end, ''), enable_nat, COALESCE(out_interface, ''), COALESCE(mtu, 1500),
+			COALESCE(stp, 0), COALESCE(block_external, 0), status, created_at, updated_at
 		FROM networks ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -531,7 +790,8 @@ func (d *DB) ListNetworks() ([]*Network, error) {
 		net := &Network{}
 		if err := rows.Scan(
 			&net.ID, &net.Name, &net.BridgeName, &net.Subnet, &net.Gateway,
-			&net.DHCPStart, &net.DHCPEnd, &net.EnableNAT, &net.Status, &net.CreatedAt, &net.UpdatedAt); err != nil {
+			&net.DHCPStart, &net.DHCPEnd, &net.EnableNAT, &net.OutInterface, &net.MTU,
+			&net.STP, &net.BlockExternal, &net.Status, &net.CreatedAt, &net.UpdatedAt); err != nil {
 			return nil, err
 		}
 		nets = append(nets, net)
@@ -543,12 +803,15 @@ func (d *DB) UpdateNetwork(net *Network) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if net.MTU == 0 {
+		net.MTU = 1500
+	}
 	_, err := d.db.Exec(`
 		UPDATE networks SET name=?, bridge_name=?, subnet=?, gateway=?,
-			dhcp_start=?, dhcp_end=?, enable_nat=?, status=?, updated_at=CURRENT_TIMESTAMP
+			dhcp_start=?, dhcp_end=?, enable_nat=?, out_interface=?, mtu=?, stp=?, block_external=?, status=?, updated_at=CURRENT_TIMESTAMP
 		WHERE id=?`,
 		net.Name, net.BridgeName, net.Subnet, net.Gateway,
-		net.DHCPStart, net.DHCPEnd, net.EnableNAT, net.Status, net.ID)
+		net.DHCPStart, net.DHCPEnd, net.EnableNAT, net.OutInterface, net.MTU, net.STP, net.BlockExternal, net.Status, net.ID)
 	return err
 }
 
@@ -593,6 +856,21 @@ func (d *DB) GetKernelImage(id string) (*KernelImage, error) {
 	err := d.db.QueryRow(`
 		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, created_at
 		FROM kernel_images WHERE id = ?`, id).Scan(
+		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return img, err
+}
+
+func (d *DB) GetKernelByPath(path string) (*KernelImage, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	img := &KernelImage{}
+	err := d.db.QueryRow(`
+		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, created_at
+		FROM kernel_images WHERE path = ?`, path).Scan(
 		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -672,14 +950,72 @@ func (d *DB) GetRootFS(id string) (*RootFS, error) {
 	defer d.mu.RUnlock()
 
 	fs := &RootFS{}
+	var scannedAt sql.NullTime
 	err := d.db.QueryRow(`
-		SELECT id, name, path, size, format, COALESCE(base_image, ''), COALESCE(checksum, ''), created_at
+		SELECT id, name, path, size, format, COALESCE(base_image, ''), COALESCE(checksum, ''),
+		       COALESCE(disk_type, ''), COALESCE(init_system, ''), COALESCE(os_release, ''),
+		       scanned_at, created_at
 		FROM rootfs WHERE id = ?`, id).Scan(
-		&fs.ID, &fs.Name, &fs.Path, &fs.Size, &fs.Format, &fs.BaseImage, &fs.Checksum, &fs.CreatedAt)
+		&fs.ID, &fs.Name, &fs.Path, &fs.Size, &fs.Format, &fs.BaseImage, &fs.Checksum,
+		&fs.DiskType, &fs.InitSystem, &fs.OSRelease, &scannedAt, &fs.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
+	if scannedAt.Valid {
+		fs.ScannedAt = scannedAt.Time
+	}
 	return fs, err
+}
+
+func (d *DB) GetRootFSByPath(path string) (*RootFS, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	fs := &RootFS{}
+	var scannedAt sql.NullTime
+	err := d.db.QueryRow(`
+		SELECT id, name, path, size, format, COALESCE(base_image, ''), COALESCE(checksum, ''),
+		       COALESCE(disk_type, ''), COALESCE(init_system, ''), COALESCE(os_release, ''),
+		       scanned_at, created_at
+		FROM rootfs WHERE path = ?`, path).Scan(
+		&fs.ID, &fs.Name, &fs.Path, &fs.Size, &fs.Format, &fs.BaseImage, &fs.Checksum,
+		&fs.DiskType, &fs.InitSystem, &fs.OSRelease, &scannedAt, &fs.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if scannedAt.Valid {
+		fs.ScannedAt = scannedAt.Time
+	}
+	return fs, err
+}
+
+// GetVMsByRootFSPath returns all VMs using a specific rootfs path
+func (d *DB) GetVMsByRootFSPath(rootfsPath string) ([]*VM, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT id, name, vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
+		       network_id, mac_address, ip_address, COALESCE(dns_servers, ''), COALESCE(snapshot_type, ''),
+		       tap_device, socket_path, status, pid, autorun, created_at, updated_at, COALESCE(error_message, '')
+		FROM vms WHERE rootfs_path = ? ORDER BY name`, rootfsPath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var vms []*VM
+	for rows.Next() {
+		vm := &VM{}
+		if err := rows.Scan(
+			&vm.ID, &vm.Name, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
+			&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType,
+			&vm.TapDevice, &vm.SocketPath, &vm.Status, &vm.PID, &vm.Autorun, &vm.CreatedAt, &vm.UpdatedAt, &vm.ErrorMessage); err != nil {
+			return nil, err
+		}
+		vms = append(vms, vm)
+	}
+	return vms, rows.Err()
 }
 
 func (d *DB) ListRootFS() ([]*RootFS, error) {
@@ -687,7 +1023,9 @@ func (d *DB) ListRootFS() ([]*RootFS, error) {
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT id, name, path, size, format, COALESCE(base_image, ''), COALESCE(checksum, ''), created_at
+		SELECT id, name, path, size, format, COALESCE(base_image, ''), COALESCE(checksum, ''),
+		       COALESCE(disk_type, ''), COALESCE(init_system, ''), COALESCE(os_release, ''),
+		       scanned_at, created_at
 		FROM rootfs ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -697,8 +1035,13 @@ func (d *DB) ListRootFS() ([]*RootFS, error) {
 	var fsList []*RootFS
 	for rows.Next() {
 		fs := &RootFS{}
-		if err := rows.Scan(&fs.ID, &fs.Name, &fs.Path, &fs.Size, &fs.Format, &fs.BaseImage, &fs.Checksum, &fs.CreatedAt); err != nil {
+		var scannedAt sql.NullTime
+		if err := rows.Scan(&fs.ID, &fs.Name, &fs.Path, &fs.Size, &fs.Format, &fs.BaseImage, &fs.Checksum,
+			&fs.DiskType, &fs.InitSystem, &fs.OSRelease, &scannedAt, &fs.CreatedAt); err != nil {
 			return nil, err
+		}
+		if scannedAt.Valid {
+			fs.ScannedAt = scannedAt.Time
 		}
 		fsList = append(fsList, fs)
 	}
@@ -710,9 +1053,11 @@ func (d *DB) UpdateRootFS(fs *RootFS) error {
 	defer d.mu.Unlock()
 
 	_, err := d.db.Exec(`
-		UPDATE rootfs SET name=?, path=?, size=?, format=?, base_image=?, checksum=?
+		UPDATE rootfs SET name=?, path=?, size=?, format=?, base_image=?, checksum=?,
+		       disk_type=?, init_system=?, os_release=?, scanned_at=?
 		WHERE id=?`,
-		fs.Name, fs.Path, fs.Size, fs.Format, fs.BaseImage, fs.Checksum, fs.ID)
+		fs.Name, fs.Path, fs.Size, fs.Format, fs.BaseImage, fs.Checksum,
+		fs.DiskType, fs.InitSystem, fs.OSRelease, fs.ScannedAt, fs.ID)
 	return err
 }
 
@@ -1053,6 +1398,17 @@ func (d *DB) DeleteVMDisk(id string) error {
 	return err
 }
 
+func (d *DB) UpdateVMDisk(disk *VMDisk) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		UPDATE vm_disks SET name=?, path=?, size_mb=?, format=?, mount_point=?, drive_id=?, is_read_only=?
+		WHERE id=?`,
+		disk.Name, disk.Path, disk.SizeMB, disk.Format, disk.MountPoint, disk.DriveID, disk.IsReadOnly, disk.ID)
+	return err
+}
+
 func (d *DB) GetNextDriveID(vmID string) (string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -1064,6 +1420,99 @@ func (d *DB) GetNextDriveID(vmID string) (string, error) {
 	}
 	// drive0 is rootfs, so additional disks start at drive1
 	return fmt.Sprintf("drive%d", count+1), nil
+}
+
+// VMNetwork operations
+
+func (d *DB) CreateVMNetwork(vmNet *VMNetwork) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		INSERT INTO vm_networks (id, vm_id, network_id, iface_index, mac_address, ip_address, tap_device)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		vmNet.ID, vmNet.VMID, vmNet.NetworkID, vmNet.IfaceIndex, vmNet.MacAddress, vmNet.IPAddress, vmNet.TapDevice)
+	return err
+}
+
+func (d *DB) GetVMNetwork(id string) (*VMNetwork, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	vmNet := &VMNetwork{}
+	err := d.db.QueryRow(`
+		SELECT id, vm_id, network_id, iface_index, mac_address, COALESCE(ip_address, ''), COALESCE(tap_device, ''), created_at
+		FROM vm_networks WHERE id = ?`, id).Scan(
+		&vmNet.ID, &vmNet.VMID, &vmNet.NetworkID, &vmNet.IfaceIndex, &vmNet.MacAddress, &vmNet.IPAddress, &vmNet.TapDevice, &vmNet.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return vmNet, err
+}
+
+func (d *DB) ListVMNetworks(vmID string) ([]*VMNetwork, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT id, vm_id, network_id, iface_index, mac_address, COALESCE(ip_address, ''), COALESCE(tap_device, ''), created_at
+		FROM vm_networks WHERE vm_id = ? ORDER BY iface_index ASC`, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var networks []*VMNetwork
+	for rows.Next() {
+		vmNet := &VMNetwork{}
+		if err := rows.Scan(&vmNet.ID, &vmNet.VMID, &vmNet.NetworkID, &vmNet.IfaceIndex, &vmNet.MacAddress, &vmNet.IPAddress, &vmNet.TapDevice, &vmNet.CreatedAt); err != nil {
+			return nil, err
+		}
+		networks = append(networks, vmNet)
+	}
+	return networks, nil
+}
+
+func (d *DB) DeleteVMNetwork(id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec("DELETE FROM vm_networks WHERE id = ?", id)
+	return err
+}
+
+func (d *DB) DeleteVMNetworksByVMID(vmID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec("DELETE FROM vm_networks WHERE vm_id = ?", vmID)
+	return err
+}
+
+func (d *DB) UpdateVMNetwork(vmNet *VMNetwork) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		UPDATE vm_networks SET network_id=?, iface_index=?, mac_address=?, ip_address=?, tap_device=?
+		WHERE id=?`,
+		vmNet.NetworkID, vmNet.IfaceIndex, vmNet.MacAddress, vmNet.IPAddress, vmNet.TapDevice, vmNet.ID)
+	return err
+}
+
+func (d *DB) GetNextIfaceIndex(vmID string) (int, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var maxIndex sql.NullInt64
+	err := d.db.QueryRow("SELECT MAX(iface_index) FROM vm_networks WHERE vm_id = ?", vmID).Scan(&maxIndex)
+	if err != nil {
+		return 0, err
+	}
+	if !maxIndex.Valid {
+		return 0, nil
+	}
+	return int(maxIndex.Int64) + 1, nil
 }
 
 // ListAutorunVMs returns all VMs with autorun enabled
@@ -1368,4 +1817,1019 @@ func (d *DB) ExportVMsJSON() ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(vms)
+}
+
+// VM Metrics operations
+
+// SaveVMMetric saves a metric data point for a VM
+func (d *DB) SaveVMMetric(vmID string, cpuPercent, memPercent float64, memUsedMB int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		INSERT INTO vm_metrics (vm_id, cpu_percent, mem_percent, mem_used_mb)
+		VALUES (?, ?, ?, ?)`,
+		vmID, cpuPercent, memPercent, memUsedMB)
+	return err
+}
+
+// GetVMMetrics retrieves metrics for a VM within a time range
+func (d *DB) GetVMMetrics(vmID string, since time.Time, limit int) ([]*VMMetric, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Convert to UTC for consistent comparison with stored timestamps
+	sinceUTC := since.UTC().Format("2006-01-02 15:04:05")
+
+	query := `
+		SELECT id, vm_id, cpu_percent, mem_percent, mem_used_mb, created_at
+		FROM vm_metrics
+		WHERE vm_id = ? AND created_at >= ?
+		ORDER BY created_at ASC`
+
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+
+	rows, err := d.db.Query(query, vmID, sinceUTC)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metrics []*VMMetric
+	for rows.Next() {
+		m := &VMMetric{}
+		if err := rows.Scan(&m.ID, &m.VMID, &m.CPUPercent, &m.MemPercent, &m.MemUsedMB, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		metrics = append(metrics, m)
+	}
+	return metrics, rows.Err()
+}
+
+// GetVMMetricsAggregated retrieves aggregated metrics for longer time ranges
+func (d *DB) GetVMMetricsAggregated(vmID string, since time.Time, intervalMinutes int) ([]*VMMetric, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Convert to UTC for consistent comparison with stored timestamps
+	sinceUTC := since.UTC().Format("2006-01-02 15:04:05")
+
+	// Group by time intervals and calculate averages
+	query := `
+		SELECT
+			0 as id,
+			vm_id,
+			AVG(cpu_percent) as cpu_percent,
+			AVG(mem_percent) as mem_percent,
+			AVG(mem_used_mb) as mem_used_mb,
+			datetime((strftime('%s', created_at) / ?) * ?, 'unixepoch') as created_at
+		FROM vm_metrics
+		WHERE vm_id = ? AND created_at >= ?
+		GROUP BY vm_id, datetime((strftime('%s', created_at) / ?) * ?, 'unixepoch')
+		ORDER BY created_at ASC`
+
+	intervalSecs := intervalMinutes * 60
+	rows, err := d.db.Query(query, intervalSecs, intervalSecs, vmID, sinceUTC, intervalSecs, intervalSecs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metrics []*VMMetric
+	for rows.Next() {
+		m := &VMMetric{}
+		var createdAtStr string
+		var memUsedMBFloat float64
+		if err := rows.Scan(&m.ID, &m.VMID, &m.CPUPercent, &m.MemPercent, &memUsedMBFloat, &createdAtStr); err != nil {
+			return nil, err
+		}
+		m.MemUsedMB = int64(memUsedMBFloat)
+		// Parse the datetime string from SQLite
+		if t, err := time.Parse("2006-01-02 15:04:05", createdAtStr); err == nil {
+			m.CreatedAt = t
+		}
+		metrics = append(metrics, m)
+	}
+	return metrics, rows.Err()
+}
+
+// DeleteVMMetrics deletes all metrics for a specific VM (including compressed tables)
+func (d *DB) DeleteVMMetrics(vmID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Delete from all metrics tables
+	tables := []string{"vm_metrics", "vm_metrics_10min", "vm_metrics_hourly", "vm_metrics_daily"}
+	for _, table := range tables {
+		if _, err := d.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE vm_id = ?`, table), vmID); err != nil {
+			// Ignore errors for tables that might not exist yet
+			continue
+		}
+	}
+	return nil
+}
+
+// ClearVMRealtimeMetrics clears only the realtime metrics (vm_metrics table) for a VM
+// This is called when a VM starts to ensure charts start fresh
+func (d *DB) ClearVMRealtimeMetrics(vmID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM vm_metrics WHERE vm_id = ?`, vmID)
+	return err
+}
+
+// CleanupOldMetrics removes metrics older than the specified duration and returns count deleted
+func (d *DB) CleanupOldMetrics(olderThan time.Duration) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	cutoff := time.Now().UTC().Add(-olderThan).Format("2006-01-02 15:04:05")
+	var totalDeleted int64
+
+	// Clean up raw metrics (keep only recent for real-time view)
+	result, err := d.db.Exec(`DELETE FROM vm_metrics WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := result.RowsAffected(); n > 0 {
+		totalDeleted += n
+	}
+
+	// Clean up compressed tables (6 months = 180 days)
+	sixMonthsCutoff := time.Now().UTC().Add(-180 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	compressedTables := []string{"vm_metrics_10min", "vm_metrics_hourly", "vm_metrics_daily"}
+	for _, table := range compressedTables {
+		result, err := d.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE period_start < ?`, table), sixMonthsCutoff)
+		if err != nil {
+			continue // Ignore errors for tables that might not exist yet
+		}
+		if n, _ := result.RowsAffected(); n > 0 {
+			totalDeleted += n
+		}
+	}
+
+	return totalDeleted, nil
+}
+
+// CompressMetricsTo10Min compresses raw metrics older than 1 hour into 10-minute averages
+func (d *DB) CompressMetricsTo10Min() (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Get cutoff time (1 hour ago)
+	cutoff := time.Now().UTC().Add(-1 * time.Hour).Format("2006-01-02 15:04:05")
+
+	// Insert aggregated data into 10min table
+	// Group by 10-minute intervals (600 seconds)
+	insertQuery := `
+		INSERT OR REPLACE INTO vm_metrics_10min (vm_id, cpu_percent, mem_percent, mem_used_mb, period_start, sample_count)
+		SELECT
+			vm_id,
+			AVG(cpu_percent),
+			AVG(mem_percent),
+			CAST(AVG(mem_used_mb) AS INTEGER),
+			datetime((strftime('%s', created_at) / 600) * 600, 'unixepoch'),
+			COUNT(*)
+		FROM vm_metrics
+		WHERE created_at < ?
+		GROUP BY vm_id, datetime((strftime('%s', created_at) / 600) * 600, 'unixepoch')`
+
+	_, err := d.db.Exec(insertQuery, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to compress to 10min: %w", err)
+	}
+
+	// Delete the compressed raw data
+	result, err := d.db.Exec(`DELETE FROM vm_metrics WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete compressed data: %w", err)
+	}
+
+	return result.RowsAffected()
+}
+
+// CompressMetricsToHourly compresses 10-minute metrics older than 1 day into hourly averages
+func (d *DB) CompressMetricsToHourly() (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Get cutoff time (1 day ago)
+	cutoff := time.Now().UTC().Add(-24 * time.Hour).Format("2006-01-02 15:04:05")
+
+	// Insert aggregated data into hourly table
+	// Group by 1-hour intervals (3600 seconds)
+	insertQuery := `
+		INSERT OR REPLACE INTO vm_metrics_hourly (vm_id, cpu_percent, mem_percent, mem_used_mb, period_start, sample_count)
+		SELECT
+			vm_id,
+			AVG(cpu_percent),
+			AVG(mem_percent),
+			CAST(AVG(mem_used_mb) AS INTEGER),
+			datetime((strftime('%s', period_start) / 3600) * 3600, 'unixepoch'),
+			SUM(sample_count)
+		FROM vm_metrics_10min
+		WHERE period_start < ?
+		GROUP BY vm_id, datetime((strftime('%s', period_start) / 3600) * 3600, 'unixepoch')`
+
+	_, err := d.db.Exec(insertQuery, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to compress to hourly: %w", err)
+	}
+
+	// Delete the compressed 10min data
+	result, err := d.db.Exec(`DELETE FROM vm_metrics_10min WHERE period_start < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete compressed 10min data: %w", err)
+	}
+
+	return result.RowsAffected()
+}
+
+// CompressMetricsToDaily compresses hourly metrics older than 1 week into 14-hour averages
+func (d *DB) CompressMetricsToDaily() (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Get cutoff time (1 week ago)
+	cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+
+	// Insert aggregated data into daily table
+	// Group by 14-hour intervals (50400 seconds)
+	insertQuery := `
+		INSERT OR REPLACE INTO vm_metrics_daily (vm_id, cpu_percent, mem_percent, mem_used_mb, period_start, sample_count)
+		SELECT
+			vm_id,
+			AVG(cpu_percent),
+			AVG(mem_percent),
+			CAST(AVG(mem_used_mb) AS INTEGER),
+			datetime((strftime('%s', period_start) / 50400) * 50400, 'unixepoch'),
+			SUM(sample_count)
+		FROM vm_metrics_hourly
+		WHERE period_start < ?
+		GROUP BY vm_id, datetime((strftime('%s', period_start) / 50400) * 50400, 'unixepoch')`
+
+	_, err := d.db.Exec(insertQuery, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to compress to daily: %w", err)
+	}
+
+	// Delete the compressed hourly data
+	result, err := d.db.Exec(`DELETE FROM vm_metrics_hourly WHERE period_start < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete compressed hourly data: %w", err)
+	}
+
+	return result.RowsAffected()
+}
+
+// GetVMMetrics10Min retrieves 10-minute aggregated metrics for day view
+func (d *DB) GetVMMetrics10Min(vmID string, since time.Time) ([]*VMMetric, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	sinceUTC := since.UTC().Format("2006-01-02 15:04:05")
+
+	query := `
+		SELECT id, vm_id, cpu_percent, mem_percent, mem_used_mb, period_start
+		FROM vm_metrics_10min
+		WHERE vm_id = ? AND period_start >= ?
+		ORDER BY period_start ASC`
+
+	rows, err := d.db.Query(query, vmID, sinceUTC)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metrics []*VMMetric
+	for rows.Next() {
+		m := &VMMetric{}
+		var periodStr string
+		if err := rows.Scan(&m.ID, &m.VMID, &m.CPUPercent, &m.MemPercent, &m.MemUsedMB, &periodStr); err != nil {
+			return nil, err
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", periodStr); err == nil {
+			m.CreatedAt = t
+		}
+		metrics = append(metrics, m)
+	}
+	return metrics, rows.Err()
+}
+
+// GetVMMetricsHourly retrieves hourly aggregated metrics for week view
+func (d *DB) GetVMMetricsHourly(vmID string, since time.Time) ([]*VMMetric, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	sinceUTC := since.UTC().Format("2006-01-02 15:04:05")
+
+	query := `
+		SELECT id, vm_id, cpu_percent, mem_percent, mem_used_mb, period_start
+		FROM vm_metrics_hourly
+		WHERE vm_id = ? AND period_start >= ?
+		ORDER BY period_start ASC`
+
+	rows, err := d.db.Query(query, vmID, sinceUTC)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metrics []*VMMetric
+	for rows.Next() {
+		m := &VMMetric{}
+		var periodStr string
+		if err := rows.Scan(&m.ID, &m.VMID, &m.CPUPercent, &m.MemPercent, &m.MemUsedMB, &periodStr); err != nil {
+			return nil, err
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", periodStr); err == nil {
+			m.CreatedAt = t
+		}
+		metrics = append(metrics, m)
+	}
+	return metrics, rows.Err()
+}
+
+// GetVMMetricsDaily retrieves 14-hour aggregated metrics for month view
+func (d *DB) GetVMMetricsDaily(vmID string, since time.Time) ([]*VMMetric, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	sinceUTC := since.UTC().Format("2006-01-02 15:04:05")
+
+	query := `
+		SELECT id, vm_id, cpu_percent, mem_percent, mem_used_mb, period_start
+		FROM vm_metrics_daily
+		WHERE vm_id = ? AND period_start >= ?
+		ORDER BY period_start ASC`
+
+	rows, err := d.db.Query(query, vmID, sinceUTC)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metrics []*VMMetric
+	for rows.Next() {
+		m := &VMMetric{}
+		var periodStr string
+		if err := rows.Scan(&m.ID, &m.VMID, &m.CPUPercent, &m.MemPercent, &m.MemUsedMB, &periodStr); err != nil {
+			return nil, err
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", periodStr); err == nil {
+			m.CreatedAt = t
+		}
+		metrics = append(metrics, m)
+	}
+	return metrics, rows.Err()
+}
+
+// Migration Key operations
+
+// CreateMigrationKey creates a new migration key
+func (d *DB) CreateMigrationKey(key *MigrationKey) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		INSERT INTO migration_keys (id, name, key_hash, description, allow_push, allow_pull)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		key.ID, key.Name, key.KeyHash, key.Description, key.AllowPush, key.AllowPull)
+	return err
+}
+
+// GetMigrationKey retrieves a migration key by ID
+func (d *DB) GetMigrationKey(id string) (*MigrationKey, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	key := &MigrationKey{}
+	var lastUsedAt sql.NullTime
+	err := d.db.QueryRow(`
+		SELECT id, name, key_hash, COALESCE(description, ''), allow_push, allow_pull, created_at, last_used_at
+		FROM migration_keys WHERE id = ?`, id).Scan(
+		&key.ID, &key.Name, &key.KeyHash, &key.Description, &key.AllowPush, &key.AllowPull, &key.CreatedAt, &lastUsedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lastUsedAt.Valid {
+		key.LastUsedAt = &lastUsedAt.Time
+	}
+	return key, nil
+}
+
+// GetMigrationKeyByName retrieves a migration key by name
+func (d *DB) GetMigrationKeyByName(name string) (*MigrationKey, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	key := &MigrationKey{}
+	var lastUsedAt sql.NullTime
+	err := d.db.QueryRow(`
+		SELECT id, name, key_hash, COALESCE(description, ''), allow_push, allow_pull, created_at, last_used_at
+		FROM migration_keys WHERE name = ?`, name).Scan(
+		&key.ID, &key.Name, &key.KeyHash, &key.Description, &key.AllowPush, &key.AllowPull, &key.CreatedAt, &lastUsedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lastUsedAt.Valid {
+		key.LastUsedAt = &lastUsedAt.Time
+	}
+	return key, nil
+}
+
+// GetMigrationKeyByHash retrieves a migration key by its hash
+func (d *DB) GetMigrationKeyByHash(keyHash string) (*MigrationKey, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	key := &MigrationKey{}
+	var lastUsedAt sql.NullTime
+	err := d.db.QueryRow(`
+		SELECT id, name, key_hash, COALESCE(description, ''), allow_push, allow_pull, created_at, last_used_at
+		FROM migration_keys WHERE key_hash = ?`, keyHash).Scan(
+		&key.ID, &key.Name, &key.KeyHash, &key.Description, &key.AllowPush, &key.AllowPull, &key.CreatedAt, &lastUsedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lastUsedAt.Valid {
+		key.LastUsedAt = &lastUsedAt.Time
+	}
+	return key, nil
+}
+
+// ListMigrationKeys returns all migration keys
+func (d *DB) ListMigrationKeys() ([]*MigrationKey, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT id, name, key_hash, COALESCE(description, ''), allow_push, allow_pull, created_at, last_used_at
+		FROM migration_keys ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []*MigrationKey
+	for rows.Next() {
+		key := &MigrationKey{}
+		var lastUsedAt sql.NullTime
+		if err := rows.Scan(&key.ID, &key.Name, &key.KeyHash, &key.Description, &key.AllowPush, &key.AllowPull, &key.CreatedAt, &lastUsedAt); err != nil {
+			return nil, err
+		}
+		if lastUsedAt.Valid {
+			key.LastUsedAt = &lastUsedAt.Time
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
+// UpdateMigrationKey updates a migration key
+func (d *DB) UpdateMigrationKey(key *MigrationKey) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		UPDATE migration_keys SET name=?, description=?, allow_push=?, allow_pull=?
+		WHERE id=?`,
+		key.Name, key.Description, key.AllowPush, key.AllowPull, key.ID)
+	return err
+}
+
+// UpdateMigrationKeyLastUsed updates the last_used_at timestamp
+func (d *DB) UpdateMigrationKeyLastUsed(id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`UPDATE migration_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
+	return err
+}
+
+// DeleteMigrationKey deletes a migration key
+func (d *DB) DeleteMigrationKey(id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec("DELETE FROM migration_keys WHERE id = ?", id)
+	return err
+}
+
+// Firewall Rule operations
+
+// CreateFirewallRule creates a new firewall rule
+func (d *DB) CreateFirewallRule(rule *FirewallRule) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		INSERT INTO firewall_rules (id, network_id, rule_type, source_ip, dest_ip, host_port, dest_port, protocol, action, description, enabled, priority)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rule.ID, rule.NetworkID, rule.RuleType, rule.SourceIP, rule.DestIP, rule.HostPort, rule.DestPort, rule.Protocol, rule.Action, rule.Description, rule.Enabled, rule.Priority)
+	return err
+}
+
+// GetFirewallRule retrieves a firewall rule by ID
+func (d *DB) GetFirewallRule(id string) (*FirewallRule, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rule := &FirewallRule{}
+	err := d.db.QueryRow(`
+		SELECT id, network_id, rule_type, COALESCE(source_ip, ''), COALESCE(dest_ip, ''),
+			COALESCE(host_port, 0), COALESCE(dest_port, 0), COALESCE(protocol, 'tcp'),
+			COALESCE(action, 'allow'), COALESCE(description, ''), enabled, COALESCE(priority, 100),
+			created_at, updated_at
+		FROM firewall_rules WHERE id = ?`, id).Scan(
+		&rule.ID, &rule.NetworkID, &rule.RuleType, &rule.SourceIP, &rule.DestIP,
+		&rule.HostPort, &rule.DestPort, &rule.Protocol, &rule.Action, &rule.Description,
+		&rule.Enabled, &rule.Priority, &rule.CreatedAt, &rule.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return rule, err
+}
+
+// ListFirewallRules returns all firewall rules for a network, ordered by priority
+func (d *DB) ListFirewallRules(networkID string) ([]*FirewallRule, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT id, network_id, rule_type, COALESCE(source_ip, ''), COALESCE(dest_ip, ''),
+			COALESCE(host_port, 0), COALESCE(dest_port, 0), COALESCE(protocol, 'tcp'),
+			COALESCE(action, 'allow'), COALESCE(description, ''), enabled, COALESCE(priority, 100),
+			created_at, updated_at
+		FROM firewall_rules WHERE network_id = ? ORDER BY priority ASC, created_at ASC`, networkID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []*FirewallRule
+	for rows.Next() {
+		rule := &FirewallRule{}
+		if err := rows.Scan(
+			&rule.ID, &rule.NetworkID, &rule.RuleType, &rule.SourceIP, &rule.DestIP,
+			&rule.HostPort, &rule.DestPort, &rule.Protocol, &rule.Action, &rule.Description,
+			&rule.Enabled, &rule.Priority, &rule.CreatedAt, &rule.UpdatedAt); err != nil {
+			return nil, err
+		}
+		rules = append(rules, rule)
+	}
+	return rules, rows.Err()
+}
+
+// ListEnabledFirewallRules returns only enabled firewall rules for a network
+func (d *DB) ListEnabledFirewallRules(networkID string) ([]*FirewallRule, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT id, network_id, rule_type, COALESCE(source_ip, ''), COALESCE(dest_ip, ''),
+			COALESCE(host_port, 0), COALESCE(dest_port, 0), COALESCE(protocol, 'tcp'),
+			COALESCE(action, 'allow'), COALESCE(description, ''), enabled, COALESCE(priority, 100),
+			created_at, updated_at
+		FROM firewall_rules WHERE network_id = ? AND enabled = 1 ORDER BY priority ASC, created_at ASC`, networkID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []*FirewallRule
+	for rows.Next() {
+		rule := &FirewallRule{}
+		if err := rows.Scan(
+			&rule.ID, &rule.NetworkID, &rule.RuleType, &rule.SourceIP, &rule.DestIP,
+			&rule.HostPort, &rule.DestPort, &rule.Protocol, &rule.Action, &rule.Description,
+			&rule.Enabled, &rule.Priority, &rule.CreatedAt, &rule.UpdatedAt); err != nil {
+			return nil, err
+		}
+		rules = append(rules, rule)
+	}
+	return rules, rows.Err()
+}
+
+// UpdateFirewallRule updates a firewall rule
+func (d *DB) UpdateFirewallRule(rule *FirewallRule) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		UPDATE firewall_rules SET rule_type=?, source_ip=?, dest_ip=?, host_port=?, dest_port=?,
+			protocol=?, action=?, description=?, enabled=?, priority=?, updated_at=CURRENT_TIMESTAMP
+		WHERE id=?`,
+		rule.RuleType, rule.SourceIP, rule.DestIP, rule.HostPort, rule.DestPort,
+		rule.Protocol, rule.Action, rule.Description, rule.Enabled, rule.Priority, rule.ID)
+	return err
+}
+
+// UpdateFirewallRuleEnabled enables or disables a firewall rule
+func (d *DB) UpdateFirewallRuleEnabled(id string, enabled bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`UPDATE firewall_rules SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, enabled, id)
+	return err
+}
+
+// DeleteFirewallRule deletes a firewall rule
+func (d *DB) DeleteFirewallRule(id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec("DELETE FROM firewall_rules WHERE id = ?", id)
+	return err
+}
+
+// DeleteFirewallRulesByNetwork deletes all firewall rules for a network
+func (d *DB) DeleteFirewallRulesByNetwork(networkID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec("DELETE FROM firewall_rules WHERE network_id = ?", networkID)
+	return err
+}
+
+// CountFirewallRules returns the number of firewall rules for a network
+func (d *DB) CountFirewallRules(networkID string) (int, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var count int
+	err := d.db.QueryRow("SELECT COUNT(*) FROM firewall_rules WHERE network_id = ?", networkID).Scan(&count)
+	return count, err
+}
+
+// VM Group operations
+
+// CreateVMGroup creates a new VM group
+func (d *DB) CreateVMGroup(group *VMGroup) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		INSERT INTO vm_groups (id, name, description, color)
+		VALUES (?, ?, ?, ?)`,
+		group.ID, group.Name, group.Description, group.Color)
+	return err
+}
+
+// GetVMGroup retrieves a VM group by ID
+func (d *DB) GetVMGroup(id string) (*VMGroup, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	group := &VMGroup{}
+	err := d.db.QueryRow(`
+		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), created_at, updated_at
+		FROM vm_groups WHERE id = ?`, id).Scan(
+		&group.ID, &group.Name, &group.Description, &group.Color, &group.CreatedAt, &group.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return group, err
+}
+
+// GetVMGroupByName retrieves a VM group by name
+func (d *DB) GetVMGroupByName(name string) (*VMGroup, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	group := &VMGroup{}
+	err := d.db.QueryRow(`
+		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), created_at, updated_at
+		FROM vm_groups WHERE name = ?`, name).Scan(
+		&group.ID, &group.Name, &group.Description, &group.Color, &group.CreatedAt, &group.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return group, err
+}
+
+// ListVMGroups returns all VM groups
+func (d *DB) ListVMGroups() ([]*VMGroup, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT id, name, COALESCE(description, ''), COALESCE(color, '#6366f1'), created_at, updated_at
+		FROM vm_groups ORDER BY name ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []*VMGroup
+	for rows.Next() {
+		group := &VMGroup{}
+		if err := rows.Scan(&group.ID, &group.Name, &group.Description, &group.Color, &group.CreatedAt, &group.UpdatedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+
+// UpdateVMGroup updates a VM group
+func (d *DB) UpdateVMGroup(group *VMGroup) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		UPDATE vm_groups SET name=?, description=?, color=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		group.Name, group.Description, group.Color, group.ID)
+	return err
+}
+
+// DeleteVMGroup deletes a VM group
+func (d *DB) DeleteVMGroup(id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec("DELETE FROM vm_groups WHERE id = ?", id)
+	return err
+}
+
+// VM Group Member operations
+
+// AddVMToGroup adds a VM to a VM group
+func (d *DB) AddVMToGroup(vmGroupID, vmID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`INSERT OR IGNORE INTO vm_group_members (vm_group_id, vm_id) VALUES (?, ?)`, vmGroupID, vmID)
+	return err
+}
+
+// RemoveVMFromGroup removes a VM from a VM group
+func (d *DB) RemoveVMFromGroup(vmGroupID, vmID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM vm_group_members WHERE vm_group_id = ? AND vm_id = ?`, vmGroupID, vmID)
+	return err
+}
+
+// GetVMGroups returns all VM groups a VM belongs to
+func (d *DB) GetVMGroups(vmID string) ([]*VMGroup, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT g.id, g.name, COALESCE(g.description, ''), COALESCE(g.color, '#6366f1'), g.created_at, g.updated_at
+		FROM vm_groups g
+		INNER JOIN vm_group_members m ON g.id = m.vm_group_id
+		WHERE m.vm_id = ?
+		ORDER BY g.name ASC`, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []*VMGroup
+	for rows.Next() {
+		group := &VMGroup{}
+		if err := rows.Scan(&group.ID, &group.Name, &group.Description, &group.Color, &group.CreatedAt, &group.UpdatedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+
+// GetVMsInGroup returns all VMs in a VM group
+func (d *DB) GetVMsInGroup(vmGroupID string) ([]*VM, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT v.id, v.name, v.vcpu, v.memory_mb, v.kernel_path, v.rootfs_path, v.kernel_args,
+			COALESCE(v.network_id, ''), COALESCE(v.mac_address, ''), COALESCE(v.ip_address, ''),
+			COALESCE(v.dns_servers, ''), COALESCE(v.snapshot_type, ''), COALESCE(v.tap_device, ''),
+			COALESCE(v.socket_path, ''), v.status, v.pid, COALESCE(v.autorun, 0),
+			COALESCE(v.error_message, ''), v.created_at, v.updated_at
+		FROM vms v
+		INNER JOIN vm_group_members m ON v.id = m.vm_id
+		WHERE m.vm_group_id = ?
+		ORDER BY v.name ASC`, vmGroupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var vms []*VM
+	for rows.Next() {
+		vm := &VM{}
+		if err := rows.Scan(&vm.ID, &vm.Name, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
+			&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType, &vm.TapDevice,
+			&vm.SocketPath, &vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage, &vm.CreatedAt, &vm.UpdatedAt); err != nil {
+			return nil, err
+		}
+		vms = append(vms, vm)
+	}
+	return vms, rows.Err()
+}
+
+// CountVMsInGroup returns the number of VMs in a group
+func (d *DB) CountVMsInGroup(vmGroupID string) (int, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var count int
+	err := d.db.QueryRow("SELECT COUNT(*) FROM vm_group_members WHERE vm_group_id = ?", vmGroupID).Scan(&count)
+	return count, err
+}
+
+// VM Group Permission operations
+
+// AddVMGroupPermission adds a user group permission to a VM group
+func (d *DB) AddVMGroupPermission(vmGroupID, groupID, permissions string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		INSERT INTO vm_group_permissions (vm_group_id, group_id, permissions) VALUES (?, ?, ?)
+		ON CONFLICT(vm_group_id, group_id) DO UPDATE SET permissions = ?`,
+		vmGroupID, groupID, permissions, permissions)
+	return err
+}
+
+// RemoveVMGroupPermission removes a user group permission from a VM group
+func (d *DB) RemoveVMGroupPermission(vmGroupID, groupID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM vm_group_permissions WHERE vm_group_id = ? AND group_id = ?`, vmGroupID, groupID)
+	return err
+}
+
+// GetVMGroupPermissions returns all permission entries for a VM group
+func (d *DB) GetVMGroupPermissions(vmGroupID string) ([]*VMGroupPermission, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT id, vm_group_id, group_id, COALESCE(permissions, ''), created_at
+		FROM vm_group_permissions WHERE vm_group_id = ?`, vmGroupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var perms []*VMGroupPermission
+	for rows.Next() {
+		p := &VMGroupPermission{}
+		if err := rows.Scan(&p.ID, &p.VMGroupID, &p.GroupID, &p.Permissions, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		perms = append(perms, p)
+	}
+	return perms, rows.Err()
+}
+
+// GetUserAccessibleVMGroups returns VM groups accessible by a user through their group memberships
+func (d *DB) GetUserAccessibleVMGroups(userID int) ([]*VMGroup, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT DISTINCT vg.id, vg.name, COALESCE(vg.description, ''), COALESCE(vg.color, '#6366f1'), vg.created_at, vg.updated_at
+		FROM vm_groups vg
+		INNER JOIN vm_group_permissions vgp ON vg.id = vgp.vm_group_id
+		INNER JOIN group_members gm ON vgp.group_id = gm.group_id
+		WHERE gm.user_id = ?
+		ORDER BY vg.name ASC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []*VMGroup
+	for rows.Next() {
+		group := &VMGroup{}
+		if err := rows.Scan(&group.ID, &group.Name, &group.Description, &group.Color, &group.CreatedAt, &group.UpdatedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+
+// VM Search operations
+
+// SearchVMs searches VMs based on various criteria
+func (d *DB) SearchVMs(params *VMSearchParams) ([]*VM, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	query := `
+		SELECT DISTINCT v.id, v.name, v.vcpu, v.memory_mb, v.kernel_path, v.rootfs_path, v.kernel_args,
+			COALESCE(v.network_id, ''), COALESCE(v.mac_address, ''), COALESCE(v.ip_address, ''),
+			COALESCE(v.dns_servers, ''), COALESCE(v.snapshot_type, ''), COALESCE(v.tap_device, ''),
+			COALESCE(v.socket_path, ''), v.status, v.pid, COALESCE(v.autorun, 0),
+			COALESCE(v.error_message, ''), v.created_at, v.updated_at
+		FROM vms v
+		LEFT JOIN rootfs r ON v.rootfs_path = r.path
+		LEFT JOIN vm_group_members vgm ON v.id = vgm.vm_id
+		LEFT JOIN vm_group_permissions vgp ON vgm.vm_group_id = vgp.vm_group_id
+		LEFT JOIN group_vms gv ON v.id = gv.vm_id
+		WHERE 1=1`
+
+	var args []interface{}
+
+	// General search query (searches name, IP, MAC)
+	if params.Query != "" {
+		query += ` AND (v.name LIKE ? OR v.ip_address LIKE ? OR v.mac_address LIKE ?)`
+		searchTerm := "%" + params.Query + "%"
+		args = append(args, searchTerm, searchTerm, searchTerm)
+	}
+
+	// Specific filters
+	if params.Name != "" {
+		query += ` AND v.name LIKE ?`
+		args = append(args, "%"+params.Name+"%")
+	}
+
+	if params.IPAddress != "" {
+		query += ` AND v.ip_address LIKE ?`
+		args = append(args, "%"+params.IPAddress+"%")
+	}
+
+	if params.OS != "" {
+		query += ` AND r.os_release LIKE ?`
+		args = append(args, "%"+params.OS+"%")
+	}
+
+	if params.Status != "" {
+		query += ` AND v.status = ?`
+		args = append(args, params.Status)
+	}
+
+	if params.NetworkID != "" {
+		query += ` AND v.network_id = ?`
+		args = append(args, params.NetworkID)
+	}
+
+	if params.RootFSID != "" {
+		query += ` AND r.id = ?`
+		args = append(args, params.RootFSID)
+	}
+
+	if params.KernelID != "" {
+		query += ` AND v.kernel_path IN (SELECT path FROM kernels WHERE id = ?)`
+		args = append(args, params.KernelID)
+	}
+
+	if params.VMGroupID != "" {
+		query += ` AND vgm.vm_group_id = ?`
+		args = append(args, params.VMGroupID)
+	}
+
+	if params.GroupID != "" {
+		query += ` AND (gv.group_id = ? OR vgp.group_id = ?)`
+		args = append(args, params.GroupID, params.GroupID)
+	}
+
+	query += ` ORDER BY v.name ASC`
+
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var vms []*VM
+	for rows.Next() {
+		vm := &VM{}
+		if err := rows.Scan(&vm.ID, &vm.Name, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
+			&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType, &vm.TapDevice,
+			&vm.SocketPath, &vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage, &vm.CreatedAt, &vm.UpdatedAt); err != nil {
+			return nil, err
+		}
+		vms = append(vms, vm)
+	}
+	return vms, rows.Err()
+}
+
+// VMSearchResult includes VM with additional info for search results
+type VMSearchResult struct {
+	VM       *VM          `json:"vm"`
+	RootFS   *RootFS      `json:"rootfs,omitempty"`
+	Kernel   *KernelImage `json:"kernel,omitempty"`
+	Network  *Network     `json:"network,omitempty"`
+	VMGroups []*VMGroup   `json:"vm_groups,omitempty"`
 }

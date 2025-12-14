@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,11 +17,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"firecrackmanager/internal/database"
+	"firecrackmanager/internal/hostnet"
 	"firecrackmanager/internal/kernel"
 	"firecrackmanager/internal/network"
+	"firecrackmanager/internal/proxyconfig"
 	"firecrackmanager/internal/setup"
 	"firecrackmanager/internal/updater"
 	"firecrackmanager/internal/version"
@@ -31,15 +36,20 @@ import (
 )
 
 type Server struct {
-	db           *database.DB
-	vmMgr        *vm.Manager
-	netMgr       *network.Manager
-	kernelMgr    *kernel.Manager
-	mux          *http.ServeMux
-	sessionMu    sync.RWMutex
-	sessionCache map[string]*database.Session
-	logger       func(string, ...interface{})
-	updater      *updater.Updater
+	db                          *database.DB
+	vmMgr                       *vm.Manager
+	netMgr                      *network.Manager
+	kernelMgr                   *kernel.Manager
+	mux                         *http.ServeMux
+	sessionMu                   sync.RWMutex
+	sessionCache                map[string]*database.Session
+	logger                      func(string, ...interface{})
+	updater                     *updater.Updater
+	migrationSrv                *vm.MigrationServer
+	dataDir                     string
+	hostNetMgr                  *hostnet.Manager
+	enableHostNetworkManagement bool
+	builderDir                  string
 }
 
 func NewServer(db *database.DB, vmMgr *vm.Manager, netMgr *network.Manager, kernelMgr *kernel.Manager, upd *updater.Updater, logger func(string, ...interface{})) *Server {
@@ -52,9 +62,34 @@ func NewServer(db *database.DB, vmMgr *vm.Manager, netMgr *network.Manager, kern
 		sessionCache: make(map[string]*database.Session),
 		logger:       logger,
 		updater:      upd,
+		builderDir:   "/home/Builder", // default
 	}
 	s.registerRoutes()
 	return s
+}
+
+// SetBuilderDir sets the directory used for building Debian images
+func (s *Server) SetBuilderDir(dir string) {
+	s.builderDir = dir
+}
+
+// GetBuilderDir returns the current builder directory
+func (s *Server) GetBuilderDir() string {
+	if s.builderDir == "" {
+		return "/home/Builder"
+	}
+	return s.builderDir
+}
+
+// handleBuilderDir returns the configured builder directory
+func (s *Server) handleBuilderDir(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.jsonResponse(w, map[string]string{
+		"builder_dir": s.GetBuilderDir(),
+	})
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -71,13 +106,19 @@ func (s *Server) registerRoutes() {
 
 	// VM routes
 	s.mux.HandleFunc("/api/vms", s.requireAuth(s.handleVMs))
+	s.mux.HandleFunc("/api/vms/search", s.requireAuth(s.handleVMSearch))
 	s.mux.HandleFunc("/api/vms/import", s.requireAuth(s.handleVMImport))
 	s.mux.HandleFunc("/api/vms/export/", s.requireAuth(s.handleVMExportDownload))
 	s.mux.HandleFunc("/api/vms/", s.requireAuth(s.handleVM))
 
+	// VM Groups routes (admin only for management, auth for viewing)
+	s.mux.HandleFunc("/api/vmgroups", s.requireAuth(s.handleVMGroups))
+	s.mux.HandleFunc("/api/vmgroups/", s.requireAuth(s.handleVMGroup))
+
 	// Network routes
 	s.mux.HandleFunc("/api/networks", s.requireAuth(s.handleNetworks))
 	s.mux.HandleFunc("/api/networks/", s.requireAuth(s.handleNetwork))
+	s.mux.HandleFunc("/api/interfaces", s.requireAuth(s.handlePhysicalInterfaces))
 
 	// Kernel routes
 	s.mux.HandleFunc("/api/kernels", s.requireAuth(s.handleKernels))
@@ -90,10 +131,15 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/rootfs/download", s.requireAuth(s.handleRootFSDownload))
 	s.mux.HandleFunc("/api/rootfs/create", s.requireAuth(s.handleRootFSCreate))
 	s.mux.HandleFunc("/api/rootfs/upload", s.requireAuth(s.handleRootFSUpload))
+	s.mux.HandleFunc("/api/rootfs/extend/", s.requireAuth(s.handleRootFSExtend))
 
 	// User routes (admin only)
 	s.mux.HandleFunc("/api/users", s.requireAdmin(s.handleUsers))
 	s.mux.HandleFunc("/api/users/", s.requireAdmin(s.handleUser))
+
+	// Current user account route (any authenticated user)
+	s.mux.HandleFunc("/api/account", s.requireAuth(s.handleAccount))
+	s.mux.HandleFunc("/api/account/password", s.requireAuth(s.handleAccountPassword))
 
 	// Group routes (admin only)
 	s.mux.HandleFunc("/api/groups", s.requireAdmin(s.handleGroups))
@@ -106,16 +152,53 @@ func (s *Server) registerRoutes() {
 	// Download progress
 	s.mux.HandleFunc("/api/downloads/", s.requireAuth(s.handleDownloadProgress))
 
+	// Operation progress (for async operations like VM duplication)
+	s.mux.HandleFunc("/api/operations/", s.requireAuth(s.handleOperationProgress))
+
 	// System status and Firecracker management
 	s.mux.HandleFunc("/api/system/status", s.requireAuth(s.handleSystemStatus))
 	s.mux.HandleFunc("/api/system/firecracker/check", s.requireAuth(s.handleFirecrackerCheck))
 	s.mux.HandleFunc("/api/system/firecracker/upgrade", s.requireAdmin(s.handleFirecrackerUpgrade))
+	s.mux.HandleFunc("/api/system/jailer", s.requireAdmin(s.handleJailerConfig))
 
 	// Ping endpoint for checking VM reachability
 	s.mux.HandleFunc("/api/ping/", s.requireAuth(s.handlePing))
 
 	// WebSocket console endpoint
 	s.mux.HandleFunc("/api/vms/console/", s.handleVMConsole)
+
+	// Registry/Container image routes
+	s.mux.HandleFunc("/api/registry/search", s.requireAuth(s.handleRegistrySearch))
+	s.mux.HandleFunc("/api/registry/convert", s.requireAuth(s.handleRegistryConvert))
+	s.mux.HandleFunc("/api/registry/convert/", s.requireAuth(s.handleRegistryConversionStatus))
+	s.mux.HandleFunc("/api/registry/jobs", s.requireAuth(s.handleRegistryJobs))
+
+	// Docker Compose routes
+	s.mux.HandleFunc("/api/compose/services", s.requireAuth(s.handleComposeServices))
+	s.mux.HandleFunc("/api/compose/convert", s.requireAuth(s.handleComposeConvert))
+	s.mux.HandleFunc("/api/compose/upload", s.requireAuth(s.handleComposeUpload))
+
+	// Data disk creation
+	s.mux.HandleFunc("/api/rootfs/create-data-disk", s.requireAuth(s.handleCreateDataDisk))
+
+	// Debian image builder
+	s.mux.HandleFunc("/api/rootfs/build-debian", s.requireAdmin(s.handleBuildDebianImage))
+	s.mux.HandleFunc("/api/rootfs/build-debian/progress", s.requireAuth(s.handleBuildDebianProgress))
+	s.mux.HandleFunc("/api/system/builder-dir", s.requireAuth(s.handleBuilderDir))
+
+	// Proxy configuration (admin only)
+	s.mux.HandleFunc("/api/system/proxy", s.requireAdmin(s.handleProxyConfig))
+	s.mux.HandleFunc("/api/system/proxy/test", s.requireAdmin(s.handleProxyTest))
+
+	// Migration routes (admin only)
+	s.mux.HandleFunc("/api/migration/keys", s.requireAdmin(s.handleMigrationKeys))
+	s.mux.HandleFunc("/api/migration/keys/", s.requireAdmin(s.handleMigrationKey))
+	s.mux.HandleFunc("/api/migration/server", s.requireAdmin(s.handleMigrationServer))
+	s.mux.HandleFunc("/api/migration/send", s.requireAdmin(s.handleMigrationSend))
+	s.mux.HandleFunc("/api/migration/status", s.requireAuth(s.handleMigrationStatus))
+
+	// Host network management routes (admin only)
+	s.registerHostNetRoutes()
 }
 
 // Authentication middleware
@@ -304,6 +387,8 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 			NetworkID    string `json:"network_id"`
 			DNSServers   string `json:"dns_servers"`
 			SnapshotType string `json:"snapshot_type"`
+			DataDiskID   string `json:"data_disk_id"`
+			RootPassword string `json:"root_password"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -385,7 +470,7 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// No network - use default kernel args if not specified
 			if vmObj.KernelArgs == "" {
-				vmObj.KernelArgs = "console=ttyS0 reboot=k panic=1 pci=off"
+				vmObj.KernelArgs = "console=ttyS0,115200n8 reboot=k panic=1 pci=off"
 			}
 		}
 
@@ -395,6 +480,42 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.db.AddVMLog(vmID, "info", "VM created")
+
+		// Set root password if specified
+		if req.RootPassword != "" {
+			if err := setRootPassword(rootfs.Path, req.RootPassword); err != nil {
+				s.logger("Warning: Failed to set root password: %v", err)
+				s.db.AddVMLog(vmID, "warning", "Failed to set root password: "+err.Error())
+			} else {
+				s.db.AddVMLog(vmID, "info", "Root password set")
+			}
+		}
+
+		// Attach data disk if specified
+		if req.DataDiskID != "" {
+			dataDisk, err := s.db.GetRootFS(req.DataDiskID)
+			if err != nil || dataDisk == nil {
+				s.logger("Warning: Data disk %s not found, skipping attachment", req.DataDiskID)
+			} else {
+				vmDisk := &database.VMDisk{
+					ID:         generateID(),
+					VMID:       vmID,
+					Name:       dataDisk.Name,
+					Path:       dataDisk.Path,
+					SizeMB:     dataDisk.Size / (1024 * 1024),
+					Format:     dataDisk.Format,
+					MountPoint: "/mnt/data",
+					DriveID:    "data",
+					IsReadOnly: false,
+				}
+				if err := s.db.CreateVMDisk(vmDisk); err != nil {
+					s.logger("Warning: Failed to attach data disk: %v", err)
+				} else {
+					s.db.AddVMLog(vmID, "info", "Data disk attached: "+dataDisk.Name)
+				}
+			}
+		}
+
 		s.jsonResponse(w, map[string]interface{}{
 			"status": "success",
 			"vm":     vmObj,
@@ -467,6 +588,118 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.jsonResponse(w, info)
+
+	case "metrics":
+		metrics, err := s.vmMgr.GetVMMetrics(vmID)
+		if err != nil {
+			s.jsonError(w, "Failed to get metrics: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.jsonResponse(w, metrics)
+
+	case "metrics-history":
+		// GET /api/vms/{id}/metrics-history?period=realtime|hour|day|week|month
+		if r.Method != http.MethodGet {
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		period := r.URL.Query().Get("period")
+		if period == "" {
+			period = "realtime"
+		}
+
+		var metrics []*database.VMMetric
+		var err error
+
+		switch period {
+		case "realtime":
+			// Last 10 minutes, raw data from vm_metrics
+			since := time.Now().Add(-10 * time.Minute)
+			metrics, err = s.db.GetVMMetrics(vmID, since, 60)
+
+		case "hour":
+			// Last hour, raw data from vm_metrics
+			since := time.Now().Add(-1 * time.Hour)
+			metrics, err = s.db.GetVMMetrics(vmID, since, 360)
+
+		case "day":
+			// Last 24 hours - use 10-minute compressed data + recent raw data
+			since := time.Now().Add(-24 * time.Hour)
+			oneHourAgo := time.Now().Add(-1 * time.Hour)
+
+			// Get compressed 10-minute data for older period
+			compressed, err1 := s.db.GetVMMetrics10Min(vmID, since)
+			if err1 != nil {
+				compressed = []*database.VMMetric{}
+			}
+
+			// Get raw data for the last hour (not yet compressed)
+			raw, err2 := s.db.GetVMMetricsAggregated(vmID, oneHourAgo, 10)
+			if err2 != nil {
+				raw = []*database.VMMetric{}
+			}
+
+			// Combine: compressed older data + aggregated recent data
+			metrics = append(compressed, raw...)
+
+		case "week":
+			// Last 7 days - use hourly compressed data + recent 10-min data
+			since := time.Now().Add(-7 * 24 * time.Hour)
+			oneDayAgo := time.Now().Add(-24 * time.Hour)
+
+			// Get compressed hourly data for older period
+			compressed, err1 := s.db.GetVMMetricsHourly(vmID, since)
+			if err1 != nil {
+				compressed = []*database.VMMetric{}
+			}
+
+			// Get 10-minute data for the last day (not yet compressed to hourly)
+			recent, err2 := s.db.GetVMMetrics10Min(vmID, oneDayAgo)
+			if err2 != nil {
+				recent = []*database.VMMetric{}
+			}
+
+			metrics = append(compressed, recent...)
+
+		case "month":
+			// Last 30 days - use 14-hour compressed data + recent hourly data
+			since := time.Now().Add(-30 * 24 * time.Hour)
+			oneWeekAgo := time.Now().Add(-7 * 24 * time.Hour)
+
+			// Get compressed 14-hour data for older period
+			compressed, err1 := s.db.GetVMMetricsDaily(vmID, since)
+			if err1 != nil {
+				compressed = []*database.VMMetric{}
+			}
+
+			// Get hourly data for the last week (not yet compressed to 14-hour)
+			recent, err2 := s.db.GetVMMetricsHourly(vmID, oneWeekAgo)
+			if err2 != nil {
+				recent = []*database.VMMetric{}
+			}
+
+			metrics = append(compressed, recent...)
+
+		default:
+			s.jsonError(w, "Invalid period. Use: realtime, hour, day, week, month", http.StatusBadRequest)
+			return
+		}
+
+		if err != nil {
+			s.jsonError(w, "Failed to get metrics history: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Ensure metrics is never null in JSON (empty array instead)
+		if metrics == nil {
+			metrics = []*database.VMMetric{}
+		}
+
+		s.jsonResponse(w, map[string]interface{}{
+			"period":  period,
+			"metrics": metrics,
+		})
 
 	case "snapshot":
 		// POST /api/vms/{id}/snapshot - create snapshot
@@ -542,7 +775,7 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 
 	case "duplicate":
-		// POST /api/vms/{id}/duplicate - duplicate VM
+		// POST /api/vms/{id}/duplicate - duplicate VM (async with progress)
 		if r.Method != http.MethodPost {
 			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -561,16 +794,16 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		newVM, err := s.vmMgr.DuplicateVM(vmID, req.Name)
+		// Start async duplication
+		opKey, err := s.vmMgr.DuplicateVMAsync(vmID, req.Name)
 		if err != nil {
-			s.jsonError(w, "Failed to duplicate VM: "+err.Error(), http.StatusInternalServerError)
+			s.jsonError(w, "Failed to start VM duplication: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		s.db.AddVMLog(newVM.ID, "info", "VM created by duplicating "+vmID)
 		s.jsonResponse(w, map[string]interface{}{
-			"status": "success",
-			"vm":     newVM,
+			"status":       "started",
+			"progress_key": opKey,
 		})
 
 	case "export":
@@ -658,6 +891,40 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		// Handle /api/vms/{id}/disks/{diskId} routes
 		diskID := parts[2]
 
+		// Check for /api/vms/{id}/disks/{diskId}/expand
+		if len(parts) >= 4 && parts[3] == "expand" {
+			// POST /api/vms/{id}/disks/{diskId}/expand - expand disk
+			if r.Method != http.MethodPost {
+				s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+
+			var req struct {
+				NewSizeMB int64 `json:"new_size_mb"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+
+			if req.NewSizeMB <= 0 {
+				s.jsonError(w, "New size must be positive (in MB)", http.StatusBadRequest)
+				return
+			}
+
+			if err := s.vmMgr.ExpandDisk(vmID, diskID, req.NewSizeMB); err != nil {
+				s.jsonError(w, "Failed to expand disk: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			s.jsonResponse(w, map[string]interface{}{
+				"status":      "success",
+				"message":     "Disk expanded",
+				"new_size_mb": req.NewSizeMB,
+			})
+			return
+		}
+
 		// DELETE /api/vms/{id}/disks/{diskId} - detach disk
 		if r.Method == http.MethodDelete {
 			if err := s.vmMgr.DetachDisk(vmID, diskID); err != nil {
@@ -687,6 +954,295 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+
+	case "networks":
+		// Handle /api/vms/{id}/networks routes for multiple network interfaces
+		if len(parts) < 3 {
+			// GET /api/vms/{id}/networks - list VM network interfaces
+			// POST /api/vms/{id}/networks - attach new network interface
+			if r.Method == http.MethodGet {
+				vmNetworks, err := s.db.ListVMNetworks(vmID)
+				if err != nil {
+					s.jsonError(w, "Failed to list networks: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				// Enrich with network names
+				type enrichedNetwork struct {
+					*database.VMNetwork
+					NetworkName string `json:"network_name"`
+				}
+				enriched := make([]enrichedNetwork, 0, len(vmNetworks))
+				for _, vmNet := range vmNetworks {
+					en := enrichedNetwork{VMNetwork: vmNet}
+					if net, err := s.db.GetNetwork(vmNet.NetworkID); err == nil && net != nil {
+						en.NetworkName = net.Name
+					}
+					enriched = append(enriched, en)
+				}
+
+				s.jsonResponse(w, map[string]interface{}{
+					"networks": enriched,
+				})
+				return
+			}
+
+			if r.Method == http.MethodPost {
+				// Check if VM is running
+				vmObj, err := s.db.GetVM(vmID)
+				if err != nil || vmObj == nil {
+					s.jsonError(w, "VM not found", http.StatusNotFound)
+					return
+				}
+				if vmObj.Status == "running" {
+					s.jsonError(w, "Cannot modify networks while VM is running", http.StatusBadRequest)
+					return
+				}
+
+				var req struct {
+					NetworkID string `json:"network_id"`
+					IPAddress string `json:"ip_address"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					s.jsonError(w, "Invalid request", http.StatusBadRequest)
+					return
+				}
+
+				if req.NetworkID == "" {
+					s.jsonError(w, "Network ID is required", http.StatusBadRequest)
+					return
+				}
+
+				// Verify network exists
+				net, err := s.db.GetNetwork(req.NetworkID)
+				if err != nil || net == nil {
+					s.jsonError(w, "Network not found", http.StatusNotFound)
+					return
+				}
+
+				// Get next interface index
+				ifaceIndex, err := s.db.GetNextIfaceIndex(vmID)
+				if err != nil {
+					s.jsonError(w, "Failed to get interface index: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				// Generate MAC address and TAP device name
+				macAddress := s.vmMgr.GenerateMAC()
+				tapDevice := fmt.Sprintf("fc%s-%d", vmID[:8], ifaceIndex)
+
+				vmNetwork := &database.VMNetwork{
+					ID:         generateID(),
+					VMID:       vmID,
+					NetworkID:  req.NetworkID,
+					IfaceIndex: ifaceIndex,
+					MacAddress: macAddress,
+					IPAddress:  req.IPAddress,
+					TapDevice:  tapDevice,
+				}
+
+				if err := s.db.CreateVMNetwork(vmNetwork); err != nil {
+					s.jsonError(w, "Failed to create network interface: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				s.db.AddVMLog(vmID, "info", fmt.Sprintf("Added network interface eth%d on network %s", ifaceIndex, net.Name))
+				s.jsonResponse(w, map[string]interface{}{
+					"status":  "success",
+					"network": vmNetwork,
+				})
+				return
+			}
+
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Handle /api/vms/{id}/networks/{netId} routes
+		netID := parts[2]
+
+		// DELETE /api/vms/{id}/networks/{netId} - remove network interface
+		if r.Method == http.MethodDelete {
+			// Check if VM is running
+			vmObj, err := s.db.GetVM(vmID)
+			if err != nil || vmObj == nil {
+				s.jsonError(w, "VM not found", http.StatusNotFound)
+				return
+			}
+			if vmObj.Status == "running" {
+				s.jsonError(w, "Cannot modify networks while VM is running", http.StatusBadRequest)
+				return
+			}
+
+			vmNet, err := s.db.GetVMNetwork(netID)
+			if err != nil || vmNet == nil {
+				s.jsonError(w, "Network interface not found", http.StatusNotFound)
+				return
+			}
+
+			if err := s.db.DeleteVMNetwork(netID); err != nil {
+				s.jsonError(w, "Failed to remove network interface: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			s.db.AddVMLog(vmID, "info", fmt.Sprintf("Removed network interface eth%d", vmNet.IfaceIndex))
+			s.jsonResponse(w, map[string]string{
+				"status":  "success",
+				"message": "Network interface removed",
+			})
+			return
+		}
+
+		// PUT /api/vms/{id}/networks/{netId} - update network interface
+		if r.Method == http.MethodPut {
+			// Check if VM is running
+			vmObj, err := s.db.GetVM(vmID)
+			if err != nil || vmObj == nil {
+				s.jsonError(w, "VM not found", http.StatusNotFound)
+				return
+			}
+			if vmObj.Status == "running" {
+				s.jsonError(w, "Cannot modify networks while VM is running", http.StatusBadRequest)
+				return
+			}
+
+			vmNet, err := s.db.GetVMNetwork(netID)
+			if err != nil || vmNet == nil {
+				s.jsonError(w, "Network interface not found", http.StatusNotFound)
+				return
+			}
+
+			var req struct {
+				NetworkID string `json:"network_id"`
+				IPAddress string `json:"ip_address"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+
+			if req.NetworkID != "" {
+				// Verify network exists
+				net, err := s.db.GetNetwork(req.NetworkID)
+				if err != nil || net == nil {
+					s.jsonError(w, "Network not found", http.StatusNotFound)
+					return
+				}
+				vmNet.NetworkID = req.NetworkID
+				// Update TAP device name if network changed
+				vmNet.TapDevice = fmt.Sprintf("fc%s-%d", vmID[:8], vmNet.IfaceIndex)
+			}
+			vmNet.IPAddress = req.IPAddress
+
+			if err := s.db.UpdateVMNetwork(vmNet); err != nil {
+				s.jsonError(w, "Failed to update network interface: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			s.db.AddVMLog(vmID, "info", fmt.Sprintf("Updated network interface eth%d", vmNet.IfaceIndex))
+			s.jsonResponse(w, map[string]interface{}{
+				"status":  "success",
+				"network": vmNet,
+			})
+			return
+		}
+
+		// GET /api/vms/{id}/networks/{netId} - get network interface info
+		if r.Method == http.MethodGet {
+			vmNet, err := s.db.GetVMNetwork(netID)
+			if err != nil {
+				s.jsonError(w, "Failed to get network interface: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if vmNet == nil {
+				s.jsonError(w, "Network interface not found", http.StatusNotFound)
+				return
+			}
+			s.jsonResponse(w, vmNet)
+			return
+		}
+
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+
+	case "password":
+		// POST /api/vms/{id}/password - change root password
+		if r.Method != http.MethodPost {
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if req.Password == "" {
+			s.jsonError(w, "Password is required", http.StatusBadRequest)
+			return
+		}
+
+		// Get VM to check status and get rootfs path
+		vmObj, err := s.db.GetVM(vmID)
+		if err != nil || vmObj == nil {
+			s.jsonError(w, "VM not found", http.StatusNotFound)
+			return
+		}
+
+		if vmObj.Status == "running" {
+			s.jsonError(w, "Cannot change password while VM is running", http.StatusBadRequest)
+			return
+		}
+
+		if vmObj.RootFSPath == "" {
+			s.jsonError(w, "VM has no root filesystem configured", http.StatusBadRequest)
+			return
+		}
+
+		// Set the root password
+		if err := setRootPassword(vmObj.RootFSPath, req.Password); err != nil {
+			s.jsonError(w, "Failed to set root password: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.db.AddVMLog(vmID, "info", "Root password changed")
+		s.jsonResponse(w, map[string]string{
+			"status":  "success",
+			"message": "Root password changed",
+		})
+
+	case "expand-rootfs":
+		// POST /api/vms/{id}/expand-rootfs - expand root filesystem
+		if r.Method != http.MethodPost {
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			NewSizeMB int64 `json:"new_size_mb"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if req.NewSizeMB <= 0 {
+			s.jsonError(w, "New size must be positive (in MB)", http.StatusBadRequest)
+			return
+		}
+
+		if err := s.vmMgr.ExpandRootFS(vmID, req.NewSizeMB); err != nil {
+			s.jsonError(w, "Failed to expand rootfs: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.jsonResponse(w, map[string]interface{}{
+			"status":      "success",
+			"message":     "RootFS expanded",
+			"new_size_mb": req.NewSizeMB,
+		})
 
 	case "":
 		switch r.Method {
@@ -817,11 +1373,136 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 				s.jsonError(w, "Failed to delete VM", http.StatusInternalServerError)
 				return
 			}
+			// Delete VM metrics history
+			if err := s.db.DeleteVMMetrics(vmID); err != nil {
+				s.logger("Warning: failed to delete VM metrics for %s: %v", vmID, err)
+			}
 			s.jsonResponse(w, map[string]string{"status": "success"})
 
 		default:
 			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
+
+	case "change-ip":
+		// POST /api/vms/{id}/change-ip - change VM IP address
+		if r.Method != http.MethodPost {
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse request
+		var req struct {
+			IPAddress string `json:"ip_address"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if req.IPAddress == "" {
+			s.jsonError(w, "IP address is required", http.StatusBadRequest)
+			return
+		}
+
+		// Validate IP format
+		if net.ParseIP(req.IPAddress) == nil {
+			s.jsonError(w, "Invalid IP address format", http.StatusBadRequest)
+			return
+		}
+
+		// Get the VM
+		vmObj, err := s.db.GetVM(vmID)
+		if err != nil || vmObj == nil {
+			s.jsonError(w, "VM not found", http.StatusNotFound)
+			return
+		}
+
+		// Check if VM has a network
+		if vmObj.NetworkID == "" {
+			s.jsonError(w, "VM is not connected to a network", http.StatusBadRequest)
+			return
+		}
+
+		// Get network to validate IP is in range
+		netObj, err := s.db.GetNetwork(vmObj.NetworkID)
+		if err != nil || netObj == nil {
+			s.jsonError(w, "Network not found", http.StatusNotFound)
+			return
+		}
+
+		// Verify IP is in the network subnet
+		_, ipNet, err := net.ParseCIDR(netObj.Subnet)
+		if err != nil {
+			s.jsonError(w, "Invalid network subnet", http.StatusInternalServerError)
+			return
+		}
+
+		reqIP := net.ParseIP(req.IPAddress)
+		if !ipNet.Contains(reqIP) {
+			s.jsonError(w, "IP address is not in the network subnet", http.StatusBadRequest)
+			return
+		}
+
+		// Check if IP is already in use by another VM
+		vms, err := s.db.GetVMsByNetwork(vmObj.NetworkID)
+		if err != nil {
+			s.jsonError(w, "Failed to check IP availability", http.StatusInternalServerError)
+			return
+		}
+
+		for _, vm := range vms {
+			if vm.ID != vmID && vm.IPAddress == req.IPAddress {
+				s.jsonError(w, "IP address is already in use by another VM", http.StatusConflict)
+				return
+			}
+		}
+
+		// Check if IP is the gateway
+		if req.IPAddress == netObj.Gateway {
+			s.jsonError(w, "Cannot use gateway IP address", http.StatusBadRequest)
+			return
+		}
+
+		// Store whether VM was running
+		wasRunning := vmObj.Status == "running"
+
+		// If VM is running, stop it first
+		if wasRunning {
+			if err := s.vmMgr.StopVM(vmID); err != nil {
+				s.logger("Warning: failed to stop VM for IP change: %v", err)
+			}
+			// Wait a bit for VM to stop
+			time.Sleep(2 * time.Second)
+		}
+
+		// Update the VM IP address
+		oldIP := vmObj.IPAddress
+		vmObj.IPAddress = req.IPAddress
+		// Update kernel args with new IP configuration
+		vmObj.KernelArgs = buildKernelArgs(vmObj.KernelArgs, req.IPAddress, netObj.Gateway)
+
+		if err := s.db.UpdateVM(vmObj); err != nil {
+			s.jsonError(w, "Failed to update VM", http.StatusInternalServerError)
+			return
+		}
+
+		s.db.AddVMLog(vmID, "info", fmt.Sprintf("IP address changed from %s to %s", oldIP, req.IPAddress))
+
+		// If VM was running, restart it
+		if wasRunning {
+			if err := s.vmMgr.StartVM(vmID); err != nil {
+				s.db.AddVMLog(vmID, "error", "Failed to restart VM after IP change: "+err.Error())
+				s.jsonError(w, "IP changed but failed to restart VM: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			s.db.AddVMLog(vmID, "info", "VM restarted with new IP address")
+		}
+
+		s.jsonResponse(w, map[string]interface{}{
+			"status":     "success",
+			"ip_address": req.IPAddress,
+			"restarted":  wasRunning,
+		})
 
 	default:
 		s.jsonError(w, "Unknown action", http.StatusBadRequest)
@@ -841,12 +1522,16 @@ func (s *Server) handleNetworks(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		var req struct {
-			Name      string `json:"name"`
-			Subnet    string `json:"subnet"`
-			Gateway   string `json:"gateway"`
-			DHCPStart string `json:"dhcp_start"`
-			DHCPEnd   string `json:"dhcp_end"`
-			EnableNAT bool   `json:"enable_nat"`
+			Name          string `json:"name"`
+			Subnet        string `json:"subnet"`
+			Gateway       string `json:"gateway"`
+			DHCPStart     string `json:"dhcp_start"`
+			DHCPEnd       string `json:"dhcp_end"`
+			EnableNAT     bool   `json:"enable_nat"`
+			OutInterface  string `json:"out_interface"`
+			MTU           int    `json:"mtu"`
+			STP           bool   `json:"stp"`
+			BlockExternal bool   `json:"block_external"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -875,19 +1560,28 @@ func (s *Server) handleNetworks(w http.ResponseWriter, r *http.Request) {
 			req.Gateway = gw
 		}
 
+		// Default MTU
+		if req.MTU == 0 {
+			req.MTU = 1500
+		}
+
 		netID := generateID()
 		bridgeName := network.GenerateBridgeName(netID)
 
 		netObj := &database.Network{
-			ID:         netID,
-			Name:       req.Name,
-			BridgeName: bridgeName,
-			Subnet:     req.Subnet,
-			Gateway:    req.Gateway,
-			DHCPStart:  req.DHCPStart,
-			DHCPEnd:    req.DHCPEnd,
-			EnableNAT:  req.EnableNAT,
-			Status:     "inactive",
+			ID:            netID,
+			Name:          req.Name,
+			BridgeName:    bridgeName,
+			Subnet:        req.Subnet,
+			Gateway:       req.Gateway,
+			DHCPStart:     req.DHCPStart,
+			DHCPEnd:       req.DHCPEnd,
+			EnableNAT:     req.EnableNAT,
+			OutInterface:  req.OutInterface,
+			MTU:           req.MTU,
+			STP:           req.STP,
+			BlockExternal: req.BlockExternal,
+			Status:        "inactive",
 		}
 
 		if err := s.db.CreateNetwork(netObj); err != nil {
@@ -998,6 +1692,114 @@ func (s *Server) handleNetwork(w http.ResponseWriter, r *http.Request) {
 		}
 		s.jsonResponse(w, map[string]interface{}{"vms": vms})
 
+	case "bridge":
+		netObj, err := s.db.GetNetwork(netID)
+		if err != nil || netObj == nil {
+			s.jsonError(w, "Network not found", http.StatusNotFound)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			// Get bridge info
+			bridgeInfo, err := s.netMgr.GetBridgeInfo(netObj.BridgeName)
+			if err != nil {
+				// Bridge may not exist yet
+				s.jsonResponse(w, map[string]interface{}{
+					"name":       netObj.BridgeName,
+					"exists":     false,
+					"is_up":      false,
+					"mtu":        netObj.MTU,
+					"stp":        netObj.STP,
+					"interfaces": []string{},
+				})
+				return
+			}
+			bridgeInfo.MTU = netObj.MTU // Use configured MTU
+			s.jsonResponse(w, map[string]interface{}{
+				"name":       bridgeInfo.Name,
+				"exists":     true,
+				"is_up":      bridgeInfo.IsUp,
+				"mtu":        bridgeInfo.MTU,
+				"stp":        bridgeInfo.STP,
+				"ip_address": bridgeInfo.IPAddress,
+				"interfaces": bridgeInfo.Interfaces,
+			})
+
+		case http.MethodPut:
+			// Update bridge settings
+			var req struct {
+				MTU int  `json:"mtu"`
+				STP bool `json:"stp"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+
+			// Update in database
+			if req.MTU > 0 {
+				netObj.MTU = req.MTU
+			}
+			netObj.STP = req.STP
+			if err := s.db.UpdateNetwork(netObj); err != nil {
+				s.jsonError(w, "Failed to update network", http.StatusInternalServerError)
+				return
+			}
+
+			// Apply to running bridge if active
+			if netObj.Status == "active" {
+				if req.MTU > 0 {
+					s.netMgr.SetBridgeMTU(netObj.BridgeName, req.MTU)
+				}
+				s.netMgr.SetBridgeSTP(netObj.BridgeName, req.STP)
+			}
+
+			s.jsonResponse(w, map[string]string{"status": "success"})
+
+		default:
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+
+	case "firewall":
+		s.handleNetworkFirewall(w, r, netID)
+		return
+
+	case "interfaces":
+		// List available physical interfaces for NAT
+		if r.Method != http.MethodGet {
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		interfaces, err := network.ListPhysicalInterfaces()
+		if err != nil {
+			s.jsonError(w, "Failed to list interfaces", http.StatusInternalServerError)
+			return
+		}
+		s.jsonResponse(w, map[string]interface{}{"interfaces": interfaces})
+
+	case "available-ips":
+		// List available (free) IP addresses in the network
+		if r.Method != http.MethodGet {
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		netObj, err := s.db.GetNetwork(netID)
+		if err != nil || netObj == nil {
+			s.jsonError(w, "Network not found", http.StatusNotFound)
+			return
+		}
+
+		// Parse subnet to get available IPs
+		availableIPs, err := s.getAvailableIPsInNetwork(netObj)
+		if err != nil {
+			s.jsonError(w, "Failed to calculate available IPs: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.jsonResponse(w, map[string]interface{}{"available_ips": availableIPs})
+
 	case "":
 		switch r.Method {
 		case http.MethodGet:
@@ -1033,6 +1835,585 @@ func (s *Server) handleNetwork(w http.ResponseWriter, r *http.Request) {
 
 			if err := s.db.DeleteNetwork(netID); err != nil {
 				s.jsonError(w, "Failed to delete network", http.StatusInternalServerError)
+				return
+			}
+			s.jsonResponse(w, map[string]string{"status": "success"})
+
+		default:
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+
+	default:
+		s.jsonError(w, "Unknown action", http.StatusBadRequest)
+	}
+}
+
+// handleNetworkFirewall handles firewall rule management for a network
+func (s *Server) handleNetworkFirewall(w http.ResponseWriter, r *http.Request, networkID string) {
+	netObj, err := s.db.GetNetwork(networkID)
+	if err != nil || netObj == nil {
+		s.jsonError(w, "Network not found", http.StatusNotFound)
+		return
+	}
+
+	// Check for rule ID in path
+	path := strings.TrimPrefix(r.URL.Path, "/api/networks/"+networkID+"/firewall")
+	path = strings.TrimPrefix(path, "/")
+	ruleID := ""
+	if path != "" {
+		ruleID = path
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		if ruleID != "" {
+			// Get single rule
+			rule, err := s.db.GetFirewallRule(ruleID)
+			if err != nil || rule == nil {
+				s.jsonError(w, "Rule not found", http.StatusNotFound)
+				return
+			}
+			s.jsonResponse(w, rule)
+		} else {
+			// List all rules for network
+			rules, err := s.db.ListFirewallRules(networkID)
+			if err != nil {
+				s.jsonError(w, "Failed to list firewall rules", http.StatusInternalServerError)
+				return
+			}
+			s.jsonResponse(w, map[string]interface{}{
+				"rules":          rules,
+				"block_external": netObj.BlockExternal,
+			})
+		}
+
+	case http.MethodPost:
+		var req struct {
+			RuleType    string `json:"rule_type"` // source_ip, port_forward, port_allow
+			SourceIP    string `json:"source_ip"` // For source_ip rules
+			DestIP      string `json:"dest_ip"`   // VM IP for port_forward
+			HostPort    int    `json:"host_port"` // External port for port_forward
+			DestPort    int    `json:"dest_port"` // Destination port
+			Protocol    string `json:"protocol"`  // tcp, udp, all
+			Description string `json:"description"`
+			Priority    int    `json:"priority"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if req.RuleType == "" {
+			s.jsonError(w, "Rule type is required", http.StatusBadRequest)
+			return
+		}
+
+		// Validate based on rule type
+		switch req.RuleType {
+		case "source_ip":
+			if req.SourceIP == "" {
+				s.jsonError(w, "Source IP is required for source_ip rules", http.StatusBadRequest)
+				return
+			}
+		case "port_forward":
+			if req.DestIP == "" || req.HostPort == 0 || req.DestPort == 0 {
+				s.jsonError(w, "dest_ip, host_port, and dest_port are required for port_forward rules", http.StatusBadRequest)
+				return
+			}
+		case "port_allow":
+			if req.DestPort == 0 {
+				s.jsonError(w, "dest_port is required for port_allow rules", http.StatusBadRequest)
+				return
+			}
+		default:
+			s.jsonError(w, "Invalid rule type", http.StatusBadRequest)
+			return
+		}
+
+		if req.Protocol == "" {
+			req.Protocol = "tcp"
+		}
+		if req.Priority == 0 {
+			req.Priority = 100
+		}
+
+		rule := &database.FirewallRule{
+			ID:          generateID(),
+			NetworkID:   networkID,
+			RuleType:    req.RuleType,
+			SourceIP:    req.SourceIP,
+			DestIP:      req.DestIP,
+			HostPort:    req.HostPort,
+			DestPort:    req.DestPort,
+			Protocol:    req.Protocol,
+			Action:      "allow",
+			Description: req.Description,
+			Enabled:     true,
+			Priority:    req.Priority,
+		}
+
+		if err := s.db.CreateFirewallRule(rule); err != nil {
+			s.jsonError(w, "Failed to create firewall rule: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.jsonResponse(w, map[string]interface{}{
+			"status": "success",
+			"rule":   rule,
+		})
+
+	case http.MethodPut:
+		if ruleID == "" {
+			// Update network block_external setting
+			var req struct {
+				BlockExternal bool `json:"block_external"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+			netObj.BlockExternal = req.BlockExternal
+			if err := s.db.UpdateNetwork(netObj); err != nil {
+				s.jsonError(w, "Failed to update network", http.StatusInternalServerError)
+				return
+			}
+			s.jsonResponse(w, map[string]string{"status": "success"})
+			return
+		}
+
+		// Update specific rule
+		rule, err := s.db.GetFirewallRule(ruleID)
+		if err != nil || rule == nil {
+			s.jsonError(w, "Rule not found", http.StatusNotFound)
+			return
+		}
+
+		var req struct {
+			Enabled     *bool  `json:"enabled"`
+			Description string `json:"description"`
+			Priority    int    `json:"priority"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if req.Enabled != nil {
+			rule.Enabled = *req.Enabled
+		}
+		if req.Description != "" {
+			rule.Description = req.Description
+		}
+		if req.Priority > 0 {
+			rule.Priority = req.Priority
+		}
+
+		if err := s.db.UpdateFirewallRule(rule); err != nil {
+			s.jsonError(w, "Failed to update firewall rule", http.StatusInternalServerError)
+			return
+		}
+
+		s.jsonResponse(w, map[string]interface{}{
+			"status": "success",
+			"rule":   rule,
+		})
+
+	case http.MethodDelete:
+		if ruleID == "" {
+			s.jsonError(w, "Rule ID required", http.StatusBadRequest)
+			return
+		}
+
+		if err := s.db.DeleteFirewallRule(ruleID); err != nil {
+			s.jsonError(w, "Failed to delete firewall rule", http.StatusInternalServerError)
+			return
+		}
+
+		s.jsonResponse(w, map[string]string{"status": "success"})
+
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handlePhysicalInterfaces returns list of physical interfaces for NAT configuration
+func (s *Server) handlePhysicalInterfaces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	interfaces, err := network.ListPhysicalInterfaces()
+	if err != nil {
+		s.jsonError(w, "Failed to list interfaces", http.StatusInternalServerError)
+		return
+	}
+
+	s.jsonResponse(w, map[string]interface{}{"interfaces": interfaces})
+}
+
+// VM Search handler
+func (s *Server) handleVMSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	params := &database.VMSearchParams{}
+
+	if r.Method == http.MethodGet {
+		// Parse query parameters
+		params.Query = r.URL.Query().Get("q")
+		if params.Query == "" {
+			params.Query = r.URL.Query().Get("query") // Also accept "query" param
+		}
+		params.Name = r.URL.Query().Get("name")
+		params.IPAddress = r.URL.Query().Get("ip")
+		params.OS = r.URL.Query().Get("os")
+		params.Status = r.URL.Query().Get("status")
+		params.NetworkID = r.URL.Query().Get("network_id")
+		params.RootFSID = r.URL.Query().Get("rootfs_id")
+		params.KernelID = r.URL.Query().Get("kernel_id")
+		params.VMGroupID = r.URL.Query().Get("vm_group_id")
+		params.GroupID = r.URL.Query().Get("group_id")
+	} else {
+		// Parse JSON body
+		if err := json.NewDecoder(r.Body).Decode(params); err != nil {
+			s.jsonError(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+	}
+
+	vms, err := s.db.SearchVMs(params)
+	if err != nil {
+		s.jsonError(w, "Search failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Enrich results with additional info
+	type enrichedVM struct {
+		*database.VM
+		RootFSName  string              `json:"rootfs_name,omitempty"`
+		OSRelease   string              `json:"os_release,omitempty"`
+		KernelName  string              `json:"kernel_name,omitempty"`
+		NetworkName string              `json:"network_name,omitempty"`
+		VMGroups    []*database.VMGroup `json:"vm_groups,omitempty"`
+	}
+
+	results := make([]enrichedVM, 0, len(vms))
+	for _, vm := range vms {
+		enriched := enrichedVM{VM: vm}
+
+		// Get rootfs info
+		if vm.RootFSPath != "" {
+			if rootfs, err := s.db.GetRootFSByPath(vm.RootFSPath); err == nil && rootfs != nil {
+				enriched.RootFSName = rootfs.Name
+				enriched.OSRelease = rootfs.OSRelease
+			}
+		}
+
+		// Get kernel info
+		if vm.KernelPath != "" {
+			if kernel, err := s.db.GetKernelByPath(vm.KernelPath); err == nil && kernel != nil {
+				enriched.KernelName = kernel.Name
+			}
+		}
+
+		// Get network info
+		if vm.NetworkID != "" {
+			if net, err := s.db.GetNetwork(vm.NetworkID); err == nil && net != nil {
+				enriched.NetworkName = net.Name
+			}
+		}
+
+		// Get VM groups
+		if groups, err := s.db.GetVMGroups(vm.ID); err == nil {
+			enriched.VMGroups = groups
+		}
+
+		results = append(results, enriched)
+	}
+
+	s.jsonResponse(w, map[string]interface{}{
+		"vms":   results,
+		"count": len(results),
+	})
+}
+
+// VM Groups handlers
+func (s *Server) handleVMGroups(w http.ResponseWriter, r *http.Request) {
+	session := s.getSession(r)
+
+	switch r.Method {
+	case http.MethodGet:
+		groups, err := s.db.ListVMGroups()
+		if err != nil {
+			s.jsonError(w, "Failed to list VM groups", http.StatusInternalServerError)
+			return
+		}
+
+		// Enrich with VM count
+		type groupWithCount struct {
+			*database.VMGroup
+			VMCount int `json:"vm_count"`
+		}
+
+		result := make([]groupWithCount, 0, len(groups))
+		for _, g := range groups {
+			count, _ := s.db.CountVMsInGroup(g.ID)
+			result = append(result, groupWithCount{VMGroup: g, VMCount: count})
+		}
+
+		s.jsonResponse(w, map[string]interface{}{"vm_groups": result})
+
+	case http.MethodPost:
+		// Only admins can create VM groups
+		if session == nil || session.Role != "admin" {
+			s.jsonError(w, "Admin access required", http.StatusForbidden)
+			return
+		}
+
+		var req struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Color       string `json:"color"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if req.Name == "" {
+			s.jsonError(w, "Name is required", http.StatusBadRequest)
+			return
+		}
+
+		if req.Color == "" {
+			req.Color = "#6366f1" // Default purple
+		}
+
+		group := &database.VMGroup{
+			ID:          generateID(),
+			Name:        req.Name,
+			Description: req.Description,
+			Color:       req.Color,
+		}
+
+		if err := s.db.CreateVMGroup(group); err != nil {
+			s.jsonError(w, "Failed to create VM group: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.jsonResponse(w, map[string]interface{}{
+			"status":   "success",
+			"vm_group": group,
+		})
+
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleVMGroup(w http.ResponseWriter, r *http.Request) {
+	session := s.getSession(r)
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/vmgroups/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		s.jsonError(w, "VM Group ID required", http.StatusBadRequest)
+		return
+	}
+
+	groupID := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
+
+	switch action {
+	case "vms":
+		// Get or manage VMs in this group
+		switch r.Method {
+		case http.MethodGet:
+			vms, err := s.db.GetVMsInGroup(groupID)
+			if err != nil {
+				s.jsonError(w, "Failed to get VMs", http.StatusInternalServerError)
+				return
+			}
+			s.jsonResponse(w, map[string]interface{}{"vms": vms})
+
+		case http.MethodPost:
+			// Add VM to group (admin only)
+			if session == nil || session.Role != "admin" {
+				s.jsonError(w, "Admin access required", http.StatusForbidden)
+				return
+			}
+			var req struct {
+				VMID string `json:"vm_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+			if err := s.db.AddVMToGroup(groupID, req.VMID); err != nil {
+				s.jsonError(w, "Failed to add VM to group", http.StatusInternalServerError)
+				return
+			}
+			s.jsonResponse(w, map[string]string{"status": "success"})
+
+		case http.MethodDelete:
+			// Remove VM from group (admin only)
+			if session == nil || session.Role != "admin" {
+				s.jsonError(w, "Admin access required", http.StatusForbidden)
+				return
+			}
+			vmID := r.URL.Query().Get("vm_id")
+			if vmID == "" {
+				s.jsonError(w, "vm_id required", http.StatusBadRequest)
+				return
+			}
+			if err := s.db.RemoveVMFromGroup(groupID, vmID); err != nil {
+				s.jsonError(w, "Failed to remove VM from group", http.StatusInternalServerError)
+				return
+			}
+			s.jsonResponse(w, map[string]string{"status": "success"})
+
+		default:
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+
+	case "permissions":
+		// Manage permissions (admin only)
+		if session == nil || session.Role != "admin" {
+			s.jsonError(w, "Admin access required", http.StatusForbidden)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			perms, err := s.db.GetVMGroupPermissions(groupID)
+			if err != nil {
+				s.jsonError(w, "Failed to get permissions", http.StatusInternalServerError)
+				return
+			}
+
+			// Enrich with group names
+			type permWithName struct {
+				*database.VMGroupPermission
+				GroupName string `json:"group_name"`
+			}
+			result := make([]permWithName, 0, len(perms))
+			for _, p := range perms {
+				name := ""
+				if g, err := s.db.GetGroup(p.GroupID); err == nil && g != nil {
+					name = g.Name
+				}
+				result = append(result, permWithName{VMGroupPermission: p, GroupName: name})
+			}
+
+			s.jsonResponse(w, map[string]interface{}{"permissions": result})
+
+		case http.MethodPost:
+			var req struct {
+				GroupID     string `json:"group_id"`
+				Permissions string `json:"permissions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+			if req.GroupID == "" {
+				s.jsonError(w, "group_id required", http.StatusBadRequest)
+				return
+			}
+			if err := s.db.AddVMGroupPermission(groupID, req.GroupID, req.Permissions); err != nil {
+				s.jsonError(w, "Failed to add permission", http.StatusInternalServerError)
+				return
+			}
+			s.jsonResponse(w, map[string]string{"status": "success"})
+
+		case http.MethodDelete:
+			userGroupID := r.URL.Query().Get("group_id")
+			if userGroupID == "" {
+				s.jsonError(w, "group_id required", http.StatusBadRequest)
+				return
+			}
+			if err := s.db.RemoveVMGroupPermission(groupID, userGroupID); err != nil {
+				s.jsonError(w, "Failed to remove permission", http.StatusInternalServerError)
+				return
+			}
+			s.jsonResponse(w, map[string]string{"status": "success"})
+
+		default:
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+
+	case "":
+		// Direct operations on the group
+		switch r.Method {
+		case http.MethodGet:
+			group, err := s.db.GetVMGroup(groupID)
+			if err != nil || group == nil {
+				s.jsonError(w, "VM group not found", http.StatusNotFound)
+				return
+			}
+
+			// Get VM count and permissions
+			vmCount, _ := s.db.CountVMsInGroup(groupID)
+			perms, _ := s.db.GetVMGroupPermissions(groupID)
+
+			s.jsonResponse(w, map[string]interface{}{
+				"vm_group":    group,
+				"vm_count":    vmCount,
+				"permissions": perms,
+			})
+
+		case http.MethodPut:
+			// Update group (admin only)
+			if session == nil || session.Role != "admin" {
+				s.jsonError(w, "Admin access required", http.StatusForbidden)
+				return
+			}
+
+			group, err := s.db.GetVMGroup(groupID)
+			if err != nil || group == nil {
+				s.jsonError(w, "VM group not found", http.StatusNotFound)
+				return
+			}
+
+			var req struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+				Color       string `json:"color"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+
+			if req.Name != "" {
+				group.Name = req.Name
+			}
+			if req.Description != "" {
+				group.Description = req.Description
+			}
+			if req.Color != "" {
+				group.Color = req.Color
+			}
+
+			if err := s.db.UpdateVMGroup(group); err != nil {
+				s.jsonError(w, "Failed to update VM group", http.StatusInternalServerError)
+				return
+			}
+			s.jsonResponse(w, map[string]interface{}{"status": "success", "vm_group": group})
+
+		case http.MethodDelete:
+			// Delete group (admin only)
+			if session == nil || session.Role != "admin" {
+				s.jsonError(w, "Admin access required", http.StatusForbidden)
+				return
+			}
+
+			if err := s.db.DeleteVMGroup(groupID); err != nil {
+				s.jsonError(w, "Failed to delete VM group", http.StatusInternalServerError)
 				return
 			}
 			s.jsonResponse(w, map[string]string{"status": "success"})
@@ -1193,7 +2574,30 @@ func (s *Server) handleRootFSList(w http.ResponseWriter, r *http.Request) {
 			s.jsonError(w, "Failed to list rootfs", http.StatusInternalServerError)
 			return
 		}
-		s.jsonResponse(w, map[string]interface{}{"rootfs": rootfsList})
+
+		// Build response with VM usage information
+		type rootfsWithUsage struct {
+			*database.RootFS
+			UsedByVMs []map[string]string `json:"used_by_vms"`
+		}
+
+		result := make([]rootfsWithUsage, 0, len(rootfsList))
+		for _, rootfs := range rootfsList {
+			entry := rootfsWithUsage{RootFS: rootfs, UsedByVMs: []map[string]string{}}
+			vms, err := s.db.GetVMsByRootFSPath(rootfs.Path)
+			if err == nil && len(vms) > 0 {
+				for _, vm := range vms {
+					entry.UsedByVMs = append(entry.UsedByVMs, map[string]string{
+						"id":     vm.ID,
+						"name":   vm.Name,
+						"status": vm.Status,
+					})
+				}
+			}
+			result = append(result, entry)
+		}
+
+		s.jsonResponse(w, map[string]interface{}{"rootfs": result})
 
 	default:
 		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1754,6 +3158,181 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleAccount returns the current user's account information with groups and accessible VMs
+func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sess := s.getSession(r)
+	if sess == nil {
+		s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Get user details
+	user, err := s.db.GetUser(sess.UserID)
+	if err != nil || user == nil {
+		s.jsonError(w, "User not found", http.StatusNotFound)
+		return
+	}
+
+	// Get user's groups
+	groups, err := s.db.GetUserGroups(sess.UserID)
+	if err != nil {
+		groups = []*database.Group{}
+	}
+
+	// Build response with groups and their VMs
+	type groupWithVMs struct {
+		*database.Group
+		Permissions []string            `json:"permissions_list"`
+		VMs         []*database.GroupVM `json:"vms"`
+	}
+
+	groupsWithVMs := make([]groupWithVMs, 0, len(groups))
+	allVMIDs := make(map[string]bool)
+
+	for _, g := range groups {
+		gvms, err := s.db.ListGroupVMs(g.ID)
+		if err != nil {
+			gvms = []*database.GroupVM{}
+		}
+
+		// Track all VM IDs for this user
+		for _, gvm := range gvms {
+			allVMIDs[gvm.VMID] = true
+		}
+
+		// Parse permissions string into list
+		permList := []string{}
+		if g.Permissions != "" {
+			permList = strings.Split(g.Permissions, ",")
+		}
+
+		groupsWithVMs = append(groupsWithVMs, groupWithVMs{
+			Group:       g,
+			Permissions: permList,
+			VMs:         gvms,
+		})
+	}
+
+	// Get full VM details for all accessible VMs
+	type vmInfo struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		Status    string `json:"status"`
+		IPAddress string `json:"ip_address"`
+		VCPU      int    `json:"vcpu"`
+		MemoryMB  int    `json:"memory_mb"`
+	}
+
+	accessibleVMs := make([]vmInfo, 0)
+
+	// If admin, they have access to all VMs
+	if user.Role == "admin" {
+		vms, err := s.db.ListVMs()
+		if err == nil {
+			for _, vm := range vms {
+				accessibleVMs = append(accessibleVMs, vmInfo{
+					ID:        vm.ID,
+					Name:      vm.Name,
+					Status:    vm.Status,
+					IPAddress: vm.IPAddress,
+					VCPU:      vm.VCPU,
+					MemoryMB:  vm.MemoryMB,
+				})
+			}
+		}
+	} else {
+		// For regular users, only show VMs from their groups
+		for vmID := range allVMIDs {
+			vm, err := s.db.GetVM(vmID)
+			if err == nil && vm != nil {
+				accessibleVMs = append(accessibleVMs, vmInfo{
+					ID:        vm.ID,
+					Name:      vm.Name,
+					Status:    vm.Status,
+					IPAddress: vm.IPAddress,
+					VCPU:      vm.VCPU,
+					MemoryMB:  vm.MemoryMB,
+				})
+			}
+		}
+	}
+
+	s.jsonResponse(w, map[string]interface{}{
+		"user": map[string]interface{}{
+			"id":         user.ID,
+			"username":   user.Username,
+			"email":      user.Email,
+			"role":       user.Role,
+			"active":     user.Active,
+			"created_at": user.CreatedAt,
+		},
+		"groups":         groupsWithVMs,
+		"accessible_vms": accessibleVMs,
+		"is_admin":       user.Role == "admin",
+	})
+}
+
+// handleAccountPassword changes the current user's password
+func (s *Server) handleAccountPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sess := s.getSession(r)
+	if sess == nil {
+		s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.jsonError(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	if req.NewPassword == "" {
+		s.jsonError(w, "New password is required", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.NewPassword) < 4 {
+		s.jsonError(w, "Password must be at least 4 characters", http.StatusBadRequest)
+		return
+	}
+
+	// Verify current password
+	user, err := s.db.GetUser(sess.UserID)
+	if err != nil || user == nil {
+		s.jsonError(w, "User not found", http.StatusNotFound)
+		return
+	}
+
+	currentHash := sha256.Sum256([]byte(req.CurrentPassword))
+	if hex.EncodeToString(currentHash[:]) != user.PasswordHash {
+		s.jsonError(w, "Current password is incorrect", http.StatusUnauthorized)
+		return
+	}
+
+	// Update password
+	newHash := sha256.Sum256([]byte(req.NewPassword))
+	if err := s.db.UpdateUserPassword(sess.UserID, hex.EncodeToString(newHash[:])); err != nil {
+		s.jsonError(w, "Failed to update password", http.StatusInternalServerError)
+		return
+	}
+
+	s.jsonResponse(w, map[string]string{"status": "success", "message": "Password changed successfully"})
+}
+
 // Group handlers
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -2093,6 +3672,25 @@ func (s *Server) handleDownloadProgress(w http.ResponseWriter, r *http.Request) 
 	s.jsonResponse(w, progress)
 }
 
+// Operation progress handler for async operations (VM duplication, etc.)
+func (s *Server) handleOperationProgress(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimPrefix(r.URL.Path, "/api/operations/")
+	if key == "" {
+		s.jsonError(w, "Operation key required", http.StatusBadRequest)
+		return
+	}
+
+	progress := s.vmMgr.GetOperationProgress(key)
+	if progress == nil {
+		s.jsonResponse(w, map[string]interface{}{
+			"status": "not_found",
+		})
+		return
+	}
+
+	s.jsonResponse(w, progress)
+}
+
 // System status handler
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -2134,14 +3732,14 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 
 	hostname, _ := os.Hostname()
 	status["system"] = map[string]interface{}{
-		"hostname":     hostname,
-		"os":           runtime.GOOS,
-		"arch":         runtime.GOARCH,
-		"go_version":   runtime.Version(),
-		"num_cpu":      runtime.NumCPU(),
+		"hostname":      hostname,
+		"os":            runtime.GOOS,
+		"arch":          runtime.GOARCH,
+		"go_version":    runtime.Version(),
+		"num_cpu":       runtime.NumCPU(),
 		"num_goroutine": runtime.NumGoroutine(),
-		"memory_alloc": memInfo.Alloc,
-		"memory_sys":   memInfo.Sys,
+		"memory_alloc":  memInfo.Alloc,
+		"memory_sys":    memInfo.Sys,
 	}
 
 	// KVM status
@@ -2157,7 +3755,138 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	// Uptime (process start time approximation)
 	status["uptime_seconds"] = time.Since(startTime).Seconds()
 
+	// Real system CPU and memory stats
+	cpuPercent, cpuCores := getSystemCPU()
+	memUsedMB, memTotalMB, memPercent := getSystemMemory()
+
+	status["cpu_percent"] = cpuPercent
+	status["cpu_cores"] = cpuCores
+	status["mem_used_mb"] = memUsedMB
+	status["mem_total_mb"] = memTotalMB
+	status["mem_percent"] = memPercent
+
+	// Disk usage for data directory
+	diskUsedGB, diskTotalGB, diskPercent := getDiskUsage(s.dataDir)
+	status["disk_used_gb"] = diskUsedGB
+	status["disk_total_gb"] = diskTotalGB
+	status["disk_percent"] = diskPercent
+	status["data_dir"] = s.dataDir
+
 	s.jsonResponse(w, status)
+}
+
+// getSystemCPU returns CPU usage percentage and core count
+func getSystemCPU() (float64, int) {
+	cores := runtime.NumCPU()
+
+	// Read /proc/stat for CPU usage
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, cores
+	}
+
+	lines := strings.Split(string(data), "\n")
+	if len(lines) == 0 {
+		return 0, cores
+	}
+
+	// Parse first line: cpu user nice system idle iowait irq softirq
+	fields := strings.Fields(lines[0])
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, cores
+	}
+
+	var user, nice, system, idle, iowait int64
+	fmt.Sscanf(fields[1], "%d", &user)
+	fmt.Sscanf(fields[2], "%d", &nice)
+	fmt.Sscanf(fields[3], "%d", &system)
+	fmt.Sscanf(fields[4], "%d", &idle)
+	if len(fields) > 5 {
+		fmt.Sscanf(fields[5], "%d", &iowait)
+	}
+
+	total := user + nice + system + idle + iowait
+	if total == 0 {
+		return 0, cores
+	}
+
+	// Calculate percentage (non-idle)
+	idlePercent := float64(idle+iowait) / float64(total) * 100
+	cpuPercent := 100 - idlePercent
+
+	return cpuPercent, cores
+}
+
+// getSystemMemory returns used MB, total MB, and percentage
+func getSystemMemory() (int64, int64, float64) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, 0
+	}
+
+	var memTotal, memFree, buffers, cached, sReclaimable int64
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		var val int64
+		fmt.Sscanf(fields[1], "%d", &val)
+
+		switch fields[0] {
+		case "MemTotal:":
+			memTotal = val
+		case "MemFree:":
+			memFree = val
+		case "Buffers:":
+			buffers = val
+		case "Cached:":
+			cached = val
+		case "SReclaimable:":
+			sReclaimable = val
+		}
+	}
+
+	// Available memory = Free + Buffers + Cached + SReclaimable
+	memAvailable := memFree + buffers + cached + sReclaimable
+	memUsed := memTotal - memAvailable
+
+	// Convert from KB to MB
+	memTotalMB := memTotal / 1024
+	memUsedMB := memUsed / 1024
+
+	var memPercent float64
+	if memTotal > 0 {
+		memPercent = float64(memUsed) / float64(memTotal) * 100
+	}
+
+	return memUsedMB, memTotalMB, memPercent
+}
+
+// getDiskUsage returns disk usage for a given path (used GB, total GB, percentage)
+func getDiskUsage(path string) (float64, float64, float64) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, 0, 0
+	}
+
+	// Calculate sizes in bytes
+	totalBytes := stat.Blocks * uint64(stat.Bsize)
+	freeBytes := stat.Bfree * uint64(stat.Bsize)
+	usedBytes := totalBytes - freeBytes
+
+	// Convert to GB
+	totalGB := float64(totalBytes) / (1024 * 1024 * 1024)
+	usedGB := float64(usedBytes) / (1024 * 1024 * 1024)
+
+	var percent float64
+	if totalBytes > 0 {
+		percent = float64(usedBytes) / float64(totalBytes) * 100
+	}
+
+	return usedGB, totalGB, percent
 }
 
 // Firecracker version check handler
@@ -2227,6 +3956,133 @@ func (s *Server) handleFirecrackerUpgrade(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// handleJailerConfig handles GET/PUT for jailer configuration
+func (s *Server) handleJailerConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// Return current jailer config
+		config := s.vmMgr.GetJailerConfig()
+		available := s.vmMgr.IsJailerAvailable()
+
+		s.jsonResponse(w, map[string]interface{}{
+			"config":    config,
+			"available": available,
+		})
+
+	case http.MethodPut:
+		// Update jailer config
+		var config vm.JailerConfig
+		if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+			s.jsonError(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Validate config
+		if config.Enabled {
+			// Check if jailer binary exists
+			jailerPath := config.JailerPath
+			if jailerPath == "" {
+				jailerPath = vm.JailerBinary
+			}
+			if _, err := os.Stat(jailerPath); err != nil {
+				s.jsonError(w, fmt.Sprintf("Jailer binary not found at %s", jailerPath), http.StatusBadRequest)
+				return
+			}
+
+			// Validate UID/GID
+			if config.UID < 0 || config.GID < 0 {
+				s.jsonError(w, "Invalid UID/GID", http.StatusBadRequest)
+				return
+			}
+
+			// Ensure chroot base directory exists or can be created
+			if config.ChrootBase == "" {
+				config.ChrootBase = vm.DefaultJailerChrootBase
+			}
+			if err := os.MkdirAll(config.ChrootBase, 0755); err != nil {
+				s.jsonError(w, fmt.Sprintf("Cannot create chroot base directory: %v", err), http.StatusBadRequest)
+				return
+			}
+
+			// Validate cgroup version
+			if config.CgroupVer != 1 && config.CgroupVer != 2 {
+				config.CgroupVer = 2 // Default to cgroup v2
+			}
+		}
+
+		// Apply config
+		s.vmMgr.SetJailerConfig(&config)
+
+		s.logger("Jailer configuration updated: enabled=%v, chroot=%s, uid=%d, gid=%d",
+			config.Enabled, config.ChrootBase, config.UID, config.GID)
+
+		s.jsonResponse(w, map[string]interface{}{
+			"status":  "success",
+			"message": "Jailer configuration updated",
+			"config":  config,
+		})
+
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleProxyTest tests the proxy connection by making a request through the proxy
+func (s *Server) handleProxyTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Create HTTP client with current proxy settings
+	client, err := proxyconfig.NewHTTPClient(30 * time.Second)
+	if err != nil {
+		s.jsonResponse(w, map[string]interface{}{
+			"success": false,
+			"error":   "Failed to create HTTP client: " + err.Error(),
+		})
+		return
+	}
+
+	// Try to reach a known test endpoint
+	testURL := "https://api.github.com/zen"
+	req, err := http.NewRequest("GET", testURL, nil)
+	if err != nil {
+		s.jsonResponse(w, map[string]interface{}{
+			"success": false,
+			"error":   "Failed to create request: " + err.Error(),
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		s.jsonResponse(w, map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		s.jsonResponse(w, map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("Unexpected status code: %d", resp.StatusCode),
+		})
+		return
+	}
+
+	s.jsonResponse(w, map[string]interface{}{
+		"success": true,
+		"message": "Proxy connection test successful",
+	})
+}
+
 // Ping handler to check if an IP address is reachable
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -2250,36 +4106,93 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Perform ICMP ping with 1 second timeout
-	reachable := ping(ipStr, time.Second)
+	// Check for debug parameter
+	debug := r.URL.Query().Get("debug") == "1"
 
-	s.jsonResponse(w, map[string]interface{}{
+	// Perform ICMP ping with 2 second timeout
+	reachable, debugInfo := pingWithDebug(ipStr, 2*time.Second)
+
+	response := map[string]interface{}{
 		"ip":        ipStr,
 		"reachable": reachable,
-	})
+	}
+	if debug {
+		response["debug"] = debugInfo
+	}
+
+	s.jsonResponse(w, response)
 }
 
 // ping sends an ICMP echo request to the specified IP and returns true if reachable
 func ping(addr string, timeout time.Duration) bool {
-	// Use a simple TCP connection attempt as a fallback method
-	// Try to connect to common ports with timeout
-	ports := []string{"22", "80", "443"}
+	reachable, _ := pingWithDebug(addr, timeout)
+	return reachable
+}
 
-	// First try ICMP ping
-	if icmpPing(addr, timeout) {
-		return true
+// pingWithDebug performs ping and returns debug information
+func pingWithDebug(addr string, timeout time.Duration) (bool, map[string]interface{}) {
+	debug := make(map[string]interface{})
+
+	// First try using system ping command (most reliable)
+	systemResult, systemErr, systemOut := systemPingDebug(addr, timeout)
+	debug["system_ping"] = map[string]interface{}{
+		"success": systemResult,
+		"error":   systemErr,
+		"output":  systemOut,
+	}
+	if systemResult {
+		return true, debug
 	}
 
-	// Fallback: try TCP connection to common ports
+	// Fallback: try ICMP ping using raw socket
+	icmpResult := icmpPing(addr, timeout)
+	debug["icmp_ping"] = icmpResult
+	if icmpResult {
+		return true, debug
+	}
+
+	// Last resort: try TCP connection to common ports
+	ports := []string{"22", "80", "443"}
+	tcpResults := make(map[string]bool)
 	for _, port := range ports {
 		conn, err := net.DialTimeout("tcp", addr+":"+port, timeout)
 		if err == nil {
 			conn.Close()
-			return true
+			tcpResults[port] = true
+			debug["tcp_ports"] = tcpResults
+			return true, debug
 		}
+		tcpResults[port] = false
+	}
+	debug["tcp_ports"] = tcpResults
+
+	return false, debug
+}
+
+// systemPing uses the system ping command which is the most reliable method
+func systemPing(addr string, timeout time.Duration) bool {
+	result, _, _ := systemPingDebug(addr, timeout)
+	return result
+}
+
+// systemPingDebug uses the system ping command and returns debug info
+func systemPingDebug(addr string, timeout time.Duration) (bool, string, string) {
+	// Use ping with count=1 and timeout in seconds
+	timeoutSecs := int(timeout.Seconds())
+	if timeoutSecs < 1 {
+		timeoutSecs = 1
 	}
 
-	return false
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+2*time.Second)
+	defer cancel()
+
+	// Use full path to ping binary
+	cmd := exec.CommandContext(ctx, "/usr/bin/ping", "-c", "1", "-W", fmt.Sprintf("%d", timeoutSecs), addr)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, err.Error(), string(output)
+	}
+	return true, "", string(output)
 }
 
 // icmpPing attempts an ICMP echo request
@@ -2342,7 +4255,10 @@ func icmpPing(addr string, timeout time.Duration) bool {
 
 		// Check if it's an echo reply from our target
 		if rm.Type == ipv4.ICMPTypeEchoReply {
-			if peer.String() == dst.String() {
+			// Compare IPs by parsing peer address
+			// peer.String() returns just the IP for ICMP connections
+			peerIP := net.ParseIP(peer.String())
+			if peerIP != nil && peerIP.Equal(dst.IP) {
 				if echo, ok := rm.Body.(*icmp.Echo); ok {
 					if echo.ID == id && echo.Seq == seq {
 						return true
@@ -2610,7 +4526,7 @@ func generateID() string {
 // buildKernelArgs constructs kernel arguments with network configuration if needed
 // Format: ip=<client-ip>:<server-ip>:<gateway>:<netmask>:<hostname>:<device>:<autoconf>
 func buildKernelArgs(baseArgs, ipAddress, gateway string) string {
-	defaultArgs := "console=ttyS0 reboot=k panic=1 pci=off"
+	defaultArgs := "console=ttyS0,115200n8 reboot=k panic=1 pci=off"
 
 	// Start with base args or default
 	args := baseArgs
@@ -2676,6 +4592,588 @@ func (s *Server) InitDefaultAdmin() error {
 			return err
 		}
 		s.logger("Created default admin user (username: admin, password: admin)")
+	}
+	return nil
+}
+
+// setRootPassword sets the root password in a rootfs image by mounting it and modifying /etc/shadow
+func setRootPassword(rootfsPath, password string) error {
+	// Create temporary mount point
+	mountPoint, err := os.MkdirTemp("", "rootfs-passwd-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(mountPoint)
+
+	// Mount the rootfs
+	mountCmd := exec.Command("mount", "-o", "loop", rootfsPath, mountPoint)
+	if output, err := mountCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("mount failed: %v: %s", err, string(output))
+	}
+	defer exec.Command("umount", mountPoint).Run()
+
+	// Ensure root user exists in /etc/passwd
+	if err := ensureRootUserExists(mountPoint); err != nil {
+		return fmt.Errorf("failed to ensure root user exists: %v", err)
+	}
+
+	// Generate password hash using openssl
+	// Use SHA-512 ($6$) which is widely supported
+	saltBytes := make([]byte, 8)
+	rand.Read(saltBytes)
+	salt := hex.EncodeToString(saltBytes)[:8]
+
+	opensslCmd := exec.Command("openssl", "passwd", "-6", "-salt", salt, password)
+	hashOutput, err := opensslCmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to generate password hash: %v", err)
+	}
+	passwordHash := strings.TrimSpace(string(hashOutput))
+
+	// Read /etc/shadow
+	shadowPath := filepath.Join(mountPoint, "etc", "shadow")
+	shadowData, err := os.ReadFile(shadowPath)
+	if err != nil {
+		// If shadow doesn't exist, try to create it
+		if os.IsNotExist(err) {
+			// Create shadow file with root entry
+			shadowContent := fmt.Sprintf("root:%s:19000:0:99999:7:::\n", passwordHash)
+			if err := os.WriteFile(shadowPath, []byte(shadowContent), 0640); err != nil {
+				return fmt.Errorf("failed to create shadow file: %v", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to read shadow file: %v", err)
+	}
+
+	// Parse and update shadow file
+	lines := strings.Split(string(shadowData), "\n")
+	found := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, "root:") {
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				parts[1] = passwordHash
+				// Ensure all required shadow fields exist (9 fields total)
+				// Format: username:password:lastchange:min:max:warn:inactive:expire:reserved
+				for len(parts) < 9 {
+					parts = append(parts, "")
+				}
+				// Set reasonable defaults if fields are empty
+				if parts[2] == "" {
+					parts[2] = "19000" // last password change (days since epoch)
+				}
+				if parts[3] == "" {
+					parts[3] = "0" // min days between password changes
+				}
+				if parts[4] == "" {
+					parts[4] = "99999" // max days password is valid
+				}
+				if parts[5] == "" {
+					parts[5] = "7" // days before expiry to warn
+				}
+				// parts[6], parts[7], parts[8] can remain empty (inactive, expire, reserved)
+				lines[i] = strings.Join(parts, ":")
+				found = true
+				break
+			}
+		}
+	}
+
+	if !found {
+		// Add root entry if not found
+		rootLine := fmt.Sprintf("root:%s:19000:0:99999:7:::", passwordHash)
+		lines = append([]string{rootLine}, lines...)
+	}
+
+	// Write updated shadow file
+	newShadow := strings.Join(lines, "\n")
+	if err := os.WriteFile(shadowPath, []byte(newShadow), 0640); err != nil {
+		return fmt.Errorf("failed to write shadow file: %v", err)
+	}
+
+	return nil
+}
+
+// ensureRootUserExists checks if root user exists in /etc/passwd and /etc/group,
+// and creates them if they don't exist
+func ensureRootUserExists(mountPoint string) error {
+	// Ensure /etc directory exists
+	etcPath := filepath.Join(mountPoint, "etc")
+	if err := os.MkdirAll(etcPath, 0755); err != nil {
+		return fmt.Errorf("failed to create /etc: %v", err)
+	}
+
+	// Check and fix /etc/passwd
+	passwdPath := filepath.Join(mountPoint, "etc", "passwd")
+	passwdData, err := os.ReadFile(passwdPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Create passwd file with root entry
+			passwdContent := "root:x:0:0:root:/root:/bin/sh\n"
+			if err := os.WriteFile(passwdPath, []byte(passwdContent), 0644); err != nil {
+				return fmt.Errorf("failed to create passwd file: %v", err)
+			}
+			passwdData = []byte(passwdContent)
+		} else {
+			return fmt.Errorf("failed to read passwd file: %v", err)
+		}
+	}
+
+	// Check if root exists in passwd
+	rootInPasswd := false
+	passwdLines := strings.Split(string(passwdData), "\n")
+	for _, line := range passwdLines {
+		if strings.HasPrefix(line, "root:") {
+			rootInPasswd = true
+			break
+		}
+	}
+
+	if !rootInPasswd {
+		// Add root entry to passwd
+		rootLine := "root:x:0:0:root:/root:/bin/sh"
+		passwdLines = append([]string{rootLine}, passwdLines...)
+		newPasswd := strings.Join(passwdLines, "\n")
+		// Ensure file ends with newline
+		if !strings.HasSuffix(newPasswd, "\n") {
+			newPasswd += "\n"
+		}
+		if err := os.WriteFile(passwdPath, []byte(newPasswd), 0644); err != nil {
+			return fmt.Errorf("failed to update passwd file: %v", err)
+		}
+	}
+
+	// Check and fix /etc/group
+	groupPath := filepath.Join(mountPoint, "etc", "group")
+	groupData, err := os.ReadFile(groupPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Create group file with root entry
+			groupContent := "root:x:0:\n"
+			if err := os.WriteFile(groupPath, []byte(groupContent), 0644); err != nil {
+				return fmt.Errorf("failed to create group file: %v", err)
+			}
+			groupData = []byte(groupContent)
+		} else {
+			return fmt.Errorf("failed to read group file: %v", err)
+		}
+	}
+
+	// Check if root group exists
+	rootInGroup := false
+	groupLines := strings.Split(string(groupData), "\n")
+	for _, line := range groupLines {
+		if strings.HasPrefix(line, "root:") {
+			rootInGroup = true
+			break
+		}
+	}
+
+	if !rootInGroup {
+		// Add root group entry
+		rootLine := "root:x:0:"
+		groupLines = append([]string{rootLine}, groupLines...)
+		newGroup := strings.Join(groupLines, "\n")
+		// Ensure file ends with newline
+		if !strings.HasSuffix(newGroup, "\n") {
+			newGroup += "\n"
+		}
+		if err := os.WriteFile(groupPath, []byte(newGroup), 0644); err != nil {
+			return fmt.Errorf("failed to update group file: %v", err)
+		}
+	}
+
+	// Ensure /root directory exists
+	rootHome := filepath.Join(mountPoint, "root")
+	if err := os.MkdirAll(rootHome, 0700); err != nil {
+		return fmt.Errorf("failed to create /root directory: %v", err)
+	}
+
+	// Ensure /etc/shadow exists (even if empty, for password to be set)
+	shadowPath := filepath.Join(mountPoint, "etc", "shadow")
+	if _, err := os.Stat(shadowPath); os.IsNotExist(err) {
+		// Create empty shadow file with proper permissions
+		if err := os.WriteFile(shadowPath, []byte(""), 0640); err != nil {
+			return fmt.Errorf("failed to create shadow file: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// SetDataDir sets the data directory for migration server
+func (s *Server) SetDataDir(dataDir string) {
+	s.dataDir = dataDir
+}
+
+// Migration API handlers
+
+// handleMigrationKeys handles GET/POST /api/migration/keys
+func (s *Server) handleMigrationKeys(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// List all migration keys
+		keys, err := s.db.ListMigrationKeys()
+		if err != nil {
+			s.jsonError(w, "Failed to list keys: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// Don't expose the actual key hashes
+		safeKeys := make([]map[string]interface{}, len(keys))
+		for i, k := range keys {
+			safeKeys[i] = map[string]interface{}{
+				"id":           k.ID,
+				"name":         k.Name,
+				"description":  k.Description,
+				"allow_push":   k.AllowPush,
+				"allow_pull":   k.AllowPull,
+				"created_at":   k.CreatedAt,
+				"last_used_at": k.LastUsedAt,
+			}
+		}
+		s.jsonResponse(w, map[string]interface{}{"keys": safeKeys})
+
+	case http.MethodPost:
+		// Create a new migration key
+		var req struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			AllowPush   bool   `json:"allow_push"`
+			AllowPull   bool   `json:"allow_pull"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if req.Name == "" {
+			s.jsonError(w, "Name is required", http.StatusBadRequest)
+			return
+		}
+
+		// Check if name already exists
+		existing, _ := s.db.GetMigrationKeyByName(req.Name)
+		if existing != nil {
+			s.jsonError(w, "Key with this name already exists", http.StatusConflict)
+			return
+		}
+
+		// Generate random key
+		keyBytes := make([]byte, 32)
+		if _, err := cryptoRandRead(keyBytes); err != nil {
+			s.jsonError(w, "Failed to generate key", http.StatusInternalServerError)
+			return
+		}
+		rawKey := hex.EncodeToString(keyBytes)
+
+		// Hash the key for storage
+		keyHash := hashSHA256(rawKey)
+
+		// Generate ID
+		idBytes := make([]byte, 8)
+		cryptoRandRead(idBytes)
+		keyID := hex.EncodeToString(idBytes)
+
+		key := &database.MigrationKey{
+			ID:          keyID,
+			Name:        req.Name,
+			KeyHash:     keyHash,
+			Description: req.Description,
+			AllowPush:   req.AllowPush,
+			AllowPull:   req.AllowPull,
+		}
+
+		if err := s.db.CreateMigrationKey(key); err != nil {
+			s.jsonError(w, "Failed to create key: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.logger("Created migration key: %s", req.Name)
+
+		// Return the raw key (only shown once)
+		s.jsonResponse(w, map[string]interface{}{
+			"status": "success",
+			"key": map[string]interface{}{
+				"id":          key.ID,
+				"name":        key.Name,
+				"key":         rawKey, // Only returned once at creation
+				"description": key.Description,
+				"allow_push":  key.AllowPush,
+				"allow_pull":  key.AllowPull,
+			},
+		})
+
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleMigrationKey handles GET/DELETE /api/migration/keys/{id}
+func (s *Server) handleMigrationKey(w http.ResponseWriter, r *http.Request) {
+	// Extract key ID from path
+	path := strings.TrimPrefix(r.URL.Path, "/api/migration/keys/")
+	keyID := strings.Split(path, "/")[0]
+
+	if keyID == "" {
+		s.jsonError(w, "Key ID is required", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		key, err := s.db.GetMigrationKey(keyID)
+		if err != nil {
+			s.jsonError(w, "Failed to get key: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if key == nil {
+			s.jsonError(w, "Key not found", http.StatusNotFound)
+			return
+		}
+		s.jsonResponse(w, map[string]interface{}{
+			"id":           key.ID,
+			"name":         key.Name,
+			"description":  key.Description,
+			"allow_push":   key.AllowPush,
+			"allow_pull":   key.AllowPull,
+			"created_at":   key.CreatedAt,
+			"last_used_at": key.LastUsedAt,
+		})
+
+	case http.MethodDelete:
+		if err := s.db.DeleteMigrationKey(keyID); err != nil {
+			s.jsonError(w, "Failed to delete key: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.logger("Deleted migration key: %s", keyID)
+		s.jsonResponse(w, map[string]string{"status": "success"})
+
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleMigrationServer handles POST /api/migration/server (start/stop)
+func (s *Server) handleMigrationServer(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// Get server status
+		running := false
+		port := 0
+		if s.migrationSrv != nil {
+			running = s.migrationSrv.IsRunning()
+			port = s.migrationSrv.GetPort()
+		}
+		s.jsonResponse(w, map[string]interface{}{
+			"running": running,
+			"port":    port,
+		})
+
+	case http.MethodPost:
+		var req struct {
+			Action string `json:"action"` // "start" or "stop"
+			Port   int    `json:"port"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		switch req.Action {
+		case "start":
+			if s.migrationSrv != nil && s.migrationSrv.IsRunning() {
+				s.jsonError(w, "Migration server already running", http.StatusBadRequest)
+				return
+			}
+
+			port := req.Port
+			if port == 0 {
+				port = 9090 // Default port
+			}
+
+			s.migrationSrv = vm.NewMigrationServer(port, s.dataDir, s.db, s.vmMgr, s.logger)
+			if err := s.migrationSrv.Start(); err != nil {
+				s.jsonError(w, "Failed to start migration server: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			s.jsonResponse(w, map[string]interface{}{
+				"status":  "success",
+				"message": fmt.Sprintf("Migration server started on port %d", port),
+				"port":    port,
+			})
+
+		case "stop":
+			if s.migrationSrv == nil || !s.migrationSrv.IsRunning() {
+				s.jsonError(w, "Migration server not running", http.StatusBadRequest)
+				return
+			}
+
+			if err := s.migrationSrv.Stop(); err != nil {
+				s.jsonError(w, "Failed to stop migration server: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			s.jsonResponse(w, map[string]string{
+				"status":  "success",
+				"message": "Migration server stopped",
+			})
+
+		default:
+			s.jsonError(w, "Invalid action (use 'start' or 'stop')", http.StatusBadRequest)
+		}
+
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleMigrationSend handles POST /api/migration/send
+func (s *Server) handleMigrationSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		VMID       string `json:"vm_id"`
+		RemoteHost string `json:"remote_host"`
+		RemotePort int    `json:"remote_port"`
+		Key        string `json:"key"`
+		Compress   bool   `json:"compress"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.jsonError(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	if req.VMID == "" {
+		s.jsonError(w, "VM ID is required", http.StatusBadRequest)
+		return
+	}
+	if req.RemoteHost == "" {
+		s.jsonError(w, "Remote host is required", http.StatusBadRequest)
+		return
+	}
+	if req.Key == "" {
+		s.jsonError(w, "Migration key is required", http.StatusBadRequest)
+		return
+	}
+
+	port := req.RemotePort
+	if port == 0 {
+		port = 9090
+	}
+
+	// Start migration in background
+	go func() {
+		err := s.vmMgr.MigrateVM(req.VMID, req.RemoteHost, port, req.Key, req.Compress, nil)
+		if err != nil {
+			s.logger("Migration failed: %v", err)
+		}
+	}()
+
+	s.jsonResponse(w, map[string]string{
+		"status":  "success",
+		"message": "Migration started",
+	})
+}
+
+// handleMigrationStatus handles GET /api/migration/status
+func (s *Server) handleMigrationStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var migrations []*vm.MigrationStatus
+	if s.migrationSrv != nil {
+		migrations = s.migrationSrv.GetMigrations()
+	}
+
+	s.jsonResponse(w, map[string]interface{}{
+		"migrations": migrations,
+	})
+}
+
+// Helper functions for crypto
+func cryptoRandRead(b []byte) (int, error) {
+	return io.ReadFull(cryptoRandReader, b)
+}
+
+var cryptoRandReader = func() io.Reader {
+	return rand.Reader
+}()
+
+func hashSHA256(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
+// getAvailableIPsInNetwork returns a list of available (unused) IP addresses in a network
+func (s *Server) getAvailableIPsInNetwork(netObj *database.Network) ([]string, error) {
+	// Parse the subnet CIDR
+	_, ipNet, err := net.ParseCIDR(netObj.Subnet)
+	if err != nil {
+		return nil, fmt.Errorf("invalid subnet: %v", err)
+	}
+
+	// Get used IPs in this network
+	vms, err := s.db.GetVMsByNetwork(netObj.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get VMs: %v", err)
+	}
+
+	usedIPs := make(map[string]bool)
+	// Mark gateway as used
+	usedIPs[netObj.Gateway] = true
+	// Mark all VM IPs as used
+	for _, vm := range vms {
+		if vm.IPAddress != "" {
+			usedIPs[vm.IPAddress] = true
+		}
+	}
+
+	// Generate available IPs (limit to reasonable range)
+	var availableIPs []string
+	ip := ipNet.IP.Mask(ipNet.Mask)
+
+	// Skip network address and start from first usable
+	for i := 0; i < 4; i++ {
+		ip = incrementIP(ip)
+	}
+
+	// Generate up to 254 IPs (typical /24 network)
+	for i := 0; i < 250; i++ {
+		if !ipNet.Contains(ip) {
+			break
+		}
+
+		ipStr := ip.String()
+		if !usedIPs[ipStr] {
+			availableIPs = append(availableIPs, ipStr)
+		}
+
+		ip = incrementIP(ip)
+		if ip == nil {
+			break
+		}
+	}
+
+	return availableIPs, nil
+}
+
+// incrementIP increments an IP address by 1
+func incrementIP(ip net.IP) net.IP {
+	result := make(net.IP, len(ip))
+	copy(result, ip)
+
+	for i := len(result) - 1; i >= 0; i-- {
+		result[i]++
+		if result[i] != 0 {
+			return result
+		}
 	}
 	return nil
 }

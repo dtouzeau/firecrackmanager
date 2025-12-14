@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"firecrackmanager/internal/database"
+	"firecrackmanager/internal/proxyconfig"
 )
 
 const (
@@ -38,12 +39,14 @@ const (
 
 // Config represents the settings.json configuration
 type Config struct {
-	ListenPort    int    `json:"listen_port"`
-	ListenAddress string `json:"listen_address"`
-	DataDir       string `json:"data_dir"`
-	DatabasePath  string `json:"database_path"`
-	LogFile       string `json:"log_file"`
-	PidFile       string `json:"pid_file"`
+	ListenPort                  int    `json:"listen_port"`
+	ListenAddress               string `json:"listen_address"`
+	DataDir                     string `json:"data_dir"`
+	DatabasePath                string `json:"database_path"`
+	LogFile                     string `json:"log_file"`
+	PidFile                     string `json:"pid_file"`
+	EnableHostNetworkManagement bool   `json:"enable_host_network_management"`
+	BuilderDir                  string `json:"builder_dir"`
 }
 
 // SetupResult holds the result of each setup step
@@ -248,7 +251,14 @@ func (s *Setup) installFirecracker() error {
 	}
 	defer os.Remove(tmpFile.Name())
 
-	resp, err := http.Get(downloadURL)
+	// Create HTTP client with proxy support
+	client, err := proxyconfig.NewHTTPClient(30 * time.Minute)
+	if err != nil {
+		s.addResult("Firecracker installation", false, "Failed to create HTTP client", err)
+		return err
+	}
+
+	resp, err := client.Get(downloadURL)
 	if err != nil {
 		s.addResult("Firecracker installation", false, "Download failed", err)
 		return err
@@ -359,7 +369,11 @@ type GitHubAsset struct {
 }
 
 func (s *Setup) getLatestRelease() (*GitHubRelease, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client, err := proxyconfig.NewHTTPClient(30 * time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+
 	req, err := http.NewRequest("GET", FirecrackerReleasesAPI, nil)
 	if err != nil {
 		return nil, err
@@ -444,7 +458,13 @@ func (s *Setup) UpgradeFirecracker() error {
 	}
 	defer os.Remove(tmpFile.Name())
 
-	resp, err := http.Get(downloadURL)
+	// Create HTTP client with proxy support
+	client, err := proxyconfig.NewHTTPClient(30 * time.Minute)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+
+	resp, err := client.Get(downloadURL)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
@@ -785,23 +805,21 @@ RestartSec=5
 StandardOutput=append:%s
 StandardError=append:%s
 
-# Security hardening
+# Security settings - relaxed for image building features (chroot, mount, apt)
 NoNewPrivileges=false
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%s %s /run
-PrivateTmp=true
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=false
 
-# Required capabilities
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_CHOWN CAP_DAC_OVERRIDE
+# Required capabilities for VM management, networking, and image building
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_SYS_CHROOT CAP_MKNOD CAP_FOWNER
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_SYS_CHROOT CAP_MKNOD CAP_FOWNER
 
 [Install]
 WantedBy=multi-user.target
 `, binaryPath, DefaultConfigPath, DefaultPidFile,
 		filepath.Join(DefaultLogDir, "firecrackmanager.log"),
-		filepath.Join(DefaultLogDir, "firecrackmanager.log"),
-		DefaultDataDir, DefaultLogDir)
+		filepath.Join(DefaultLogDir, "firecrackmanager.log"))
 
 	if err := os.WriteFile(servicePath, []byte(serviceContent), 0644); err != nil {
 		s.addResult("Systemd service", false, "Failed to write service file", err)
@@ -876,7 +894,13 @@ func (s *Setup) downloadFile(url, destPath string) error {
 		return err
 	}
 
-	resp, err := http.Get(url)
+	// Create HTTP client with proxy support
+	client, err := proxyconfig.NewHTTPClient(30 * time.Minute)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}

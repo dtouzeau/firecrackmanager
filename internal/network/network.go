@@ -15,25 +15,25 @@ import (
 )
 
 const (
-	TUNSETIFF     = 0x400454ca
-	TUNSETPERSIST = 0x400454cb
-	IFF_TAP       = 0x0002
-	IFF_NO_PI     = 0x1000
-	IFF_VNET_HDR  = 0x4000
-	IFNAMSIZ      = 16
-	SIOCGIFFLAGS  = 0x8913
-	SIOCSIFFLAGS  = 0x8914
-	SIOCGIFADDR   = 0x8915
-	SIOCSIFADDR   = 0x8916
+	TUNSETIFF      = 0x400454ca
+	TUNSETPERSIST  = 0x400454cb
+	IFF_TAP        = 0x0002
+	IFF_NO_PI      = 0x1000
+	IFF_VNET_HDR   = 0x4000
+	IFNAMSIZ       = 16
+	SIOCGIFFLAGS   = 0x8913
+	SIOCSIFFLAGS   = 0x8914
+	SIOCGIFADDR    = 0x8915
+	SIOCSIFADDR    = 0x8916
 	SIOCGIFNETMASK = 0x891b
 	SIOCSIFNETMASK = 0x891c
 	SIOCGIFBRDADDR = 0x8919
 	SIOCSIFBRDADDR = 0x891a
-	SIOCGIFINDEX  = 0x8933
-	SIOCBRADDIF   = 0x89a2
-	SIOCBRDELIF   = 0x89a3
-	IFF_UP        = 0x1
-	IFF_RUNNING   = 0x40
+	SIOCGIFINDEX   = 0x8933
+	SIOCBRADDIF    = 0x89a2
+	SIOCBRDELIF    = 0x89a3
+	IFF_UP         = 0x1
+	IFF_RUNNING    = 0x40
 )
 
 type ifreq struct {
@@ -55,7 +55,7 @@ type ifreqIndex struct {
 }
 
 type Manager struct {
-	mu        sync.Mutex
+	mu         sync.Mutex
 	tapDevices map[string]int // tap name -> fd
 	bridges    map[string]bool
 }
@@ -666,6 +666,187 @@ func MACToBytes(mac string) ([]byte, error) {
 		result[i] = byte(val)
 	}
 	return result, nil
+}
+
+// BridgeInfo contains information about a bridge interface
+type BridgeInfo struct {
+	Name       string   `json:"name"`
+	IsUp       bool     `json:"is_up"`
+	MTU        int      `json:"mtu"`
+	STP        bool     `json:"stp"`
+	IPAddress  string   `json:"ip_address"`
+	Interfaces []string `json:"interfaces"` // Attached interfaces (TAPs)
+}
+
+// GetBridgeInfo returns detailed information about a bridge
+func (m *Manager) GetBridgeInfo(bridgeName string) (*BridgeInfo, error) {
+	info := &BridgeInfo{Name: bridgeName}
+
+	// Check if bridge exists
+	bridgePath := fmt.Sprintf("/sys/class/net/%s", bridgeName)
+	if _, err := os.Stat(bridgePath); err != nil {
+		return nil, fmt.Errorf("bridge %s does not exist", bridgeName)
+	}
+
+	// Check if interface is up
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if err == nil {
+		defer syscall.Close(fd)
+		var ifr ifreq
+		copy(ifr.Name[:], bridgeName)
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(SIOCGIFFLAGS), uintptr(unsafe.Pointer(&ifr)))
+		if errno == 0 {
+			info.IsUp = (ifr.Flags & IFF_UP) != 0
+		}
+	}
+
+	// Get MTU from sysfs
+	mtuData, err := os.ReadFile(fmt.Sprintf("%s/mtu", bridgePath))
+	if err == nil {
+		if mtu, err := strconv.Atoi(strings.TrimSpace(string(mtuData))); err == nil {
+			info.MTU = mtu
+		}
+	}
+
+	// Get STP state from sysfs
+	stpData, err := os.ReadFile(fmt.Sprintf("%s/bridge/stp_state", bridgePath))
+	if err == nil {
+		info.STP = strings.TrimSpace(string(stpData)) != "0"
+	}
+
+	// Get IP address
+	if ip, err := GetInterfaceIP(bridgeName); err == nil {
+		info.IPAddress = ip
+	}
+
+	// Get attached interfaces from sysfs
+	brifsPath := fmt.Sprintf("%s/brif", bridgePath)
+	entries, err := os.ReadDir(brifsPath)
+	if err == nil {
+		for _, entry := range entries {
+			info.Interfaces = append(info.Interfaces, entry.Name())
+		}
+	}
+
+	return info, nil
+}
+
+// SetBridgeMTU sets the MTU for a bridge interface
+func (m *Manager) SetBridgeMTU(bridgeName string, mtu int) error {
+	if mtu < 576 || mtu > 65535 {
+		return fmt.Errorf("invalid MTU value: %d (must be 576-65535)", mtu)
+	}
+
+	mtuPath := fmt.Sprintf("/sys/class/net/%s/mtu", bridgeName)
+	return os.WriteFile(mtuPath, []byte(strconv.Itoa(mtu)), 0644)
+}
+
+// SetBridgeSTP enables or disables Spanning Tree Protocol on a bridge
+func (m *Manager) SetBridgeSTP(bridgeName string, enabled bool) error {
+	stpPath := fmt.Sprintf("/sys/class/net/%s/bridge/stp_state", bridgeName)
+	value := "0"
+	if enabled {
+		value = "1"
+	}
+	return os.WriteFile(stpPath, []byte(value), 0644)
+}
+
+// ListBridges returns a list of all bridge interfaces on the system
+func (m *Manager) ListBridges() ([]string, error) {
+	var bridges []string
+
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read network interfaces: %w", err)
+	}
+
+	for _, entry := range entries {
+		// Check if this is a bridge by looking for the bridge directory
+		bridgePath := fmt.Sprintf("/sys/class/net/%s/bridge", entry.Name())
+		if _, err := os.Stat(bridgePath); err == nil {
+			bridges = append(bridges, entry.Name())
+		}
+	}
+
+	return bridges, nil
+}
+
+// ListPhysicalInterfaces returns a list of physical network interfaces (for NAT selection)
+func ListPhysicalInterfaces() ([]string, error) {
+	var interfaces []string
+
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read network interfaces: %w", err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+
+		// Skip virtual interfaces
+		if name == "lo" {
+			continue
+		}
+		if strings.HasPrefix(name, "fc") { // Our TAP/bridge interfaces
+			continue
+		}
+		if strings.HasPrefix(name, "veth") {
+			continue
+		}
+		if strings.HasPrefix(name, "docker") {
+			continue
+		}
+		if strings.HasPrefix(name, "br-") {
+			continue
+		}
+		if strings.HasPrefix(name, "virbr") {
+			continue
+		}
+
+		// Check if it's a bridge (skip)
+		bridgePath := fmt.Sprintf("/sys/class/net/%s/bridge", name)
+		if _, err := os.Stat(bridgePath); err == nil {
+			continue
+		}
+
+		// Check if it's a physical interface (has a device link)
+		devicePath := fmt.Sprintf("/sys/class/net/%s/device", name)
+		if _, err := os.Stat(devicePath); err == nil {
+			interfaces = append(interfaces, name)
+			continue
+		}
+
+		// Also include interfaces that look like physical (eth*, ens*, enp*, etc.)
+		if strings.HasPrefix(name, "eth") ||
+			strings.HasPrefix(name, "ens") ||
+			strings.HasPrefix(name, "enp") ||
+			strings.HasPrefix(name, "em") ||
+			strings.HasPrefix(name, "wlan") ||
+			strings.HasPrefix(name, "wlp") {
+			interfaces = append(interfaces, name)
+		}
+	}
+
+	return interfaces, nil
+}
+
+// GetInterfaceStatus returns status information for an interface
+func GetInterfaceStatus(name string) (bool, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		return false, fmt.Errorf("failed to create socket: %w", err)
+	}
+	defer syscall.Close(fd)
+
+	var ifr ifreq
+	copy(ifr.Name[:], name)
+
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(SIOCGIFFLAGS), uintptr(unsafe.Pointer(&ifr)))
+	if errno != 0 {
+		return false, fmt.Errorf("failed to get interface flags: %v", errno)
+	}
+
+	return (ifr.Flags & IFF_UP) != 0, nil
 }
 
 // Cleanup releases all TAP devices and bridges

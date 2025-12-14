@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"firecrackmanager/internal/proxyconfig"
 )
 
 const (
@@ -34,11 +36,11 @@ type DownloadProgress struct {
 }
 
 type Manager struct {
-	dataDir    string
-	kernelDir  string
-	rootfsDir  string
-	mu         sync.RWMutex
-	downloads  map[string]*DownloadProgress
+	dataDir   string
+	kernelDir string
+	rootfsDir string
+	mu        sync.RWMutex
+	downloads map[string]*DownloadProgress
 }
 
 func NewManager(dataDir string) (*Manager, error) {
@@ -85,9 +87,11 @@ func (m *Manager) downloadFile(url, destPath, progressKey string) (string, error
 		m.mu.Unlock()
 	}()
 
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Minute,
+	// Create HTTP client with proxy support and timeout
+	client, err := proxyconfig.NewHTTPClient(30 * time.Minute)
+	if err != nil {
+		m.updateProgress(progressKey, -1, -1, "error", err.Error())
+		return "", fmt.Errorf("failed to create HTTP client: %w", err)
 	}
 
 	resp, err := client.Get(url)

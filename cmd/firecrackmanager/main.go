@@ -16,8 +16,10 @@ import (
 
 	"firecrackmanager/internal/api"
 	"firecrackmanager/internal/database"
+	"firecrackmanager/internal/hostnet"
 	"firecrackmanager/internal/kernel"
 	"firecrackmanager/internal/network"
+	"firecrackmanager/internal/rootfs"
 	"firecrackmanager/internal/setup"
 	"firecrackmanager/internal/updater"
 	"firecrackmanager/internal/vm"
@@ -34,14 +36,16 @@ const (
 )
 
 type Config struct {
-	ConfigPath    string
-	DataDir       string
-	DatabasePath  string
-	HTTPPort      int
-	HTTPBind      string
-	LogFile       string
-	PidFile       string
-	RunSetup      bool
+	ConfigPath                  string
+	DataDir                     string
+	DatabasePath                string
+	HTTPPort                    int
+	HTTPBind                    string
+	LogFile                     string
+	PidFile                     string
+	RunSetup                    bool
+	EnableHostNetworkManagement bool
+	BuilderDir                  string
 }
 
 func main() {
@@ -158,8 +162,19 @@ func main() {
 		logger("Warning: failed to start updater: %v", err)
 	}
 
+	// Initialize rootfs scanner (background disk type detection)
+	rootfsScanner := rootfs.NewScanner(db, config.DataDir, logger)
+	rootfsScanner.Start()
+
+	// Initialize host network manager
+	hostNetMgr := hostnet.NewManager(logger)
+	logger("Host network manager initialized (enabled: %v)", config.EnableHostNetworkManagement)
+
 	// Initialize API server
 	apiServer := api.NewServer(db, vmMgr, netMgr, kernelMgr, upd, logger)
+	apiServer.SetHostNetManager(hostNetMgr, config.EnableHostNetworkManagement)
+	apiServer.SetBuilderDir(config.BuilderDir)
+	apiServer.SetDataDir(config.DataDir)
 
 	// Initialize default admin user
 	if err := apiServer.InitDefaultAdmin(); err != nil {
@@ -168,6 +183,89 @@ func main() {
 
 	// Start session cleanup goroutine
 	go apiServer.CleanupSessions()
+
+	// Start metrics compression and cleanup schedulers
+	metricsCleanupCtx, metricsCleanupCancel := context.WithCancel(context.Background())
+
+	// Hourly compression: raw metrics (>1 hour old) -> 10-minute averages
+	go func() {
+		// Run once at startup
+		if deleted, err := db.CompressMetricsTo10Min(); err != nil {
+			logger("Warning: failed to compress metrics to 10min: %v", err)
+		} else if deleted > 0 {
+			logger("Compressed %d raw metrics to 10-minute averages", deleted)
+		}
+
+		// Then run every hour
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-metricsCleanupCtx.Done():
+				return
+			case <-ticker.C:
+				if deleted, err := db.CompressMetricsTo10Min(); err != nil {
+					logger("Warning: failed to compress metrics to 10min: %v", err)
+				} else if deleted > 0 {
+					logger("Compressed %d raw metrics to 10-minute averages", deleted)
+				}
+			}
+		}
+	}()
+
+	// Daily compression and cleanup scheduler
+	go func() {
+		// Run compression at startup
+		if deleted, err := db.CompressMetricsToHourly(); err != nil {
+			logger("Warning: failed to compress metrics to hourly: %v", err)
+		} else if deleted > 0 {
+			logger("Compressed %d 10-minute metrics to hourly averages", deleted)
+		}
+
+		if deleted, err := db.CompressMetricsToDaily(); err != nil {
+			logger("Warning: failed to compress metrics to daily: %v", err)
+		} else if deleted > 0 {
+			logger("Compressed %d hourly metrics to 14-hour averages", deleted)
+		}
+
+		// Cleanup old metrics (raw: 1 hour, compressed: 6 months)
+		if deleted, err := db.CleanupOldMetrics(1 * time.Hour); err != nil {
+			logger("Warning: failed to cleanup old metrics: %v", err)
+		} else if deleted > 0 {
+			logger("Cleaned up %d old metric records", deleted)
+		}
+
+		// Then run daily at 3:00 AM
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-metricsCleanupCtx.Done():
+				return
+			case <-ticker.C:
+				// Compress 10-minute to hourly (data > 1 day old)
+				if deleted, err := db.CompressMetricsToHourly(); err != nil {
+					logger("Warning: failed to compress metrics to hourly: %v", err)
+				} else if deleted > 0 {
+					logger("Compressed %d 10-minute metrics to hourly averages", deleted)
+				}
+
+				// Compress hourly to 14-hour (data > 1 week old)
+				if deleted, err := db.CompressMetricsToDaily(); err != nil {
+					logger("Warning: failed to compress metrics to daily: %v", err)
+				} else if deleted > 0 {
+					logger("Compressed %d hourly metrics to 14-hour averages", deleted)
+				}
+
+				// Cleanup old metrics (6 months retention for compressed data)
+				if deleted, err := db.CleanupOldMetrics(1 * time.Hour); err != nil {
+					logger("Warning: failed to cleanup old metrics: %v", err)
+				} else if deleted > 0 {
+					logger("Cleaned up %d old metric records", deleted)
+				}
+			}
+		}
+	}()
 
 	// Initialize web console
 	webConsole := webconsole.New(db, apiServer)
@@ -196,8 +294,14 @@ func main() {
 
 	logger("Shutting down...")
 
+	// Stop metrics cleanup scheduler
+	metricsCleanupCancel()
+
 	// Stop updater
 	upd.Stop()
+
+	// Stop rootfs scanner
+	rootfsScanner.Stop()
 
 	// Stop all running VMs
 	vmMgr.StopAllVMs()
@@ -272,6 +376,10 @@ func parseFlags() *Config {
 			if config.PidFile == "" {
 				config.PidFile = fileConfig.PidFile
 			}
+			// Feature flags from config file
+			config.EnableHostNetworkManagement = fileConfig.EnableHostNetworkManagement
+			// Builder directory
+			config.BuilderDir = fileConfig.BuilderDir
 		}
 	}
 
@@ -290,6 +398,9 @@ func parseFlags() *Config {
 	}
 	if config.PidFile == "" {
 		config.PidFile = DefaultPidFile
+	}
+	if config.BuilderDir == "" {
+		config.BuilderDir = "/home/Builder"
 	}
 
 	return config

@@ -1,9 +1,11 @@
 # FireCrackManager
 
 A MicroVM management daemon for [Firecracker](https://firecracker-microvm.github.io/). 
-FireCrackManager is a part of Artica appliance.
+FireCrackManager is a part of Artica appliance ecosystem.
 
 It provides a REST API and web-based UI for managing virtual machines, networks, kernel images, and root filesystems.
+
+<img src="http://www.articatech.com/images/2025-12-14_04-03-19.png">
 
 ## Features
 
