@@ -3028,6 +3028,29 @@ func (m *Manager) GenerateMAC() string {
 
 // ExportVM creates a .fcrack archive containing the VM configuration, rootfs, and snapshots
 func (m *Manager) ExportVM(vmID string) (string, error) {
+	return m.ExportVMWithProgress(vmID, "")
+}
+
+// ExportVMWithProgress creates a .fcrack archive with progress tracking
+func (m *Manager) ExportVMWithProgress(vmID, opKey string) (string, error) {
+	// Helper to update progress
+	updateProgress := func(stage string, copied, total int64) {
+		if opKey == "" {
+			return
+		}
+		percent := float64(0)
+		if total > 0 {
+			percent = float64(copied) / float64(total) * 100
+		}
+		m.SetOperationProgress(opKey, &OperationProgress{
+			Status:  "exporting",
+			Stage:   stage,
+			Total:   total,
+			Copied:  copied,
+			Percent: percent,
+		})
+	}
+
 	// Get VM
 	vm, err := m.db.GetVM(vmID)
 	if err != nil {
@@ -3044,6 +3067,8 @@ func (m *Manager) ExportVM(vmID string) (string, error) {
 	if isRunning {
 		return "", fmt.Errorf("cannot export a running VM, please stop it first")
 	}
+
+	updateProgress("Preparing export...", 0, 100)
 
 	// Create export filename
 	safeName := strings.ReplaceAll(vm.Name, " ", "_")
@@ -3076,41 +3101,72 @@ func (m *Manager) ExportVM(vmID string) (string, error) {
 		return "", fmt.Errorf("rootfs not found: %w", err)
 	}
 
-	// Add rootfs to archive
+	// Calculate total size for progress
+	totalSize := rootfsInfo.Size()
+	snapshots, _ := m.ListSnapshots(vmID)
+	for _, snap := range snapshots {
+		if info, err := os.Stat(snap.SnapshotPath); err == nil {
+			totalSize += info.Size()
+		}
+		if info, err := os.Stat(snap.MemFilePath); err == nil {
+			totalSize += info.Size()
+		}
+	}
+
+	var copiedSize int64
+
+	// Add rootfs to archive with progress
+	updateProgress("Exporting rootfs...", copiedSize, totalSize)
 	rootfsName := "rootfs" + filepath.Ext(vm.RootFSPath)
-	checksum, err := addFileToTar(tarWriter, vm.RootFSPath, rootfsName)
+	checksum, err := addFileToTarWithProgress(tarWriter, vm.RootFSPath, rootfsName, func(written int64) {
+		updateProgress("Exporting rootfs...", copiedSize+written, totalSize)
+	})
 	if err != nil {
 		os.Remove(exportPath)
 		return "", fmt.Errorf("failed to add rootfs to archive: %w", err)
 	}
 	checksums[rootfsName] = checksum
-
-	// Get snapshots
-	snapshots, _ := m.ListSnapshots(vmID)
-	var snapshotInfos []SnapshotInfo
+	copiedSize += rootfsInfo.Size()
 
 	// Add snapshots to archive
-	for _, snap := range snapshots {
+	var snapshotInfos []SnapshotInfo
+	for i, snap := range snapshots {
+		updateProgress(fmt.Sprintf("Exporting snapshot %d/%d...", i+1, len(snapshots)), copiedSize, totalSize)
+
 		// Add vmstate
 		vmstateName := fmt.Sprintf("snapshots/vmstate-%s.fc", snap.ID)
-		checksum, err := addFileToTar(tarWriter, snap.SnapshotPath, vmstateName)
+		vmstateInfo, _ := os.Stat(snap.SnapshotPath)
+		checksum, err := addFileToTarWithProgress(tarWriter, snap.SnapshotPath, vmstateName, func(written int64) {
+			updateProgress(fmt.Sprintf("Exporting snapshot %d/%d...", i+1, len(snapshots)), copiedSize+written, totalSize)
+		})
 		if err != nil {
 			m.logger("Warning: failed to add snapshot vmstate: %v", err)
 			continue
 		}
 		checksums[vmstateName] = checksum
+		if vmstateInfo != nil {
+			copiedSize += vmstateInfo.Size()
+		}
 
 		// Add memfile
 		memfileName := fmt.Sprintf("snapshots/memfile-%s.fc", snap.ID)
-		checksum, err = addFileToTar(tarWriter, snap.MemFilePath, memfileName)
+		memfileInfo, _ := os.Stat(snap.MemFilePath)
+		checksum, err = addFileToTarWithProgress(tarWriter, snap.MemFilePath, memfileName, func(written int64) {
+			updateProgress(fmt.Sprintf("Exporting snapshot %d/%d...", i+1, len(snapshots)), copiedSize+written, totalSize)
+		})
 		if err != nil {
 			m.logger("Warning: failed to add snapshot memfile: %v", err)
 			continue
 		}
 		checksums[memfileName] = checksum
+		if memfileInfo != nil {
+			copiedSize += memfileInfo.Size()
+		}
 
 		snapshotInfos = append(snapshotInfos, *snap)
 	}
+
+	updateProgress("Creating manifest...", totalSize, totalSize)
 
 	// Create manifest
 	manifest := VMExportManifest{
@@ -3721,6 +3777,107 @@ func (m *Manager) resizeExt4Filesystem(path string) error {
 	return nil
 }
 
+// ShrinkRootFS shrinks a VM's rootfs to minimize disk space
+// Steps: 1) Check filesystem, 2) Shrink to minimum, 3) Zero free space, 4) Truncate file
+func (m *Manager) ShrinkRootFS(vmID string) error {
+	// Get VM
+	vm, err := m.db.GetVM(vmID)
+	if err != nil {
+		return fmt.Errorf("failed to get VM: %w", err)
+	}
+	if vm == nil {
+		return fmt.Errorf("VM not found")
+	}
+
+	// Check if VM is running
+	m.mu.RLock()
+	_, isRunning := m.runningVMs[vmID]
+	m.mu.RUnlock()
+	if isRunning {
+		return fmt.Errorf("cannot shrink rootfs of a running VM, please stop it first")
+	}
+
+	rootfsPath := vm.RootFSPath
+	if rootfsPath == "" {
+		return fmt.Errorf("VM has no rootfs configured")
+	}
+
+	// Check file exists
+	if _, err := os.Stat(rootfsPath); os.IsNotExist(err) {
+		return fmt.Errorf("rootfs file not found: %s", rootfsPath)
+	}
+
+	m.logger("Shrinking rootfs for VM %s: %s", vm.Name, rootfsPath)
+
+	// Get original size
+	origInfo, _ := os.Stat(rootfsPath)
+	origSize := origInfo.Size()
+
+	// Step 1: Check and fix filesystem
+	m.logger("  Running e2fsck...")
+	cmd := exec.Command("e2fsck", "-f", "-y", rootfsPath)
+	cmd.Run() // Ignore exit code, e2fsck returns non-zero when it fixes things
+
+	// Step 2: Shrink filesystem to minimum size
+	m.logger("  Shrinking filesystem to minimum size...")
+	cmd = exec.Command("resize2fs", "-M", rootfsPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("resize2fs -M failed: %s: %w", string(output), err)
+	}
+
+	// Step 3: Get the new filesystem size in blocks
+	cmd = exec.Command("dumpe2fs", "-h", rootfsPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("dumpe2fs failed: %w", err)
+	}
+
+	var blockCount, blockSize int64
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Block count:") {
+			fmt.Sscanf(line, "Block count: %d", &blockCount)
+		}
+		if strings.HasPrefix(line, "Block size:") {
+			fmt.Sscanf(line, "Block size: %d", &blockSize)
+		}
+	}
+
+	if blockCount == 0 || blockSize == 0 {
+		return fmt.Errorf("could not determine filesystem size")
+	}
+
+	// Calculate new file size (filesystem size + small buffer for safety)
+	newSize := blockCount * blockSize
+
+	// Step 4: Truncate the file to the new size
+	m.logger("  Truncating file from %d to %d bytes...", origSize, newSize)
+	if err := os.Truncate(rootfsPath, newSize); err != nil {
+		return fmt.Errorf("failed to truncate file: %w", err)
+	}
+
+	// Step 5: Try to use zerofree if available (zeros unused blocks for better compression)
+	if _, err := exec.LookPath("zerofree"); err == nil {
+		m.logger("  Running zerofree to zero unused blocks...")
+		cmd = exec.Command("zerofree", rootfsPath)
+		cmd.Run() // Ignore errors, zerofree is optional
+	}
+
+	// Get final size
+	finalInfo, _ := os.Stat(rootfsPath)
+	finalSize := finalInfo.Size()
+	savedBytes := origSize - finalSize
+	savedPct := float64(savedBytes) / float64(origSize) * 100
+
+	m.logger("  Shrink complete: %d -> %d bytes (saved %.1f%%)", origSize, finalSize, savedPct)
+
+	// Log to VM
+	m.db.AddVMLog(vmID, "info", fmt.Sprintf("RootFS shrunk: %s -> %s (saved %.1f%%)",
+		formatBytes(origSize), formatBytes(finalSize), savedPct))
+
+	return nil
+}
+
 // removeFstabEntry removes a mount point entry from fstab
 func (m *Manager) removeFstabEntry(rootfsPath, mountPoint string) error {
 	// Create a temporary directory to mount the rootfs
@@ -3778,6 +3935,11 @@ func (m *Manager) GetDisksDir() string {
 	return filepath.Join(m.dataDir, "disks")
 }
 
+// GetDataDir returns the path to the data directory
+func (m *Manager) GetDataDir() string {
+	return m.dataDir
+}
+
 // Helper functions
 
 func generateVMID() string {
@@ -3804,6 +3966,26 @@ func copyFile(src, dst string) error {
 }
 
 func addFileToTar(tw *tar.Writer, filePath, name string) (string, error) {
+	return addFileToTarWithProgress(tw, filePath, name, nil)
+}
+
+// progressWriter wraps a writer and calls a callback with bytes written
+type progressWriter struct {
+	writer   io.Writer
+	written  int64
+	callback func(int64)
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n, err := pw.writer.Write(p)
+	pw.written += int64(n)
+	if pw.callback != nil {
+		pw.callback(pw.written)
+	}
+	return n, err
+}
+
+func addFileToTarWithProgress(tw *tar.Writer, filePath, name string, progressCallback func(int64)) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", err
@@ -3826,11 +4008,15 @@ func addFileToTar(tw *tar.Writer, filePath, name string) (string, error) {
 		return "", err
 	}
 
-	// Calculate checksum while writing
+	// Calculate checksum while writing with progress
 	hash := md5.New()
-	multiWriter := io.MultiWriter(tw, hash)
+	var dest io.Writer = io.MultiWriter(tw, hash)
 
-	if _, err := io.Copy(multiWriter, file); err != nil {
+	if progressCallback != nil {
+		dest = &progressWriter{writer: dest, callback: progressCallback}
+	}
+
+	if _, err := io.Copy(dest, file); err != nil {
 		return "", err
 	}
 

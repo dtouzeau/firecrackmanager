@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -196,6 +197,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/migration/server", s.requireAdmin(s.handleMigrationServer))
 	s.mux.HandleFunc("/api/migration/send", s.requireAdmin(s.handleMigrationSend))
 	s.mux.HandleFunc("/api/migration/status", s.requireAuth(s.handleMigrationStatus))
+
+	// Appliances routes (exported VMs)
+	s.mux.HandleFunc("/api/appliances", s.requireAuth(s.handleAppliances))
+	s.mux.HandleFunc("/api/appliances/", s.requireAuth(s.handleAppliance))
 
 	// Host network management routes (admin only)
 	s.registerHostNetRoutes()
@@ -470,7 +475,7 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// No network - use default kernel args if not specified
 			if vmObj.KernelArgs == "" {
-				vmObj.KernelArgs = "console=ttyS0,115200n8 reboot=k panic=1 pci=off"
+				vmObj.KernelArgs = "console=ttyS0,115200n8 reboot=k panic=1"
 			}
 		}
 
@@ -813,21 +818,74 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		archivePath, err := s.vmMgr.ExportVM(vmID)
-		if err != nil {
-			s.jsonError(w, "Failed to export VM: "+err.Error(), http.StatusInternalServerError)
+		// Generate operation key for progress tracking
+		opKey := fmt.Sprintf("export-%s-%d", vmID, time.Now().UnixNano())
+
+		// Initialize progress
+		s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
+			Status:  "starting",
+			Stage:   "Preparing export...",
+			Percent: 0,
+		})
+
+		// Run export in background
+		go func() {
+			// Auto-shrink rootfs before export
+			s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
+				Status:  "shrinking",
+				Stage:   "Shrinking rootfs...",
+				Percent: 0,
+			})
+			s.logger("Shrinking rootfs before export...")
+			if err := s.vmMgr.ShrinkRootFS(vmID); err != nil {
+				s.logger("Warning: failed to shrink rootfs: %v", err)
+				// Continue with export even if shrink fails
+			}
+
+			archivePath, err := s.vmMgr.ExportVMWithProgress(vmID, opKey)
+			if err != nil {
+				s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
+					Status: "error",
+					Stage:  "Export failed",
+					Error:  err.Error(),
+				})
+				return
+			}
+
+			// Get just the filename for the download URL
+			filename := filepath.Base(archivePath)
+			s.db.AddVMLog(vmID, "info", "VM exported to "+filename)
+
+			s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
+				Status:     "completed",
+				Stage:      "Export completed",
+				Percent:    100,
+				ResultID:   filename,
+				ResultName: "/api/vms/export/" + filename,
+			})
+		}()
+
+		s.jsonResponse(w, map[string]interface{}{
+			"status":       "started",
+			"progress_key": opKey,
+			"vm_id":        vmID,
+		})
+
+	case "shrink":
+		// POST /api/vms/{id}/shrink - shrink VM rootfs
+		if r.Method != http.MethodPost {
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Get just the filename for the download URL
-		filename := filepath.Base(archivePath)
-		s.db.AddVMLog(vmID, "info", "VM exported to "+filename)
+		if err := s.vmMgr.ShrinkRootFS(vmID); err != nil {
+			s.jsonError(w, "Failed to shrink rootfs: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		s.jsonResponse(w, map[string]interface{}{
-			"status":       "success",
-			"archive_path": archivePath,
-			"filename":     filename,
-			"download_url": "/api/vms/export/" + filename,
+			"status":  "success",
+			"message": "RootFS shrunk successfully",
 		})
 
 	case "disks":
@@ -4532,7 +4590,7 @@ func generateID() string {
 // buildKernelArgs constructs kernel arguments with network configuration if needed
 // Format: ip=<client-ip>:<server-ip>:<gateway>:<netmask>:<hostname>:<device>:<autoconf>
 func buildKernelArgs(baseArgs, ipAddress, gateway string) string {
-	defaultArgs := "console=ttyS0,115200n8 reboot=k panic=1 pci=off"
+	defaultArgs := "console=ttyS0,115200n8 reboot=k panic=1"
 
 	// Start with base args or default
 	args := baseArgs
@@ -5182,4 +5240,142 @@ func incrementIP(ip net.IP) net.IP {
 		}
 	}
 	return nil
+}
+
+// ApplianceInfo represents an exported VM appliance file
+type ApplianceInfo struct {
+	Filename     string `json:"filename"`
+	Size         int64  `json:"size"`
+	ExportedDate string `json:"exported_date"`
+	VMName       string `json:"vm_name"`
+}
+
+// handleAppliances handles GET /api/appliances - list all exported VM appliances
+func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// List all .fcrack files in the data directory
+	dataDir := s.vmMgr.GetDataDir()
+	files, err := os.ReadDir(dataDir)
+	if err != nil {
+		s.jsonError(w, "Failed to read data directory: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var appliances []ApplianceInfo
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".fcrack") {
+			continue
+		}
+
+		info, err := file.Info()
+		if err != nil {
+			continue
+		}
+
+		// Parse filename to extract VM name and date
+		// Format: <vm-name>-<YYYYMMDD-HHMMSS>.fcrack
+		filename := file.Name()
+		baseName := strings.TrimSuffix(filename, ".fcrack")
+
+		vmName := baseName
+		exportedDate := info.ModTime().Format("2006-01-02 15:04:05")
+
+		// Try to extract date from filename
+		if len(baseName) > 16 {
+			// Check if the last 15 chars match date format YYYYMMDD-HHMMSS
+			datePart := baseName[len(baseName)-15:]
+			if len(datePart) == 15 && datePart[8] == '-' {
+				if t, err := time.Parse("20060102-150405", datePart); err == nil {
+					exportedDate = t.Format("2006-01-02 15:04:05")
+					vmName = baseName[:len(baseName)-16] // Remove the date part and preceding dash
+				}
+			}
+		}
+
+		// Replace underscores back to spaces for display
+		vmName = strings.ReplaceAll(vmName, "_", " ")
+
+		appliances = append(appliances, ApplianceInfo{
+			Filename:     filename,
+			Size:         info.Size(),
+			ExportedDate: exportedDate,
+			VMName:       vmName,
+		})
+	}
+
+	// Sort by date descending (most recent first)
+	sort.Slice(appliances, func(i, j int) bool {
+		return appliances[i].ExportedDate > appliances[j].ExportedDate
+	})
+
+	s.jsonResponse(w, map[string]interface{}{
+		"appliances": appliances,
+		"count":      len(appliances),
+	})
+}
+
+// handleAppliance handles individual appliance operations
+// DELETE /api/appliances/{filename} - delete an appliance
+// GET /api/appliances/{filename} - download an appliance
+func (s *Server) handleAppliance(w http.ResponseWriter, r *http.Request) {
+	// Extract filename from path
+	path := strings.TrimPrefix(r.URL.Path, "/api/appliances/")
+	filename := strings.TrimSuffix(path, "/")
+
+	if filename == "" {
+		s.jsonError(w, "Filename is required", http.StatusBadRequest)
+		return
+	}
+
+	// Security check: ensure filename doesn't contain path traversal
+	if strings.Contains(filename, "/") || strings.Contains(filename, "\\") || strings.Contains(filename, "..") {
+		s.jsonError(w, "Invalid filename", http.StatusBadRequest)
+		return
+	}
+
+	// Ensure it's a .fcrack file
+	if !strings.HasSuffix(filename, ".fcrack") {
+		s.jsonError(w, "Invalid file type", http.StatusBadRequest)
+		return
+	}
+
+	filePath := filepath.Join(s.vmMgr.GetDataDir(), filename)
+
+	switch r.Method {
+	case http.MethodGet:
+		// Download the appliance file
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			s.jsonError(w, "Appliance not found", http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+		http.ServeFile(w, r, filePath)
+
+	case http.MethodDelete:
+		// Delete the appliance file
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			s.jsonError(w, "Appliance not found", http.StatusNotFound)
+			return
+		}
+
+		if err := os.Remove(filePath); err != nil {
+			s.jsonError(w, "Failed to delete appliance: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.logger("Deleted appliance: %s", filename)
+		s.jsonResponse(w, map[string]interface{}{
+			"success": true,
+			"message": "Appliance deleted successfully",
+		})
+
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }

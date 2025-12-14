@@ -871,6 +871,31 @@ tbody a:hover {
 td.actions {
     vertical-align: middle;
 }
+.export-progress {
+    margin-top: 4px;
+    margin-left: 24px;
+}
+.export-progress-text {
+    font-size: 11px;
+    color: var(--primary);
+    margin-bottom: 2px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.export-progress-bar {
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    width: 200px;
+}
+.export-progress-fill {
+    height: 100%%;
+    background: var(--primary);
+    border-radius: 2px;
+    transition: width 0.3s ease;
+}
 .modal-header {
     padding: 7px 8px 8px;
     background: linear-gradient(135deg, var(--primary) 0%%,var(--primary-dark) 100%%);
@@ -955,7 +980,7 @@ td.actions {
 }
 
 /* Utility */
-.actions { display: flex; gap: 8px; }
+.actions { display: flex; gap: 8px; justify-content: center; align-items: center; }
 .empty-state {
     text-align: center;
     padding: 60px 20px;

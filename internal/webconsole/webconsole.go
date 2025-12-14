@@ -51,6 +51,7 @@ func (wc *WebConsole) registerRoutes() {
 	wc.mux.HandleFunc("/networks", wc.requireAuth(wc.handleNetworksPage))
 	wc.mux.HandleFunc("/images", wc.requireAuth(wc.handleImagesPage))
 	wc.mux.HandleFunc("/docker", wc.requireAuth(wc.handleDockerPage))
+	wc.mux.HandleFunc("/appliances", wc.requireAuth(wc.handleAppliancesPage))
 	wc.mux.HandleFunc("/logs", wc.requireAuth(wc.handleLogsPage))
 	wc.mux.HandleFunc("/settings", wc.requireAuth(wc.handleSettingsPage))
 	wc.mux.HandleFunc("/account", wc.requireAuth(wc.handleAccountPage))
@@ -219,6 +220,12 @@ func (wc *WebConsole) handleDockerPage(w http.ResponseWriter, r *http.Request) {
 	sess := wc.getSession(r)
 	w.Header().Set("Content-Type", "text/html")
 	fmt.Fprint(w, wc.baseTemplate("Docker Images", "docker", wc.renderDockerPage(), sess))
+}
+
+func (wc *WebConsole) handleAppliancesPage(w http.ResponseWriter, r *http.Request) {
+	sess := wc.getSession(r)
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, wc.baseTemplate("Appliances", "appliances", wc.renderAppliancesPage(), sess))
 }
 
 func (wc *WebConsole) handleLogsPage(w http.ResponseWriter, r *http.Request) {
@@ -472,6 +479,10 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
             <a href="/docker" class="nav-item" data-page="docker">
                 <span class="material-icons">cloud_download</span>
                 <span>Docker Images</span>
+            </a>
+            <a href="/appliances" class="nav-item" data-page="appliances">
+                <span class="material-icons">inventory_2</span>
+                <span>Appliances</span>
             </a>
             <a href="/logs" class="nav-item" data-page="logs">
                 <span class="material-icons">article</span>
@@ -1009,7 +1020,7 @@ func (wc *WebConsole) renderVMsPage() string {
                 </div>
                 <div class="form-group">
                     <label>Kernel Arguments (optional)</label>
-                    <input type="text" name="kernel_args" placeholder="console=ttyS0,115200n8 reboot=k panic=1 pci=off">
+                    <input type="text" name="kernel_args" placeholder="console=ttyS0,115200n8 reboot=k panic=1">
                 </div>
                 <div class="form-group">
                     <label>DNS Servers (optional)</label>
@@ -1070,7 +1081,7 @@ func (wc *WebConsole) renderVMsPage() string {
                 </div>
                 <div class="form-group">
                     <label>Kernel Arguments (optional)</label>
-                    <input type="text" name="kernel_args" id="editVmKernelArgs" placeholder="console=ttyS0,115200n8 reboot=k panic=1 pci=off">
+                    <input type="text" name="kernel_args" id="editVmKernelArgs" placeholder="console=ttyS0,115200n8 reboot=k panic=1">
                 </div>
                 <div class="form-group">
                     <label>DNS Servers (optional)</label>
@@ -1756,6 +1767,10 @@ function createVMRow(vm) {
                 <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 -960 960 960" style="vertical-align: middle; margin-right: 6px; fill: ${statusColor};" class="vm-status-icon"><path d="M280-332h260q37.8 0 63.9-26.61t26.1-64.5Q630-461 602.94-487T538-513h-9l-1-9q-7-48-43.26-79-36.27-31-84.62-31Q362-632 331-611.5 300-591 283-557l-3 5-6 1q-43.79 1.83-73.89 33.48Q170-485.88 170-441.86 170-396 202.08-364q32.09 32 77.92 32Zm0-60q-21.25 0-35.62-14.32Q230-420.65 230-441.82q0-21.18 14.38-35.68Q258.75-492 280-492h40q0-33.14 23.4-56.57T399.9-572q33.1 0 56.6 23.43T480-492v40h60q13 0 21.5 8.5T570-422q0 13-8.5 21.5T540-392H280Zm8 352v-60h62v-104H100q-24 0-42-18t-18-42v-436q0-24 18-42t42-18h600q24 0 42 18t18 42v436q0 24-18 42t-42 18H450v104h61v60H288Zm572-369v-451H204v-60h656q24 0 42 18t18 42v451h-60ZM100-264h600v-436H100v436Zm300-218Z"/></svg>
                 <a href="/vms/${vm.id}">${vm.name}</a>
                 ${vm.autorun ? '<span class="material-icons" style="font-size: 14px; color: var(--primary); vertical-align: middle; margin-left: 4px;" title="Autorun enabled">auto_mode</span>' : ''}
+                <div id="export-progress-${vm.id}" class="export-progress" style="display: none;">
+                    <div class="export-progress-text"><span class="material-icons" style="font-size: 14px; animation: spin 1s linear infinite;">sync</span> Exporting... <span class="export-percent">0%</span></div>
+                    <div class="export-progress-bar"><div class="export-progress-fill" style="width: 0%"></div></div>
+                </div>
             </td>
             <td class="vm-vcpu">${vm.vcpu}</td>
             <td class="vm-memory">${vm.memory_mb} MB</td>
@@ -1805,6 +1820,9 @@ function createVMRow(vm) {
                             <span class="material-icons">lan</span> Networks
                         </button>
                         <div class="action-dropdown-divider"></div>
+                        <button class="action-dropdown-item" onclick="shrinkVM('${vm.id}', '${vm.name}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
+                            <span class="material-icons">compress</span> Shrink
+                        </button>
                         <button class="action-dropdown-item" onclick="duplicateVM('${vm.id}', '${vm.name}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">content_copy</span> Duplicate
                         </button>
@@ -2373,36 +2391,110 @@ async function submitDuplicateVM(event) {
     setTimeout(pollProgress, 200);
 }
 
-// Export VM functionality
-async function exportVM(vmId, vmName) {
-    if (!confirm(` + "`" + `Export VM "${vmName}" as a .fcrack virtual appliance?` + "`" + `)) return;
+// Shrink VM rootfs functionality
+async function shrinkVM(vmId, vmName) {
+    if (!confirm(` + "`" + `Shrink rootfs for VM "${vmName}"?\n\nThis will minimize the disk size by removing unused space. The VM must be stopped.` + "`" + `)) return;
 
     // Show loading indicator
     const btn = event.target.closest('button');
     const originalContent = btn.innerHTML;
-    btn.innerHTML = '<span class="material-icons" style="animation: spin 1s linear infinite;">sync</span>';
+    btn.innerHTML = '<span class="material-icons" style="animation: spin 1s linear infinite;">sync</span> Shrinking...';
     btn.disabled = true;
 
     try {
-        const { ok, data } = await apiCall(` + "`" + `/api/vms/${vmId}/export` + "`" + `, 'POST');
-        if (ok && data.download_url) {
-            // Trigger download
-            const link = document.createElement('a');
-            link.href = data.download_url;
-            link.download = data.filename || (vmName + '.fcrack');
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-            alert('VM export started. Download will begin shortly.');
+        const { ok, data } = await apiCall(` + "`" + `/api/vms/${vmId}/shrink` + "`" + `, 'POST');
+        if (ok) {
+            alert('RootFS shrunk successfully!');
+            loadVMs(); // Refresh the list
         } else {
-            alert(data.error || 'Failed to export VM');
+            alert(data.error || 'Failed to shrink rootfs');
         }
     } catch (e) {
-        alert('Failed to export VM: ' + e.message);
+        alert('Failed to shrink rootfs: ' + e.message);
     } finally {
         btn.innerHTML = originalContent;
         btn.disabled = false;
     }
+}
+
+// Export VM functionality
+async function exportVM(vmId, vmName) {
+    if (!confirm(` + "`" + `Export VM "${vmName}" as a .fcrack virtual appliance?\n\nThe rootfs will be automatically shrunk before export.` + "`" + `)) return;
+
+    // Show progress bar under VM name
+    const progressDiv = document.getElementById('export-progress-' + vmId);
+    if (progressDiv) {
+        progressDiv.style.display = 'block';
+    }
+
+    try {
+        const { ok, data } = await apiCall(` + "`" + `/api/vms/${vmId}/export` + "`" + `, 'POST');
+        if (ok && data.progress_key) {
+            // Poll for progress
+            pollExportProgress(vmId, data.progress_key, vmName);
+        } else {
+            if (progressDiv) progressDiv.style.display = 'none';
+            alert(data.error || 'Failed to start export');
+        }
+    } catch (e) {
+        if (progressDiv) progressDiv.style.display = 'none';
+        alert('Failed to export VM: ' + e.message);
+    }
+}
+
+async function pollExportProgress(vmId, progressKey, vmName) {
+    const progressDiv = document.getElementById('export-progress-' + vmId);
+    if (!progressDiv) return;
+
+    const percentSpan = progressDiv.querySelector('.export-percent');
+    const fillDiv = progressDiv.querySelector('.export-progress-fill');
+    const textDiv = progressDiv.querySelector('.export-progress-text');
+
+    const poll = async () => {
+        try {
+            const { ok, data } = await apiCall('/api/operations/' + progressKey);
+            if (!ok) {
+                progressDiv.style.display = 'none';
+                alert('Failed to get export progress');
+                return;
+            }
+
+            const percent = Math.round(data.percent || 0);
+            if (percentSpan) percentSpan.textContent = percent + '%';
+            if (fillDiv) fillDiv.style.width = percent + '%';
+
+            // Update text based on stage
+            if (textDiv && data.stage) {
+                const icon = '<span class="material-icons" style="font-size: 14px; animation: spin 1s linear infinite;">sync</span>';
+                textDiv.innerHTML = icon + ' ' + data.stage + ' <span class="export-percent">' + percent + '%</span>';
+            }
+
+            if (data.status === 'completed') {
+                progressDiv.style.display = 'none';
+                // Trigger download
+                if (data.result_name) {
+                    const link = document.createElement('a');
+                    link.href = data.result_name;
+                    link.download = data.result_id || (vmName + '.fcrack');
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                }
+                alert('Export completed! Download started.');
+            } else if (data.status === 'error') {
+                progressDiv.style.display = 'none';
+                alert('Export failed: ' + (data.error || 'Unknown error'));
+            } else {
+                // Continue polling
+                setTimeout(poll, 500);
+            }
+        } catch (e) {
+            progressDiv.style.display = 'none';
+            alert('Error polling export progress: ' + e.message);
+        }
+    };
+
+    poll();
 }
 
 // Move to VM Group functionality
@@ -3076,7 +3168,10 @@ func (wc *WebConsole) renderVMDetailPage(vmID string) string {
             </div>
             <div>
                 <p><strong>Root Disk Size:</strong> <span id="vmDiskSize">-</span>
-                    <button class="btn btn-info btn-xs" id="expandRootFSBtn" onclick="triggerExpandRootFS()" title="Expand Root Filesystem" style="margin-left: 8px;">
+                    <button class="btn btn-info btn-xs" id="shrinkRootFSBtn" onclick="triggerShrinkRootFS()" title="Shrink Root Filesystem" style="margin-left: 8px;">
+                        <span class="material-icons">compress</span>
+                    </button>
+                    <button class="btn btn-info btn-xs" id="expandRootFSBtn" onclick="triggerExpandRootFS()" title="Expand Root Filesystem" style="margin-left: 4px;">
                         <span class="material-icons">expand</span>
                     </button>
                 </p>
@@ -3285,6 +3380,35 @@ function triggerExpandRootFS() {
     if (window.currentVMDetails) {
         const sizeMB = window.currentVMDetails.disk_size_mb || 0;
         openExpandRootFSModal(vmId, window.currentVMDetails.name, sizeMB);
+    }
+}
+
+async function triggerShrinkRootFS() {
+    if (!window.currentVMDetails) return;
+
+    const vmName = window.currentVMDetails.name;
+    if (!confirm('Shrink rootfs for VM "' + vmName + '"?\n\nThis will minimize the disk size by removing unused space. The VM must be stopped.')) {
+        return;
+    }
+
+    const btn = document.getElementById('shrinkRootFSBtn');
+    const originalContent = btn.innerHTML;
+    btn.innerHTML = '<span class="material-icons" style="animation: spin 1s linear infinite;">sync</span>';
+    btn.disabled = true;
+
+    try {
+        const { ok, data } = await apiCall('/api/vms/' + vmId + '/shrink', 'POST');
+        if (ok) {
+            alert('RootFS shrunk successfully!');
+            loadVMDetails(); // Refresh to show new size
+        } else {
+            alert(data.error || 'Failed to shrink rootfs');
+        }
+    } catch (e) {
+        alert('Failed to shrink rootfs: ' + e.message);
+    } finally {
+        btn.innerHTML = originalContent;
+        btn.disabled = false;
     }
 }
 
@@ -3752,7 +3876,7 @@ setInterval(loadVMMetrics, 3000);
                 </div>
                 <div class="form-group">
                     <label>Kernel Arguments (optional)</label>
-                    <input type="text" name="kernel_args" id="editVmKernelArgs" placeholder="console=ttyS0,115200n8 reboot=k panic=1 pci=off">
+                    <input type="text" name="kernel_args" id="editVmKernelArgs" placeholder="console=ttyS0,115200n8 reboot=k panic=1">
                 </div>
                 <div class="form-group">
                     <label>DNS Servers (optional)</label>
@@ -9243,6 +9367,124 @@ async function submitChangePassword(e) {
 
 // Load account data on page load
 loadAccountData();
+</script>
+`
+}
+
+func (wc *WebConsole) renderAppliancesPage() string {
+	return `
+<div class="card">
+    <div class="card-header">
+        <h3><span class="material-icons" style="vertical-align: middle; margin-right: 8px;">inventory_2</span>Appliances</h3>
+    </div>
+    <div class="card-body">
+        <p>Exported VM appliances (.fcrack archives) ready for download or import on other systems.</p>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h3>Exported VMs</h3>
+    </div>
+    <div class="card-body">
+        <table class="data-table" style="table-layout: fixed; width: 100%;">
+            <thead>
+                <tr>
+                    <th style="width: auto;">NAME</th>
+                    <th style="width: 180px;">EXPORTED DATE</th>
+                    <th style="width: 100px;">SIZE</th>
+                    <th style="width: 100px; text-align: center;">ACTIONS</th>
+                </tr>
+            </thead>
+            <tbody id="appliancesList">
+                <tr>
+                    <td colspan="4">Loading...</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+async function loadAppliances() {
+    const tbody = document.getElementById('appliancesList');
+
+    try {
+        const response = await fetch('/api/appliances', { credentials: 'include' });
+        const data = await response.json();
+
+        if (!response.ok) {
+            tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><span class="material-icons">error</span><p>' + (data.error || 'Failed to load appliances') + '</p></td></tr>';
+            return;
+        }
+
+        if (!data.appliances || data.appliances.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><span class="material-icons">inventory_2</span><p>No exported appliances</p><small>Export a VM from the Virtual Machines page to create an appliance</small></td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = data.appliances.map(app => ` + "`" + `
+            <tr>
+                <td>
+                    <span class="material-icons" style="vertical-align: middle; margin-right: 8px; color: var(--primary);">folder_zip</span>
+                    <strong>${app.vm_name}</strong>
+                    <br><small style="color: var(--text-secondary); margin-left: 32px;">${app.filename}</small>
+                </td>
+                <td>${app.exported_date}</td>
+                <td>${formatBytes(app.size)}</td>
+                <td>
+                    <div class="actions">
+                        <button class="btn btn-primary btn-sm" onclick="downloadAppliance('${app.filename}')" title="Download">
+                            <span class="material-icons">download</span>
+                        </button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteAppliance('${app.filename}')" title="Delete">
+                            <span class="material-icons">delete</span>
+                        </button>
+                    </div>
+                </td>
+            </tr>
+        ` + "`" + `).join('');
+    } catch (error) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><span class="material-icons">error</span><p>Error loading appliances</p></td></tr>';
+    }
+}
+
+function downloadAppliance(filename) {
+    window.location.href = '/api/appliances/' + encodeURIComponent(filename);
+}
+
+async function deleteAppliance(filename) {
+    if (!confirm('Are you sure you want to delete this appliance?\n\n' + filename)) {
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/appliances/' + encodeURIComponent(filename), {
+            method: 'DELETE',
+            credentials: 'include'
+        });
+        const data = await response.json();
+
+        if (response.ok) {
+            loadAppliances();
+        } else {
+            alert(data.error || 'Failed to delete appliance');
+        }
+    } catch (error) {
+        alert('Error deleting appliance: ' + error.message);
+    }
+}
+
+// Load appliances on page load
+loadAppliances();
 </script>
 `
 }

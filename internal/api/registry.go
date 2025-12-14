@@ -359,7 +359,7 @@ func (s *Server) runConversion(job *ConversionJob, name string, injectMinInit bo
 				MemoryMB:   vmConfig.MemoryMB,
 				KernelPath: kernel.Path,
 				RootFSPath: outputPath,
-				KernelArgs: "console=ttyS0,115200n8 reboot=k panic=1 pci=off",
+				KernelArgs: "console=ttyS0,115200n8 reboot=k panic=1",
 				Status:     "stopped",
 			}
 
