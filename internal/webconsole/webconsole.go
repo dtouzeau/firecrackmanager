@@ -52,6 +52,7 @@ func (wc *WebConsole) registerRoutes() {
 	wc.mux.HandleFunc("/images", wc.requireAuth(wc.handleImagesPage))
 	wc.mux.HandleFunc("/docker", wc.requireAuth(wc.handleDockerPage))
 	wc.mux.HandleFunc("/appliances", wc.requireAuth(wc.handleAppliancesPage))
+	wc.mux.HandleFunc("/store", wc.requireAuth(wc.handleStorePage))
 	wc.mux.HandleFunc("/logs", wc.requireAuth(wc.handleLogsPage))
 	wc.mux.HandleFunc("/settings", wc.requireAuth(wc.handleSettingsPage))
 	wc.mux.HandleFunc("/account", wc.requireAuth(wc.handleAccountPage))
@@ -151,7 +152,12 @@ func (wc *WebConsole) handlePage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
-	http.Redirect(w, r, "/dashboard", http.StatusFound)
+	// Redirect admins to dashboard, others to VMs
+	if sess.Role == "admin" {
+		http.Redirect(w, r, "/dashboard", http.StatusFound)
+	} else {
+		http.Redirect(w, r, "/vms", http.StatusFound)
+	}
 }
 
 func (wc *WebConsole) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -172,7 +178,12 @@ func (wc *WebConsole) handleLogout(w http.ResponseWriter, r *http.Request) {
 func (wc *WebConsole) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 	sess := wc.getSession(r)
 	if sess != nil {
-		http.Redirect(w, r, "/dashboard", http.StatusFound)
+		// Redirect admins to dashboard, others to VMs
+		if sess.Role == "admin" {
+			http.Redirect(w, r, "/dashboard", http.StatusFound)
+		} else {
+			http.Redirect(w, r, "/vms", http.StatusFound)
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "text/html")
@@ -181,6 +192,11 @@ func (wc *WebConsole) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 
 func (wc *WebConsole) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	sess := wc.getSession(r)
+	// Non-admin users are redirected to VMs page
+	if sess == nil || sess.Role != "admin" {
+		http.Redirect(w, r, "/vms", http.StatusFound)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html")
 	fmt.Fprint(w, wc.baseTemplate("Dashboard", "dashboard", wc.renderDashboard(), sess))
 }
@@ -195,7 +211,7 @@ func (wc *WebConsole) handleVMDetailPage(w http.ResponseWriter, r *http.Request)
 	sess := wc.getSession(r)
 	vmID := strings.TrimPrefix(r.URL.Path, "/vms/")
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, wc.baseTemplate("VM Details", "vms", wc.renderVMDetailPage(vmID), sess))
+	fmt.Fprint(w, wc.baseTemplate("VM Details<div class=\"vm-title\" id=\"vmTitleName\"></div><div class=\"description-vm-title\" id=\"vmDescriptionTitle\"><span id=\"vmDescriptionText\"></span> <a href=\"#\" onclick=\"openEditDescriptionModal(); return false;\" class=\"edit-description-link\">Edit description...</a></div>", "vms", wc.renderVMDetailPage(vmID), sess))
 }
 
 func (wc *WebConsole) handleConsolePage(w http.ResponseWriter, r *http.Request) {
@@ -226,6 +242,12 @@ func (wc *WebConsole) handleAppliancesPage(w http.ResponseWriter, r *http.Reques
 	sess := wc.getSession(r)
 	w.Header().Set("Content-Type", "text/html")
 	fmt.Fprint(w, wc.baseTemplate("Appliances", "appliances", wc.renderAppliancesPage(), sess))
+}
+
+func (wc *WebConsole) handleStorePage(w http.ResponseWriter, r *http.Request) {
+	sess := wc.getSession(r)
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, wc.baseTemplate("Store", "store", wc.renderStorePage(), sess))
 }
 
 func (wc *WebConsole) handleLogsPage(w http.ResponseWriter, r *http.Request) {
@@ -361,16 +383,58 @@ func (wc *WebConsole) renderLoginPage() string {
 func (wc *WebConsole) baseTemplate(title, page, content string, session *database.Session) string {
 	isAdmin := session != nil && session.Role == "admin"
 	username := ""
+	userPerms := make(map[string]bool)
 	if session != nil {
 		username = session.Username
+		userPerms = wc.db.GetUserPermissions(session.UserID, session.Role)
 	}
 
-	// Host Network menu item (only shown if enabled in config)
+	// Dashboard menu (only for admins)
+	dashboardMenu := ""
+	if isAdmin {
+		dashboardMenu = `<a href="/dashboard" class="nav-item" data-page="dashboard">
+                <span class="material-icons">dashboard</span>
+                <span>Dashboard</span>
+            </a>`
+	}
+
+	// Networks menu (only if admin or has networks permission)
+	networksMenu := ""
+	if userPerms["admin"] || userPerms["networks"] {
+		networksMenu = `<a href="/networks" class="nav-item" data-page="networks">
+                <span class="material-icons">hub</span>
+                <span>Networks</span>
+            </a>`
+	}
+
+	// Images menu (only if admin or has images permission)
+	imagesMenu := ""
+	if userPerms["admin"] || userPerms["images"] {
+		imagesMenu = `<a href="/images" class="nav-item" data-page="images">
+                <span class="material-icons">storage</span>
+                <span>Images</span>
+            </a>
+            <a href="/docker" class="nav-item" data-page="docker">
+                <span class="material-icons">cloud_download</span>
+                <span>Docker Images</span>
+            </a>`
+	}
+
+	// Host Network menu item (only for admins and if enabled in config)
 	hostNetworkMenu := ""
-	if wc.apiServer.IsHostNetworkManagementEnabled() {
+	if isAdmin && wc.apiServer.IsHostNetworkManagementEnabled() {
 		hostNetworkMenu = `<a href="/hostnetwork" class="nav-item" data-page="hostnetwork">
                 <span class="material-icons">lan</span>
                 <span>Host Network</span>
+            </a>`
+	}
+
+	// Migration menu (only for admins)
+	migrationMenu := ""
+	if isAdmin {
+		migrationMenu = `<a href="/migration" class="nav-item" data-page="migration">
+                <span class="material-icons">swap_horiz</span>
+                <span>Migration</span>
             </a>`
 	}
 
@@ -382,11 +446,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
         </a>
         <a href="/users" class="nav-item" data-page="users">
             <span class="material-icons">people</span>
-            <span>Users</span>
-        </a>
-        <a href="/groups" class="nav-item" data-page="groups">
-            <span class="material-icons">group_work</span>
-            <span>Groups</span>
+            <span>Users & Groups</span>
         </a>`
 	}
 
@@ -460,29 +520,20 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
             <h1>FireCrackManager</h1>
         </div>
         <nav>
-            <a href="/dashboard" class="nav-item" data-page="dashboard">
-                <span class="material-icons">dashboard</span>
-                <span>Dashboard</span>
-            </a>
+            %s
             <a href="/vms" class="nav-item" data-page="vms">
                 <span class="material-icons">memory</span>
                 <span>Virtual Machines</span>
             </a>
-            <a href="/networks" class="nav-item" data-page="networks">
-                <span class="material-icons">hub</span>
-                <span>Networks</span>
-            </a>
-            <a href="/images" class="nav-item" data-page="images">
-                <span class="material-icons">storage</span>
-                <span>Images</span>
-            </a>
-            <a href="/docker" class="nav-item" data-page="docker">
-                <span class="material-icons">cloud_download</span>
-                <span>Docker Images</span>
-            </a>
+            %s
+            %s
             <a href="/appliances" class="nav-item" data-page="appliances">
                 <span class="material-icons">inventory_2</span>
                 <span>Appliances</span>
+            </a>
+            <a href="/store" class="nav-item" data-page="store">
+                <span class="material-icons">store</span>
+                <span>Store</span>
             </a>
             <a href="/logs" class="nav-item" data-page="logs">
                 <span class="material-icons">article</span>
@@ -492,10 +543,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
                 <span class="material-icons">settings</span>
                 <span>Settings</span>
             </a>
-            <a href="/migration" class="nav-item" data-page="migration">
-                <span class="material-icons">swap_horiz</span>
-                <span>Migration</span>
-            </a>
+            %s
             %s
             %s
         </nav>
@@ -524,7 +572,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
         });
     </script>
 </body>
-</html>`, title, hostNetworkMenu, adminMenu, title, username, content, page)
+</html>`, title, dashboardMenu, networksMenu, imagesMenu, migrationMenu, hostNetworkMenu, adminMenu, title, username, content, page)
 }
 
 func (wc *WebConsole) renderDashboard() string {
@@ -553,7 +601,7 @@ func (wc *WebConsole) renderDashboard() string {
             <span class="label label-primary" id="cpuStatusLabel">OK</span>
         </div>
         <div class="ibox-content">
-            <h1 id="cpuPercent">-%</h1>
+            <h1 id="cpuPercent">-%%</h1>
             <div class="stat-percent text-success" id="cpuCores">- CPUs <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
             <small>Used CPU</small>
         </div>
@@ -570,7 +618,7 @@ func (wc *WebConsole) renderDashboard() string {
         </div>
         <div class="ibox-content">
             <h1 id="memUsed">-</h1>
-            <div class="stat-percent text-success" id="memPercent">-% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
+            <div class="stat-percent text-success" id="memPercent">-%% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
             <small id="memTotal">Total: -</small>
         </div>
         <div class="ibox-footer">
@@ -586,7 +634,7 @@ func (wc *WebConsole) renderDashboard() string {
         </div>
         <div class="ibox-content">
             <h1 id="diskUsed">-</h1>
-            <div class="stat-percent text-success" id="diskPercent">-% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
+            <div class="stat-percent text-success" id="diskPercent">-%% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
             <small id="diskTotal">Total: -</small>
         </div>
         <div class="ibox-footer" style="padding: 15px;">
@@ -603,14 +651,14 @@ func (wc *WebConsole) renderDashboard() string {
 
 <style>
 .disk-progress-container {
-    width: 100%;
+    width: 100%%;
     height: 12px;
     background: #e8e8e8;
     border-radius: 6px;
     overflow: hidden;
 }
 .disk-progress-bar {
-    height: 100%;
+    height: 100%%;
     background: #18a689;
     border-radius: 6px;
     transition: width 0.3s ease, background-color 0.3s ease;
@@ -701,9 +749,9 @@ function updateDiskProgressBar(usedPercent) {
     const bar = document.getElementById('diskProgressBar');
     if (!bar) return;
 
-    bar.style.width = usedPercent + '%';
+    bar.style.width = usedPercent + '%%';
 
-    // Change color based on usage: green < 75%, yellow 75-90%, red > 90%
+    // Change color based on usage: green < 75%%, yellow 75-90%%, red > 90%%
     if (usedPercent >= 90) {
         bar.style.background = '#ed5565'; // red
     } else if (usedPercent >= 75) {
@@ -737,7 +785,7 @@ async function loadDashboard() {
 
         // CPU
         const cpuPercent = sys.cpu_percent || 0;
-        document.getElementById('cpuPercent').textContent = cpuPercent.toFixed(0) + '%';
+        document.getElementById('cpuPercent').textContent = cpuPercent.toFixed(0) + '%%';
         document.getElementById('cpuCores').innerHTML = (sys.cpu_cores || '-') + ' CPUs <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
         const cpuLabel = document.getElementById('cpuStatusLabel');
         if (cpuPercent > 80) {
@@ -760,7 +808,7 @@ async function loadDashboard() {
         const memTotalMB = sys.mem_total_mb || 1;
         const memPct = (memUsedMB / memTotalMB * 100);
         document.getElementById('memUsed').textContent = formatMemory(memUsedMB);
-        document.getElementById('memPercent').innerHTML = memPct.toFixed(1) + '% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
+        document.getElementById('memPercent').innerHTML = memPct.toFixed(1) + '%% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
         document.getElementById('memTotal').textContent = 'Total: ' + formatMemory(memTotalMB);
         const memLabel = document.getElementById('memStatusLabel');
         if (memPct > 80) {
@@ -784,7 +832,7 @@ async function loadDashboard() {
         const diskFreeGB = diskTotalGB - diskUsedGB;
         const diskPct = sys.disk_percent || 0;
         document.getElementById('diskUsed').textContent = diskUsedGB.toFixed(1) + ' GB';
-        document.getElementById('diskPercent').innerHTML = diskPct.toFixed(1) + '% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
+        document.getElementById('diskPercent').innerHTML = diskPct.toFixed(1) + '%% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
         document.getElementById('diskTotal').textContent = 'Total: ' + diskTotalGB.toFixed(1) + ' GB';
         document.getElementById('diskFreeLabel').textContent = diskFreeGB.toFixed(1) + ' GB free';
         document.getElementById('diskUsedLabel').textContent = diskUsedGB.toFixed(1) + ' GB used';
@@ -863,7 +911,7 @@ func (wc *WebConsole) renderVMsPage() string {
         <div class="vm-search-container">
             <div class="search-main">
                 <span class="material-icons search-icon">search</span>
-                <input type="text" id="vmSearchQuery" placeholder="Search VMs by name, IP, or MAC..." oninput="debounceSearch()">
+                <input type="text" id="vmSearchQuery" placeholder="Search VMs by name, description, IP, or MAC..." oninput="debounceSearch()">
                 <button class="btn btn-sm" onclick="toggleAdvancedSearch()" title="Advanced search">
                     <span class="material-icons">tune</span>
                 </button>
@@ -906,7 +954,7 @@ func (wc *WebConsole) renderVMsPage() string {
         <div id="searchResultInfo" style="display: none; padding: 0.5rem 0; color: var(--text-secondary); font-size: 0.9rem;"></div>
         <!-- List View -->
         <div id="vmListView">
-            <table>
+            <table id="vmTable">
                 <thead>
                     <tr>
                         <th>Name</th>
@@ -915,7 +963,7 @@ func (wc *WebConsole) renderVMsPage() string {
                         <th>Status</th>
                         <th>IP Address</th>
                         <th>&nbsp;</th>
-                        <th>Actions</th>
+                        <th style="text-align: right;">Actions</th>
                     </tr>
                 </thead>
                 <tbody id="vmList">
@@ -993,6 +1041,10 @@ func (wc *WebConsole) renderVMsPage() string {
                     <input type="text" name="name" required>
                 </div>
                 <div class="form-group">
+                    <label>Description (optional)</label>
+                    <textarea name="description" rows="2" placeholder="Brief description of this VM"></textarea>
+                </div>
+                <div class="form-group">
                     <label>vCPUs</label>
                     <input type="number" name="vcpu" value="1" min="1" max="8">
                 </div>
@@ -1064,6 +1116,10 @@ func (wc *WebConsole) renderVMsPage() string {
                 <div class="form-group">
                     <label>Name</label>
                     <input type="text" name="name" id="editVmName" required>
+                </div>
+                <div class="form-group">
+                    <label>Description (optional)</label>
+                    <textarea name="description" id="editVmDescription" rows="2" placeholder="Brief description of this VM"></textarea>
                 </div>
                 <div class="form-group">
                     <label>vCPUs</label>
@@ -1174,7 +1230,7 @@ func (wc *WebConsole) renderVMsPage() string {
             </div>
             <div id="importProgress" style="display: none; margin-top: 10px;">
                 <div style="background: var(--bg-tertiary); border-radius: 4px; overflow: hidden;">
-                    <div id="importProgressBar" style="background: var(--primary); height: 4px; width: 0%; transition: width 0.3s;"></div>
+                    <div id="importProgressBar" style="background: var(--primary); height: 4px; width: 0%%; transition: width 0.3s;"></div>
                 </div>
                 <small id="importProgressText" style="color: var(--text-secondary);">Uploading...</small>
             </div>
@@ -1206,10 +1262,10 @@ func (wc *WebConsole) renderVMsPage() string {
             <div id="duplicateProgress" style="display: none; margin-top: 15px;">
                 <div style="margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
                     <span id="duplicateProgressStage" style="color: var(--text-secondary); font-size: 13px;">Initializing...</span>
-                    <span id="duplicateProgressPercent" style="color: var(--primary); font-weight: 500;">0%</span>
+                    <span id="duplicateProgressPercent" style="color: var(--primary); font-weight: 500;">0%%</span>
                 </div>
                 <div style="background: var(--bg-tertiary); border-radius: 4px; overflow: hidden; height: 8px;">
-                    <div id="duplicateProgressBar" style="background: var(--primary); height: 100%; width: 0%; transition: width 0.3s ease;"></div>
+                    <div id="duplicateProgressBar" style="background: var(--primary); height: 100%%; width: 0%%; transition: width 0.3s ease;"></div>
                 </div>
                 <div style="margin-top: 8px; display: flex; justify-content: space-between; font-size: 11px; color: var(--text-secondary);">
                     <span id="duplicateProgressCopied">0 MB</span>
@@ -1221,6 +1277,32 @@ func (wc *WebConsole) renderVMsPage() string {
                 <button type="submit" class="btn btn-primary" id="duplicateSubmitBtn">Duplicate</button>
             </div>
         </form>
+    </div>
+</div>
+
+<!-- Export VM Modal -->
+<div id="exportVMModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2>Export VM as Appliance</h2>
+            <span class="material-icons modal-close" onclick="closeModal('exportVMModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <input type="hidden" id="exportVmId">
+            <p style="margin-bottom: 15px; color: var(--text-secondary);">
+                Export VM "<strong id="exportVmName"></strong>" as a .fcrack virtual appliance.
+                The rootfs will be automatically shrunk before export.
+            </p>
+            <div class="form-group">
+                <label>Appliance Description (optional)</label>
+                <textarea id="exportVmDescription" rows="3" placeholder="Enter a description for this appliance..."></textarea>
+                <small style="color: var(--text-secondary);">This description will be included in the appliance and restored with the VM.</small>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('exportVMModal')">Cancel</button>
+            <button type="button" class="btn btn-primary" onclick="submitExportVM()"><span class="material-icons">download</span> Export</button>
+        </div>
     </div>
 </div>
 
@@ -1703,11 +1785,10 @@ function renderVMList(vms) {
             </td>
             <td>${vm.ip_address || '-'}</td>
             <td>-</td>
-            <td class="actions">
-                <div class="action-menu">
+            <td style="text-align: right; vertical-align: middle;">
+                <div class="action-menu" style="display: inline-block;">
                     <button class="btn btn-primary btn-sm action-menu-btn" onclick="toggleActionMenu('${vm.id}', event)">
                         <span class="material-icons">more_vert</span>
-                        Actions
                     </button>
                     <div class="action-dropdown" id="action-menu-${vm.id}">
                         ${vm.status === 'running'
@@ -1761,21 +1842,26 @@ let vmListFirstLoad = true;
 
 function createVMRow(vm) {
     const statusColor = getStatusColor(vm.status);
+    const noNetwork = !vm.network_id;
+    const rowStyle = noNetwork ? 'color: #dc3545;' : '';
+    const statusBadge = vm.status === 'running' ? 'success' : (vm.status === 'error' || noNetwork) ? 'danger' : 'warning';
     return ` + "`" + `
-        <tr data-vm-id="${vm.id}">
+        <tr data-vm-id="${vm.id}" style="${rowStyle}">
             <td>
-                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 -960 960 960" style="vertical-align: middle; margin-right: 6px; fill: ${statusColor};" class="vm-status-icon"><path d="M280-332h260q37.8 0 63.9-26.61t26.1-64.5Q630-461 602.94-487T538-513h-9l-1-9q-7-48-43.26-79-36.27-31-84.62-31Q362-632 331-611.5 300-591 283-557l-3 5-6 1q-43.79 1.83-73.89 33.48Q170-485.88 170-441.86 170-396 202.08-364q32.09 32 77.92 32Zm0-60q-21.25 0-35.62-14.32Q230-420.65 230-441.82q0-21.18 14.38-35.68Q258.75-492 280-492h40q0-33.14 23.4-56.57T399.9-572q33.1 0 56.6 23.43T480-492v40h60q13 0 21.5 8.5T570-422q0 13-8.5 21.5T540-392H280Zm8 352v-60h62v-104H100q-24 0-42-18t-18-42v-436q0-24 18-42t42-18h600q24 0 42 18t18 42v436q0 24-18 42t-42 18H450v104h61v60H288Zm572-369v-451H204v-60h656q24 0 42 18t18 42v451h-60ZM100-264h600v-436H100v436Zm300-218Z"/></svg>
-                <a href="/vms/${vm.id}">${vm.name}</a>
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 -960 960 960" style="vertical-align: middle; margin-right: 6px; fill: ${noNetwork ? '#dc3545' : statusColor};" class="vm-status-icon"><path d="M280-332h260q37.8 0 63.9-26.61t26.1-64.5Q630-461 602.94-487T538-513h-9l-1-9q-7-48-43.26-79-36.27-31-84.62-31Q362-632 331-611.5 300-591 283-557l-3 5-6 1q-43.79 1.83-73.89 33.48Q170-485.88 170-441.86 170-396 202.08-364q32.09 32 77.92 32Zm0-60q-21.25 0-35.62-14.32Q230-420.65 230-441.82q0-21.18 14.38-35.68Q258.75-492 280-492h40q0-33.14 23.4-56.57T399.9-572q33.1 0 56.6 23.43T480-492v40h60q13 0 21.5 8.5T570-422q0 13-8.5 21.5T540-392H280Zm8 352v-60h62v-104H100q-24 0-42-18t-18-42v-436q0-24 18-42t42-18h600q24 0 42 18t18 42v436q0 24-18 42t-42 18H450v104h61v60H288Zm572-369v-451H204v-60h656q24 0 42 18t18 42v451h-60ZM100-264h600v-436H100v436Zm300-218Z"/></svg>
+                <a href="/vms/${vm.id}" style="${rowStyle}">${vm.name}</a>
                 ${vm.autorun ? '<span class="material-icons" style="font-size: 14px; color: var(--primary); vertical-align: middle; margin-left: 4px;" title="Autorun enabled">auto_mode</span>' : ''}
+                ${noNetwork ? '<div style="font-size: 11px; color: #dc3545; margin-left: 24px; font-style: italic;">no defined network</div>' : ''}
+                ${vm.description ? '<div class="vm-descriptions-row" title="' + vm.description.replace(/"/g, '&quot;') + '">' + vm.description.split(' ').slice(0, 15).join(' ') + (vm.description.split(' ').length > 15 ? '...' : '') + '</div>' : ''}
                 <div id="export-progress-${vm.id}" class="export-progress" style="display: none;">
-                    <div class="export-progress-text"><span class="material-icons" style="font-size: 14px; animation: spin 1s linear infinite;">sync</span> Exporting... <span class="export-percent">0%</span></div>
-                    <div class="export-progress-bar"><div class="export-progress-fill" style="width: 0%"></div></div>
+                    <div class="export-progress-text"><span class="material-icons" style="font-size: 14px; animation: spin 1s linear infinite;">sync</span> Exporting... <span class="export-percent">0%%</span></div>
+                    <div class="export-progress-bar"><div class="export-progress-fill" style="width: 0%%"></div></div>
                 </div>
             </td>
             <td class="vm-vcpu">${vm.vcpu}</td>
             <td class="vm-memory">${vm.memory_mb} MB</td>
             <td class="vm-status-cell">
-                <span class="badge badge-${vm.status === 'running' ? 'success' : vm.status === 'error' ? 'danger' : 'warning'}">
+                <span class="badge badge-${statusBadge}">
                     ${vm.status}
                 </span>
             </td>
@@ -1785,11 +1871,10 @@ function createVMRow(vm) {
                     ? '<span class="material-icons" style="color: var(--text-secondary); animation: spin 1s linear infinite;">sync</span>'
                     : '-'}
             </td>
-            <td class="actions">
-                <div class="action-menu">
+            <td style="text-align: right; vertical-align: middle;">
+                <div class="action-menu" style="display: inline-block;">
                     <button class="btn btn-primary btn-sm action-menu-btn" onclick="toggleActionMenu('${vm.id}', event)">
                         <span class="material-icons">more_vert</span>
-                        Actions
                     </button>
                     <div class="action-dropdown" id="action-menu-${vm.id}">
                         ${vm.status === 'running'
@@ -1826,7 +1911,7 @@ function createVMRow(vm) {
                         <button class="action-dropdown-item" onclick="duplicateVM('${vm.id}', '${vm.name}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">content_copy</span> Duplicate
                         </button>
-                        <button class="action-dropdown-item" onclick="exportVM('${vm.id}', '${vm.name}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
+                        <button class="action-dropdown-item" onclick="exportVM('${vm.id}', '${vm.name}', '${(vm.description || '').replace(/'/g, "\\'")}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">download</span> Export
                         </button>
                         <button class="action-dropdown-item" onclick="openMoveToGroupModal('${vm.id}', '${vm.name}'); closeAllMenus();">
@@ -1906,9 +1991,9 @@ function updateVMRow(row, vm, oldVm) {
     }
 }
 
-async function loadVMs() {
-    // Skip refresh if search is active or action menu is open
-    if (isSearchActive || openMenuVmId !== null) {
+async function loadVMs(force = false) {
+    // Skip refresh if search is active or action menu is open (unless forced)
+    if (!force && (isSearchActive || openMenuVmId !== null)) {
         return;
     }
 
@@ -2053,7 +2138,7 @@ async function createVM() {
     if (ok) {
         closeModal('createVMModal');
         form.reset();
-        loadVMs();
+        loadVMs(true); // Force refresh to show new VM
     } else {
         alert(resp.error || 'Failed to create VM');
     }
@@ -2087,7 +2172,7 @@ document.addEventListener('click', function(event) {
 async function startVM(id) {
     const { ok, data } = await apiCall(` + "`" + `/api/vms/${id}/start` + "`" + `, 'POST');
     if (ok) {
-        loadVMs();
+        loadVMs(true);
     } else {
         alert(data.error || 'Failed to start VM');
     }
@@ -2096,7 +2181,7 @@ async function startVM(id) {
 async function stopVM(id) {
     const { ok, data } = await apiCall(` + "`" + `/api/vms/${id}/stop` + "`" + `, 'POST');
     if (ok) {
-        loadVMs();
+        loadVMs(true);
     } else {
         alert(data.error || 'Failed to stop VM');
     }
@@ -2106,7 +2191,7 @@ async function deleteVM(id) {
     if (!confirm('Are you sure you want to delete this VM?')) return;
     const { ok, data } = await apiCall(` + "`" + `/api/vms/${id}` + "`" + `, 'DELETE');
     if (ok) {
-        loadVMs();
+        loadVMs(true);
     } else {
         alert(data.error || 'Failed to delete VM');
     }
@@ -2127,6 +2212,7 @@ async function editVM(id) {
     // Populate edit form
     document.getElementById('editVmId').value = data.id;
     document.getElementById('editVmName').value = data.name;
+    document.getElementById('editVmDescription').value = data.description || '';
     document.getElementById('editVmVcpu').value = data.vcpu;
     document.getElementById('editVmMemory').value = data.memory_mb;
     document.getElementById('editVmKernelArgs').value = data.kernel_args || '';
@@ -2152,6 +2238,7 @@ async function saveVM() {
     const vmId = document.getElementById('editVmId').value;
     const updateData = {
         name: document.getElementById('editVmName').value,
+        description: document.getElementById('editVmDescription').value,
         vcpu: parseInt(document.getElementById('editVmVcpu').value) || 1,
         memory_mb: parseInt(document.getElementById('editVmMemory').value) || 512,
         network_id: document.getElementById('editVmNetwork').value,
@@ -2350,8 +2437,8 @@ async function submitDuplicateVM(event) {
 
         // Update progress UI
         const percent = Math.round(pollData.percent || 0);
-        document.getElementById('duplicateProgressBar').style.width = percent + '%';
-        document.getElementById('duplicateProgressPercent').textContent = percent + '%';
+        document.getElementById('duplicateProgressBar').style.width = percent + '%%';
+        document.getElementById('duplicateProgressPercent').textContent = percent + '%%';
         document.getElementById('duplicateProgressStage').textContent = pollData.stage || 'Processing...';
         document.getElementById('duplicateProgressCopied').textContent = formatBytes(pollData.copied || 0);
         document.getElementById('duplicateProgressTotal').textContent = formatBytes(pollData.total || 0);
@@ -2368,7 +2455,7 @@ async function submitDuplicateVM(event) {
                 nameInput.value = '';
                 closeBtn.style.display = '';
                 progressDiv.style.display = 'none';
-                document.getElementById('duplicateProgressBar').style.width = '0%';
+                document.getElementById('duplicateProgressBar').style.width = '0%%';
             }, 500);
             return;
         } else if (pollData.status === 'error') {
@@ -2379,7 +2466,7 @@ async function submitDuplicateVM(event) {
             nameInput.disabled = false;
             closeBtn.style.display = '';
             progressDiv.style.display = 'none';
-            document.getElementById('duplicateProgressBar').style.width = '0%';
+            document.getElementById('duplicateProgressBar').style.width = '0%%';
             return;
         }
 
@@ -2418,8 +2505,19 @@ async function shrinkVM(vmId, vmName) {
 }
 
 // Export VM functionality
-async function exportVM(vmId, vmName) {
-    if (!confirm(` + "`" + `Export VM "${vmName}" as a .fcrack virtual appliance?\n\nThe rootfs will be automatically shrunk before export.` + "`" + `)) return;
+function exportVM(vmId, vmName, vmDescription) {
+    document.getElementById('exportVmId').value = vmId;
+    document.getElementById('exportVmName').textContent = vmName;
+    document.getElementById('exportVmDescription').value = vmDescription || '';
+    openModal('exportVMModal');
+}
+
+async function submitExportVM() {
+    const vmId = document.getElementById('exportVmId').value;
+    const vmName = document.getElementById('exportVmName').textContent;
+    const description = document.getElementById('exportVmDescription').value.trim();
+
+    closeModal('exportVMModal');
 
     // Show progress bar under VM name
     const progressDiv = document.getElementById('export-progress-' + vmId);
@@ -2428,7 +2526,7 @@ async function exportVM(vmId, vmName) {
     }
 
     try {
-        const { ok, data } = await apiCall(` + "`" + `/api/vms/${vmId}/export` + "`" + `, 'POST');
+        const { ok, data } = await apiCall(` + "`" + `/api/vms/${vmId}/export` + "`" + `, 'POST', { description: description });
         if (ok && data.progress_key) {
             // Poll for progress
             pollExportProgress(vmId, data.progress_key, vmName);
@@ -2460,13 +2558,13 @@ async function pollExportProgress(vmId, progressKey, vmName) {
             }
 
             const percent = Math.round(data.percent || 0);
-            if (percentSpan) percentSpan.textContent = percent + '%';
-            if (fillDiv) fillDiv.style.width = percent + '%';
+            if (percentSpan) percentSpan.textContent = percent + '%%';
+            if (fillDiv) fillDiv.style.width = percent + '%%';
 
             // Update text based on stage
             if (textDiv && data.stage) {
                 const icon = '<span class="material-icons" style="font-size: 14px; animation: spin 1s linear infinite;">sync</span>';
-                textDiv.innerHTML = icon + ' ' + data.stage + ' <span class="export-percent">' + percent + '%</span>';
+                textDiv.innerHTML = icon + ' ' + data.stage + ' <span class="export-percent">' + percent + '%%</span>';
             }
 
             if (data.status === 'completed') {
@@ -2656,8 +2754,8 @@ async function submitImportVM(event) {
         xhr.upload.onprogress = function(e) {
             if (e.lengthComputable) {
                 const percent = (e.loaded / e.total) * 100;
-                progressBar.style.width = percent + '%';
-                progressText.textContent = ` + "`" + `Uploading... ${Math.round(percent)}%` + "`" + `;
+                progressBar.style.width = percent + '%%';
+                progressText.textContent = ` + "`" + `Uploading... ${Math.round(percent)}%%` + "`" + `;
             }
         };
 
@@ -3113,7 +3211,6 @@ func (wc *WebConsole) renderVMDetailPage(vmID string) string {
 
 <div class="card">
     <div class="card-header">
-        <h3>VM Details</h3>
         <div class="actions">
             <button class="btn btn-success" id="startBtn" onclick="startVM()">
                 <span class="material-icons">play_arrow</span> Start
@@ -3215,11 +3312,11 @@ func (wc *WebConsole) renderVMDetailPage(vmID string) string {
         </div>
         <div id="chartsOnline" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
             <div>
-                <h4 style="font-size: 14px; color: var(--text-secondary); margin-bottom: 10px;">CPU Usage (%%)</h4>
+                <h4 style="font-size: 14px; color: var(--text-secondary); margin-bottom: 10px;">CPU Usage (%%%%)</h4>
                 <div id="cpuChart" style="height: 250px;"></div>
             </div>
             <div>
-                <h4 style="font-size: 14px; color: var(--text-secondary); margin-bottom: 10px;">Memory Usage (%%)</h4>
+                <h4 style="font-size: 14px; color: var(--text-secondary); margin-bottom: 10px;">Memory Usage (%%%%)</h4>
                 <div id="memoryChart" style="height: 250px;"></div>
             </div>
         </div>
@@ -3234,12 +3331,12 @@ func (wc *WebConsole) renderVMDetailPage(vmID string) string {
 
 <!-- Logs Modal -->
 <div id="logsModal" class="modal">
-    <div class="modal-content" style="width: 90%%; max-width: 1000px; height: 80vh;">
+    <div class="modal-content" style="width: 90%%%%; max-width: 1000px; height: 80vh;">
         <div class="modal-header">
             <h3><span class="material-icons" style="vertical-align: middle;">article</span> VM Logs</h3>
             <span class="material-icons modal-close" onclick="closeModal('logsModal')">close</span>
         </div>
-        <div class="modal-body" style="padding: 0; height: calc(100%% - 60px); display: flex; flex-direction: column;">
+        <div class="modal-body" style="padding: 0; height: calc(100%%%% - 60px); display: flex; flex-direction: column;">
             <div style="padding: 15px; border-bottom: 1px solid var(--border-color); display: flex; gap: 10px; align-items: center;">
                 <input type="text" id="logSearchInput" placeholder="Search logs..." style="flex: 1; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 6px;">
                 <select id="logLevelFilter" style="padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 6px;">
@@ -3281,6 +3378,9 @@ async function loadVMDetails() {
     }
 
     document.getElementById('vmName').textContent = data.name;
+    document.getElementById('vmTitleName').textContent = data.name;
+    document.getElementById('vmDescriptionText').textContent = data.description || '';
+    window.currentVMDescription = data.description || '';
     document.getElementById('vmStatus').innerHTML = '<span class="badge badge-' +
         (data.status === 'running' ? 'success' : data.status === 'error' ? 'danger' : 'warning') +
         '">' + data.status + '</span>';
@@ -3513,13 +3613,13 @@ async function loadVMMetrics() {
 
     // Update CPU
     const cpuPercent = data.cpu_percent || 0;
-    document.getElementById('statCpuPercent').textContent = cpuPercent.toFixed(1) + '%%';
+    document.getElementById('statCpuPercent').textContent = cpuPercent.toFixed(1) + '%%%%';
 
     // Update Memory
     const memPercent = data.mem_percent || 0;
     const memUsed = data.mem_used_mb || 0;
     const memTotal = data.memory_mb || 0;
-    document.getElementById('statMemPercent').textContent = memPercent.toFixed(1) + '%%';
+    document.getElementById('statMemPercent').textContent = memPercent.toFixed(1) + '%%%%';
     document.getElementById('statMemDetail').textContent = memUsed + ' / ' + memTotal + ' MB';
 
     // Update Uptime
@@ -3548,8 +3648,8 @@ function initCharts() {
         stroke: { curve: 'smooth', width: 2 },
         fill: { type: 'gradient', gradient: { shadeIntensity: 1, opacityFrom: 0.4, opacityTo: 0.1, stops: [0, 90, 100] } },
         xaxis: { type: 'datetime', labels: { datetimeUTC: false, format: 'HH:mm:ss' } },
-        yaxis: { min: 0, max: 100, labels: { formatter: (val) => val.toFixed(0) + '%%' } },
-        tooltip: { x: { format: 'yyyy-MM-dd HH:mm:ss' }, y: { formatter: (val) => val.toFixed(1) + '%%' } },
+        yaxis: { min: 0, max: 100, labels: { formatter: (val) => val.toFixed(0) + '%%%%' } },
+        tooltip: { x: { format: 'yyyy-MM-dd HH:mm:ss' }, y: { formatter: (val) => val.toFixed(1) + '%%%%' } },
         legend: { show: false }
     };
 
@@ -3897,7 +3997,7 @@ setInterval(loadVMMetrics, 3000);
 
 <!-- Console Modal -->
 <div id="consoleModal" class="modal">
-    <div class="modal-content" style="width: 90%%; max-width: 1000px; height: 80vh;">
+    <div class="modal-content" style="width: 90%%%%; max-width: 1000px; height: 80vh;">
         <div class="modal-header">
             <h3><span class="material-icons" style="vertical-align: middle;">terminal</span> VM Console</h3>
             <div style="display: flex; align-items: center; gap: 10px;">
@@ -3907,8 +4007,8 @@ setInterval(loadVMMetrics, 3000);
                 <span class="material-icons modal-close" onclick="closeConsole()">close</span>
             </div>
         </div>
-        <div class="modal-body" style="padding: 0; height: calc(100%% - 60px);">
-            <div id="terminal" style="width: 100%%; height: 100%%;"></div>
+        <div class="modal-body" style="padding: 0; height: calc(100%%%% - 60px);">
+            <div id="terminal" style="width: 100%%%%; height: 100%%%%;"></div>
         </div>
     </div>
 </div>
@@ -4031,6 +4131,25 @@ window.addEventListener('resize', function() {
 });
 
 // Change IP Address functions
+function openEditDescriptionModal() {
+    document.getElementById('editDescriptionText').value = window.currentVMDescription || '';
+    openModal('editDescriptionModal');
+}
+
+async function saveDescription() {
+    const description = document.getElementById('editDescriptionText').value.trim();
+
+    const { ok } = await apiCall('/api/vms/' + vmId, 'PUT', { description: description });
+
+    if (ok) {
+        window.currentVMDescription = description;
+        document.getElementById('vmDescriptionText').textContent = description;
+        closeModal('editDescriptionModal');
+    } else {
+        alert('Failed to save description');
+    }
+}
+
 async function openChangeIPModal() {
     if (!window.currentVMNetworkId) {
         alert('VM is not connected to a network. Cannot change IP address.');
@@ -4236,7 +4355,7 @@ async function expandRootFS() {
             </div>
             <div class="form-group">
                 <label>New IP Address</label>
-                <select id="changeIPSelect" style="width: 100%%;">
+                <select id="changeIPSelect" style="width: 100%%%%;">
                     <option value="">Loading available IPs...</option>
                 </select>
                 <small style="color: var(--text-secondary); font-size: 11px;">Only free IP addresses in the network are shown.</small>
@@ -4251,6 +4370,25 @@ async function expandRootFS() {
         <div class="modal-footer">
             <button type="button" class="btn btn-secondary" onclick="closeModal('changeIPModal')">Cancel</button>
             <button type="button" class="btn btn-primary" id="changeIPBtn" onclick="changeVMIP()"><span class="material-icons">save</span> Save</button>
+        </div>
+    </div>
+</div>
+
+<div id="editDescriptionModal" class="modal">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <h3><span class="material-icons" style="vertical-align: middle;">edit_note</span> Edit Description</h3>
+            <span class="material-icons modal-close" onclick="closeModal('editDescriptionModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <div class="form-group">
+                <label>Description</label>
+                <textarea id="editDescriptionText" rows="3" placeholder="Enter a description for this VM..." style="width: 100%%%%; resize: vertical;"></textarea>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('editDescriptionModal')">Cancel</button>
+            <button type="button" class="btn btn-primary" onclick="saveDescription()"><span class="material-icons">save</span> Save</button>
         </div>
     </div>
 </div>
@@ -4853,17 +4991,21 @@ func (wc *WebConsole) renderImagesPage() string {
                 <span class="material-icons">build</span>
                 Create Image
             </button>
+            <button id="convertQemuBtn" class="btn btn-secondary" onclick="openConvertQemuModal()" title="Convert Proxmox/VMware images to Firecracker rootfs">
+                <span class="material-icons">transform</span>
+                Convert VM Image
+            </button>
         </div>
     </div>
     <div class="card-body">
         <table>
             <thead>
                 <tr>
+                    <th style="width: 1%%;">&nbsp;</th>
                     <th>Name</th>
                     <th>Type</th>
                     <th>Format</th>
                     <th>Size</th>
-                    <th>OS / Init</th>
                     <th>Used By</th>
                     <th>Actions</th>
                 </tr>
@@ -4960,6 +5102,43 @@ func (wc *WebConsole) renderImagesPage() string {
         <div class="modal-footer">
             <button type="button" class="btn btn-secondary" onclick="closeModal('uploadRootfsModal')" id="uploadCancelBtn">Cancel</button>
             <button type="button" class="btn btn-primary" onclick="uploadRootfs()" id="uploadSubmitBtn">Upload</button>
+        </div>
+    </div>
+</div>
+
+<div id="convertQemuModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Convert VM Disk Image</h3>
+            <span class="material-icons modal-close" onclick="closeQemuConvertModal()">close</span>
+        </div>
+        <div class="modal-body">
+            <form id="convertQemuForm" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label>Output Name</label>
+                    <input type="text" name="name" id="convertQemuName" required placeholder="my-converted-rootfs">
+                </div>
+                <div class="form-group">
+                    <label>VM Disk Image File</label>
+                    <input type="file" name="file" id="convertQemuFile" required accept=".qcow2,.vmdk,.raw,.img">
+                    <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Supported formats: QCOW2 (Proxmox), VMDK (VMware), RAW disk images</small>
+                </div>
+                <div id="convertQemuProgress" style="display: none; margin-top: 15px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                        <span id="convertQemuProgressText">Converting...</span>
+                        <span id="convertQemuProgressPercent">0%%</span>
+                    </div>
+                    <div style="background: var(--border); border-radius: 4px; height: 8px; overflow: hidden;">
+                        <div id="convertQemuProgressBar" style="background: var(--primary); height: 100%%; width: 0%%; transition: width 0.3s;"></div>
+                    </div>
+                </div>
+            </form>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeQemuConvertModal()" id="convertQemuCancelBtn">Cancel</button>
+            <button type="button" class="btn btn-primary" onclick="startQemuConversion()" id="convertQemuSubmitBtn">
+                <span class="material-icons">transform</span> Convert
+            </button>
         </div>
     </div>
 </div>
@@ -5179,9 +5358,10 @@ async function loadKernels() {
             <td>${k.version}</td>
             <td>${k.architecture}</td>
             <td>${formatBytes(k.size)}</td>
-            <td>${k.is_default ? '<span class="badge badge-success">Default</span>' : ''}</td>
+            <td>${k.is_default
+                ? '<span class="badge badge-success">Default</span>'
+                : ` + "`" + `<span class="badge badge-secondary" style="cursor: pointer;" onclick="setDefaultKernel('${k.id}')" title="Click to set as default">Default</span>` + "`" + `}</td>
             <td class="actions">
-                ${!k.is_default ? ` + "`" + `<button class="btn btn-secondary btn-sm" onclick="setDefaultKernel('${k.id}')">Set Default</button>` + "`" + ` : ''}
                 <button class="btn btn-danger btn-sm" onclick="deleteKernel('${k.id}')">
                     <span class="material-icons">delete</span>
                 </button>
@@ -5213,16 +5393,12 @@ async function loadRootfs() {
             typeBadge = '<span class="badge badge-secondary">Scanning...</span>';
         }
 
-        // OS/Init info
+        // OS/Init info for description
         let osInfo = '';
         if (r.os_release) {
             osInfo = r.os_release;
         } else if (r.init_system) {
             osInfo = r.init_system;
-        } else if (r.disk_type === 'data') {
-            osInfo = '-';
-        } else {
-            osInfo = '<span style="color: var(--text-secondary)">-</span>';
         }
 
         // Used by VMs
@@ -5241,24 +5417,29 @@ async function loadRootfs() {
 
         return ` + "`" + `
         <tr>
-            <td>${r.name}</td>
+            <td><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-secondary);"><line x1="22" y1="12" x2="2" y2="12"></line><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path><line x1="6" y1="16" x2="6.01" y2="16"></line><line x1="10" y1="16" x2="10.01" y2="16"></line></svg></td>
+            <td>
+                ${r.name}
+                ${osInfo ? '<div class="rfs-description">' + osInfo + '</div>' : ''}
+            </td>
             <td>${typeBadge}</td>
             <td>${r.format}</td>
             <td>${formatBytes(r.size)}</td>
-            <td>${osInfo}</td>
             <td style="white-space: nowrap;">${usedByHtml}</td>
-            <td class="actions">
-                <div class="dropdown">
-                    <button class="btn btn-secondary btn-xs dropdown-toggle" onclick="toggleDropdown(this)">
-                        <span class="material-icons">more_vert</span>
-                    </button>
-                    <div class="dropdown-menu">
-                        ${r.disk_type === 'system' ? '<a href="#" onclick="openCreateVMFromRootfs(\'' + r.id + '\', \'' + r.name + '\'); return false;"><span class="material-icons">add_box</span> Create VM</a>' : ''}
-                        <a href="#" onclick="openDuplicateRootfsModal('${r.id}', '${r.name}'); return false;"><span class="material-icons">content_copy</span> Duplicate</a>
-                        <a href="#" onclick="openRenameRootfsModal('${r.id}', '${r.name}'); return false;"><span class="material-icons">edit</span> Rename</a>
-                        <a href="#" onclick="openExtendDiskModal('${r.id}', '${r.name}', ${r.size}); return false;"><span class="material-icons">expand</span> Extend Disk</a>
-                        <div class="dropdown-divider"></div>
-                        <a href="#" class="danger ${inUse ? 'disabled' : ''}" onclick="${inUse ? 'alert(\'Cannot delete: rootfs is in use by VMs\'); return false;' : 'deleteRootfs(\'' + r.id + '\'); return false;'}"><span class="material-icons">delete</span> Delete</a>
+            <td>
+                <div class="actions">
+                    <div class="dropdown">
+                        <button class="btn btn-secondary btn-xs dropdown-toggle" onclick="toggleDropdown(this)">
+                            <span class="material-icons">more_vert</span>
+                        </button>
+                        <div class="dropdown-menu">
+                            ${r.disk_type === 'system' ? '<a href="#" onclick="openCreateVMFromRootfs(\'' + r.id + '\', \'' + r.name + '\'); return false;"><span class="material-icons">add_box</span> Create VM</a>' : ''}
+                            <a href="#" onclick="openDuplicateRootfsModal('${r.id}', '${r.name}'); return false;"><span class="material-icons">content_copy</span> Duplicate</a>
+                            <a href="#" onclick="openRenameRootfsModal('${r.id}', '${r.name}'); return false;"><span class="material-icons">edit</span> Rename</a>
+                            <a href="#" onclick="openExtendDiskModal('${r.id}', '${r.name}', ${r.size}); return false;"><span class="material-icons">expand</span> Extend Disk</a>
+                            <div class="dropdown-divider"></div>
+                            <a href="#" class="danger ${inUse ? 'disabled' : ''}" onclick="${inUse ? 'alert(\'Cannot delete: rootfs is in use by VMs\'); return false;' : 'deleteRootfs(\'' + r.id + '\'); return false;'}"><span class="material-icons">delete</span> Delete</a>
+                        </div>
                     </div>
                 </div>
             </td>
@@ -5331,8 +5512,8 @@ async function uploadRootfs() {
     submitBtn.disabled = true;
     cancelBtn.disabled = true;
     progressText.textContent = 'Uploading...';
-    progressBar.style.width = '0%';
-    progressPercent.textContent = '0%';
+    progressBar.style.width = '0%%';
+    progressPercent.textContent = '0%%';
 
     const formData = new FormData();
     formData.append('name', name);
@@ -5343,8 +5524,8 @@ async function uploadRootfs() {
     xhr.upload.onprogress = function(e) {
         if (e.lengthComputable) {
             const percent = Math.round((e.loaded / e.total) * 100);
-            progressBar.style.width = percent + '%';
-            progressPercent.textContent = percent + '%';
+            progressBar.style.width = percent + '%%';
+            progressPercent.textContent = percent + '%%';
             const sizeMB = (e.loaded / (1024 * 1024)).toFixed(1);
             const totalMB = (e.total / (1024 * 1024)).toFixed(1);
             progressText.textContent = 'Uploading... ' + sizeMB + ' MB / ' + totalMB + ' MB';
@@ -5359,8 +5540,8 @@ async function uploadRootfs() {
             const resp = JSON.parse(xhr.responseText);
             if (resp.status === 'success') {
                 progressText.textContent = 'Upload complete!';
-                progressBar.style.width = '100%';
-                progressPercent.textContent = '100%';
+                progressBar.style.width = '100%%';
+                progressPercent.textContent = '100%%';
                 setTimeout(() => {
                     closeModal('uploadRootfsModal');
                     document.getElementById('uploadRootfsForm').reset();
@@ -5391,6 +5572,244 @@ async function uploadRootfs() {
 
     xhr.open('POST', '/api/rootfs/upload');
     xhr.send(formData);
+}
+
+let qemuConversionJobId = null;
+let qemuConversionPollInterval = null;
+let qemuUtilsStatus = null;
+
+// Check qemu-utils availability on page load
+async function checkQemuUtilsStatus() {
+    const btn = document.getElementById('convertQemuBtn');
+    if (!btn) return;
+
+    try {
+        const resp = await fetch('/api/system/qemu-utils');
+        qemuUtilsStatus = await resp.json();
+
+        if (qemuUtilsStatus.available) {
+            btn.disabled = false;
+            btn.title = 'Convert Proxmox/VMware images to Firecracker rootfs\\n' + qemuUtilsStatus.version;
+            btn.classList.remove('btn-disabled');
+        } else if (qemuUtilsStatus.can_install) {
+            btn.disabled = false;
+            btn.title = 'qemu-utils not installed. Click to install and convert.';
+            btn.classList.remove('btn-disabled');
+        } else {
+            btn.disabled = true;
+            btn.title = 'qemu-utils not available and cannot be installed automatically';
+            btn.classList.add('btn-disabled');
+            btn.style.opacity = '0.5';
+            btn.style.cursor = 'not-allowed';
+        }
+    } catch (e) {
+        console.error('Failed to check qemu-utils status:', e);
+    }
+}
+
+// Called when Convert VM Image button is clicked
+async function openConvertQemuModal() {
+    if (!qemuUtilsStatus) {
+        await checkQemuUtilsStatus();
+    }
+
+    if (qemuUtilsStatus && !qemuUtilsStatus.available) {
+        if (qemuUtilsStatus.can_install) {
+            if (confirm('qemu-utils is not installed.\\n\\nWould you like to install it now?\\n\\nThis requires administrator privileges and may take a moment.')) {
+                await installQemuUtils();
+            }
+            return;
+        } else {
+            alert('qemu-utils is not available and cannot be installed automatically.\\n\\nPlease install qemu-utils manually using your package manager.');
+            return;
+        }
+    }
+
+    openModal('convertQemuModal');
+}
+
+// Install qemu-utils
+async function installQemuUtils() {
+    const btn = document.getElementById('convertQemuBtn');
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '<span class="material-icons">hourglass_empty</span> Installing...';
+    btn.disabled = true;
+
+    try {
+        const resp = await fetch('/api/system/qemu-utils/install', { method: 'POST' });
+        const data = await resp.json();
+
+        if (resp.ok) {
+            alert('qemu-utils installed successfully!\\n\\n' + (data.version || ''));
+            // Refresh status
+            await checkQemuUtilsStatus();
+            // Open the modal now
+            openModal('convertQemuModal');
+        } else {
+            alert('Failed to install qemu-utils: ' + (data.error || 'Unknown error'));
+        }
+    } catch (e) {
+        alert('Failed to install qemu-utils: ' + e.message);
+    } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
+}
+
+// Check qemu-utils status on page load
+document.addEventListener('DOMContentLoaded', function() {
+    // Check status after a short delay to ensure DOM is ready
+    setTimeout(checkQemuUtilsStatus, 500);
+});
+
+function closeQemuConvertModal() {
+    if (qemuConversionPollInterval) {
+        clearInterval(qemuConversionPollInterval);
+        qemuConversionPollInterval = null;
+    }
+    closeModal('convertQemuModal');
+    document.getElementById('convertQemuForm').reset();
+    document.getElementById('convertQemuProgress').style.display = 'none';
+    document.getElementById('convertQemuSubmitBtn').disabled = false;
+    document.getElementById('convertQemuCancelBtn').disabled = false;
+}
+
+async function startQemuConversion() {
+    const nameInput = document.getElementById('convertQemuName');
+    const fileInput = document.getElementById('convertQemuFile');
+    const progressDiv = document.getElementById('convertQemuProgress');
+    const progressBar = document.getElementById('convertQemuProgressBar');
+    const progressText = document.getElementById('convertQemuProgressText');
+    const progressPercent = document.getElementById('convertQemuProgressPercent');
+    const submitBtn = document.getElementById('convertQemuSubmitBtn');
+    const cancelBtn = document.getElementById('convertQemuCancelBtn');
+
+    const name = nameInput.value.trim();
+    const file = fileInput.files[0];
+
+    if (!name) {
+        alert('Please enter an output name');
+        return;
+    }
+    if (!file) {
+        alert('Please select a VM disk image file');
+        return;
+    }
+
+    // Validate file extension
+    const ext = file.name.toLowerCase().split('.').pop();
+    if (!['qcow2', 'vmdk', 'raw', 'img'].includes(ext)) {
+        alert('Unsupported file format. Supported formats: .qcow2, .vmdk, .raw, .img');
+        return;
+    }
+
+    // Show progress, disable buttons
+    progressDiv.style.display = 'block';
+    submitBtn.disabled = true;
+    cancelBtn.disabled = true;
+    progressText.textContent = 'Uploading...';
+    progressBar.style.width = '0%%';
+    progressPercent.textContent = '0%%';
+
+    const formData = new FormData();
+    formData.append('name', name);
+    formData.append('file', file);
+
+    const xhr = new XMLHttpRequest();
+
+    xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 50); // Upload is 0-50%%
+            progressBar.style.width = percent + '%%';
+            progressPercent.textContent = percent + '%%';
+            const sizeMB = (e.loaded / (1024 * 1024)).toFixed(1);
+            const totalMB = (e.total / (1024 * 1024)).toFixed(1);
+            progressText.textContent = 'Uploading... ' + sizeMB + ' MB / ' + totalMB + ' MB';
+        }
+    };
+
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            const resp = JSON.parse(xhr.responseText);
+            if (resp.job_id) {
+                // Upload complete, start polling for conversion progress
+                qemuConversionJobId = resp.job_id;
+                progressText.textContent = 'Converting... Please wait';
+                progressBar.style.width = '50%%';
+                progressPercent.textContent = '50%%';
+                pollQemuConversionProgress();
+            } else {
+                progressDiv.style.display = 'none';
+                submitBtn.disabled = false;
+                cancelBtn.disabled = false;
+                alert(resp.error || 'Failed to start conversion');
+            }
+        } else {
+            progressDiv.style.display = 'none';
+            submitBtn.disabled = false;
+            cancelBtn.disabled = false;
+            try {
+                const resp = JSON.parse(xhr.responseText);
+                alert(resp.error || 'Upload failed');
+            } catch (e) {
+                alert('Upload failed: ' + xhr.statusText);
+            }
+        }
+    };
+
+    xhr.onerror = function() {
+        submitBtn.disabled = false;
+        cancelBtn.disabled = false;
+        progressDiv.style.display = 'none';
+        alert('Upload failed: Network error');
+    };
+
+    xhr.open('POST', '/api/rootfs/convert-qemu');
+    xhr.send(formData);
+}
+
+function pollQemuConversionProgress() {
+    const progressBar = document.getElementById('convertQemuProgressBar');
+    const progressText = document.getElementById('convertQemuProgressText');
+    const progressPercent = document.getElementById('convertQemuProgressPercent');
+    const submitBtn = document.getElementById('convertQemuSubmitBtn');
+    const cancelBtn = document.getElementById('convertQemuCancelBtn');
+    const progressDiv = document.getElementById('convertQemuProgress');
+
+    qemuConversionPollInterval = setInterval(async () => {
+        try {
+            const resp = await fetch('/api/registry/convert/' + qemuConversionJobId);
+            const data = await resp.json();
+
+            if (data.status === 'completed') {
+                clearInterval(qemuConversionPollInterval);
+                qemuConversionPollInterval = null;
+                progressBar.style.width = '100%%';
+                progressPercent.textContent = '100%%';
+                progressText.textContent = 'Conversion complete!';
+                setTimeout(() => {
+                    closeQemuConvertModal();
+                    loadRootfs();
+                }, 1500);
+            } else if (data.status === 'failed') {
+                clearInterval(qemuConversionPollInterval);
+                qemuConversionPollInterval = null;
+                progressDiv.style.display = 'none';
+                submitBtn.disabled = false;
+                cancelBtn.disabled = false;
+                alert('Conversion failed: ' + (data.error || 'Unknown error'));
+            } else {
+                // Running - update progress
+                // Map conversion progress (0-100) to 50-100 (since upload was 0-50)
+                const displayPercent = 50 + Math.round(data.progress / 2);
+                progressBar.style.width = displayPercent + '%%';
+                progressPercent.textContent = displayPercent + '%%';
+                progressText.textContent = data.message || 'Converting...';
+            }
+        } catch (e) {
+            console.error('Failed to poll conversion status:', e);
+        }
+    }, 2000);
 }
 
 async function setDefaultKernel(id) {
@@ -5692,8 +6111,8 @@ async function checkDebianBuildProgress() {
     };
 
     document.getElementById('debianBuildStep').textContent = stepNames[data.step] || data.step;
-    document.getElementById('debianBuildPercent').textContent = data.progress + '%';
-    document.getElementById('debianBuildBar').style.width = data.progress + '%';
+    document.getElementById('debianBuildPercent').textContent = data.progress + '%%';
+    document.getElementById('debianBuildBar').style.width = data.progress + '%%';
     document.getElementById('debianBuildMessage').textContent = data.message || '';
 
     if (data.status === 'completed') {
@@ -5780,7 +6199,13 @@ func (wc *WebConsole) renderDockerPage() string {
                 <input type="file" id="composeFile" style="display: none;" accept=".yml,.yaml" onchange="handleComposeUpload(this)">
             </div>
             <div id="composePreview" style="display: none; margin-top: 20px;">
-                <h4 style="margin-bottom: 10px;">Services found:</h4>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <h4>Services found:</h4>
+                    <button class="btn btn-secondary btn-sm" onclick="clearComposeFile()" title="Remove imported file">
+                        <span class="material-icons" style="font-size: 16px;">delete</span>
+                        Clear
+                    </button>
+                </div>
                 <div id="serviceList" class="service-list"></div>
                 <div style="margin-top: 15px;">
                     <button class="btn btn-primary" onclick="convertSelectedServices()">
@@ -5909,6 +6334,14 @@ func (wc *WebConsole) renderDockerPage() string {
                     </small>
                 </div>
                 <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--border-color);">
+                <h4 style="margin-bottom: 15px;">Environment Variables</h4>
+                <div id="composeEnvVars" class="env-vars-container">
+                    <p style="color: var(--text-secondary); font-size: 12px;">No environment variables defined</p>
+                </div>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="addComposeEnvVar()" style="margin-top: 10px;">
+                    <span class="material-icons" style="font-size: 16px;">add</span> Add Variable
+                </button>
+                <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--border-color);">
                 <h4 style="margin-bottom: 15px;">Data Disk (Optional)</h4>
                 <div class="form-group">
                     <label>Data Disk Size (GiB)</label>
@@ -5929,6 +6362,14 @@ func (wc *WebConsole) renderDockerPage() string {
 <script>
 let currentComposePath = '';
 let composeServices = [];
+
+function clearComposeFile() {
+    currentComposePath = '';
+    composeServices = [];
+    document.getElementById('composePreview').style.display = 'none';
+    document.getElementById('serviceList').innerHTML = '';
+    document.getElementById('composeFile').value = '';
+}
 
 function switchTab(tab) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -6146,26 +6587,93 @@ function displayServices() {
     }
 
     preview.style.display = 'block';
-    serviceList.innerHTML = composeServices.map(svc => ` + "`" + `
-        <div class="service-item">
-            <input type="checkbox" id="svc_${svc.name}" value="${svc.name}" checked>
-            <span class="service-name">${svc.name}</span>
-            <span class="service-image">${svc.image || 'build context'}</span>
-            <button class="btn btn-primary btn-sm" style="margin-left: 10px;" onclick="openComposeConvertModal('${svc.name}', '${escapeHtml(svc.image || '')}')">
-                Convert
+    serviceList.innerHTML = composeServices.map(svc => {
+        const envCount = svc.environment ? Object.keys(svc.environment).length : 0;
+        const envBadge = envCount > 0 ? ` + "`" + `<span class="service-env"><span class="env-badge">${envCount} env vars</span></span>` + "`" + ` : '';
+        const svcIndex = composeServices.indexOf(svc);
+        return ` + "`" + `
+            <div class="service-item">
+                <input type="checkbox" id="svc_${svc.name}" value="${svc.name}" checked>
+                <span class="service-name">${svc.name}</span>
+                <span class="service-image">${svc.image || 'build context'}</span>
+                ${envBadge}
+                <button class="btn btn-primary btn-sm" style="margin-left: 10px;" onclick="openComposeConvertModal(${svcIndex})">
+                    Convert
+                </button>
+            </div>
+        ` + "`" + `;
+    }).join('');
+}
+
+let currentServiceEnv = {};
+
+function openComposeConvertModal(serviceIndex) {
+    const svc = composeServices[serviceIndex];
+    if (!svc) return;
+
+    document.getElementById('composeServiceName').value = svc.name;
+    document.getElementById('composeServiceDisplay').value = svc.name + (svc.image ? ' (' + svc.image + ')' : '');
+    document.getElementById('composeOutputName').value = '';
+    document.getElementById('composeDataDiskSize').value = '0';
+    document.getElementById('composeInjectInit').checked = true;
+    document.getElementById('composeUseDocker').checked = false;
+
+    // Populate environment variables
+    currentServiceEnv = svc.environment ? {...svc.environment} : {};
+    renderComposeEnvVars();
+
+    openModal('convertComposeModal');
+}
+
+function renderComposeEnvVars() {
+    const container = document.getElementById('composeEnvVars');
+    const keys = Object.keys(currentServiceEnv);
+
+    if (keys.length === 0) {
+        container.innerHTML = '<p style="color: var(--text-secondary); font-size: 12px;">No environment variables defined</p>';
+        return;
+    }
+
+    container.innerHTML = keys.map(key => ` + "`" + `
+        <div class="env-var-row">
+            <input type="text" value="${escapeHtml(key)}" placeholder="KEY" data-env-key="${escapeHtml(key)}" onchange="updateComposeEnvKey(this)">
+            <input type="text" value="${escapeHtml(currentServiceEnv[key])}" placeholder="value" data-env-key="${escapeHtml(key)}" onchange="updateComposeEnvValue(this, '${escapeHtml(key)}')">
+            <button type="button" class="btn-icon" onclick="removeComposeEnvVar('${escapeHtml(key)}')">
+                <span class="material-icons">delete</span>
             </button>
         </div>
     ` + "`" + `).join('');
 }
 
-function openComposeConvertModal(serviceName, image) {
-    document.getElementById('composeServiceName').value = serviceName;
-    document.getElementById('composeServiceDisplay').value = serviceName + (image ? ' (' + image + ')' : '');
-    document.getElementById('composeOutputName').value = '';
-    document.getElementById('composeDataDiskSize').value = '0';
-    document.getElementById('composeInjectInit').checked = true;
-    document.getElementById('composeUseDocker').checked = false;
-    openModal('convertComposeModal');
+function addComposeEnvVar() {
+    let newKey = 'NEW_VAR';
+    let counter = 1;
+    while (currentServiceEnv.hasOwnProperty(newKey)) {
+        newKey = 'NEW_VAR_' + counter++;
+    }
+    currentServiceEnv[newKey] = '';
+    renderComposeEnvVars();
+}
+
+function removeComposeEnvVar(key) {
+    delete currentServiceEnv[key];
+    renderComposeEnvVars();
+}
+
+function updateComposeEnvKey(input) {
+    const oldKey = input.dataset.envKey;
+    const newKey = input.value.trim();
+
+    if (newKey && newKey !== oldKey) {
+        const value = currentServiceEnv[oldKey];
+        delete currentServiceEnv[oldKey];
+        currentServiceEnv[newKey] = value;
+        renderComposeEnvVars();
+    }
+}
+
+function updateComposeEnvValue(input, key) {
+    currentServiceEnv[key] = input.value;
 }
 
 async function startComposeConversion() {
@@ -6180,7 +6688,8 @@ async function startComposeConversion() {
         service_name: serviceName,
         output_name: outputName,
         inject_min_init: injectMinInit,
-        use_docker: useDocker
+        use_docker: useDocker,
+        environment: currentServiceEnv
     };
 
     if (dataDiskSize > 0) {
@@ -6396,7 +6905,7 @@ func (wc *WebConsole) renderSettingsPage() string {
         <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));">
             <div>
                 <h4 style="margin-bottom: 15px; color: var(--text-secondary);">FireCrackManager</h4>
-                <table style="width: 100%;">
+                <table style="width: 100%%;">
                     <tr><td><strong>Version:</strong></td><td id="fcmVersion">-</td></tr>
                     <tr><td><strong>Build Date:</strong></td><td id="fcmBuildDate">-</td></tr>
                     <tr><td><strong>Uptime:</strong></td><td id="fcmUptime">-</td></tr>
@@ -6404,7 +6913,7 @@ func (wc *WebConsole) renderSettingsPage() string {
             </div>
             <div>
                 <h4 style="margin-bottom: 15px; color: var(--text-secondary);">Firecracker</h4>
-                <table style="width: 100%;">
+                <table style="width: 100%%;">
                     <tr>
                         <td><strong>Version:</strong></td>
                         <td>
@@ -6428,7 +6937,7 @@ func (wc *WebConsole) renderSettingsPage() string {
             </div>
             <div>
                 <h4 style="margin-bottom: 15px; color: var(--text-secondary);">System</h4>
-                <table style="width: 100%;">
+                <table style="width: 100%%;">
                     <tr><td><strong>Hostname:</strong></td><td id="sysHostname">-</td></tr>
                     <tr><td><strong>OS:</strong></td><td id="sysOS">-</td></tr>
                     <tr><td><strong>Architecture:</strong></td><td id="sysArch">-</td></tr>
@@ -6438,7 +6947,7 @@ func (wc *WebConsole) renderSettingsPage() string {
             </div>
             <div>
                 <h4 style="margin-bottom: 15px; color: var(--text-secondary);">KVM</h4>
-                <table style="width: 100%;">
+                <table style="width: 100%%;">
                     <tr><td><strong>Available:</strong></td><td id="kvmAvailable">-</td></tr>
                     <tr><td><strong>Path:</strong></td><td id="kvmPath">-</td></tr>
                 </table>
@@ -6452,7 +6961,7 @@ func (wc *WebConsole) renderSettingsPage() string {
         <h3>Configuration</h3>
     </div>
     <div class="card-body">
-        <table style="width: 100%; max-width: 600px;">
+        <table style="width: 100%%; max-width: 600px;">
             <tr>
                 <td><strong>Proxy Settings:</strong></td>
                 <td>
@@ -6615,6 +7124,63 @@ func (wc *WebConsole) renderSettingsPage() string {
             <button type="button" class="btn btn-primary" onclick="saveProxyConfig()">
                 <span class="material-icons">save</span> Save
             </button>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h3>Kernel Updates</h3>
+        <div style="display: flex; gap: 10px; align-items: center;">
+            <span id="kernelUpdateBadge" class="badge badge-secondary" style="display: none;">Updates available</span>
+            <button class="btn btn-secondary btn-sm" onclick="checkKernelUpdates(true)" id="kernelCheckBtn">
+                <span class="material-icons">refresh</span> Check Now
+            </button>
+        </div>
+    </div>
+    <div class="card-body">
+        <p style="color: var(--text-secondary); margin-bottom: 20px;">
+            Firecracker-compatible Linux kernels are checked daily for updates. You can download new versions to use with your VMs.
+        </p>
+        <div class="grid" style="grid-template-columns: 1fr 1fr; gap: 30px;">
+            <div>
+                <h4 style="margin-bottom: 15px; color: var(--text-secondary);">Installed Kernels</h4>
+                <div id="installedKernelList" style="max-height: 200px; overflow-y: auto;">
+                    <p style="color: var(--text-secondary);">Loading...</p>
+                </div>
+            </div>
+            <div>
+                <h4 style="margin-bottom: 15px; color: var(--text-secondary);">Available for Download</h4>
+                <div id="availableKernelList" style="max-height: 200px; overflow-y: auto;">
+                    <p style="color: var(--text-secondary);">Click "Check Now" to fetch available versions</p>
+                </div>
+                <p style="font-size: 12px; color: var(--text-secondary); margin-top: 10px;">
+                    <span class="material-icons" style="font-size: 14px; vertical-align: middle;">schedule</span>
+                    Last checked: <span id="kernelLastChecked">never</span>
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Kernel Download Modal -->
+<div id="kernelDownloadModal" class="modal">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <h2>Download Kernel</h2>
+            <span class="material-icons modal-close" onclick="closeModal('kernelDownloadModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <p>Downloading kernel version: <strong id="downloadKernelVersion"></strong></p>
+            <div style="margin-top: 20px;">
+                <div class="progress-bar" style="height: 20px; background: var(--bg-tertiary); border-radius: 10px; overflow: hidden;">
+                    <div id="kernelDownloadProgress" style="width: 0%%; height: 100%%; background: var(--primary); transition: width 0.3s;"></div>
+                </div>
+                <p id="kernelDownloadStatus" style="margin-top: 10px; font-size: 14px; color: var(--text-secondary);">Starting download...</p>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('kernelDownloadModal')" id="kernelDownloadCloseBtn" disabled>Close</button>
         </div>
     </div>
 </div>
@@ -6884,6 +7450,156 @@ async function testProxyConnection() {
     }
 }
 
+// Kernel update functions
+let installedKernelVersions = [];
+
+async function loadInstalledKernels() {
+    const listDiv = document.getElementById('installedKernelList');
+    const { ok, data } = await apiCall('/api/kernels');
+    if (ok && data.kernels && data.kernels.length > 0) {
+        installedKernelVersions = data.kernels.map(k => {
+            // Extract version from filename like "vmlinux-5.10" or "vmlinux-5.10-firecracker"
+            const match = k.name.match(/vmlinux[_-]?(\d+\.\d+)/);
+            return match ? match[1] : null;
+        }).filter(v => v !== null);
+
+        let html = '<div style="display: flex; flex-wrap: wrap; gap: 8px;">';
+        data.kernels.forEach(k => {
+            html += '<span class="badge badge-primary" style="font-size: 13px;">' + k.name + '</span>';
+        });
+        html += '</div>';
+        listDiv.innerHTML = html;
+    } else {
+        listDiv.innerHTML = '<p style="color: var(--text-secondary);">No kernels installed</p>';
+        installedKernelVersions = [];
+    }
+}
+
+async function checkKernelUpdates(forceRefresh = false) {
+    const btn = document.getElementById('kernelCheckBtn');
+    const listDiv = document.getElementById('availableKernelList');
+    const badge = document.getElementById('kernelUpdateBadge');
+    const lastCheckedSpan = document.getElementById('kernelLastChecked');
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="material-icons">hourglass_empty</span> Checking...';
+
+    const method = forceRefresh ? 'POST' : 'GET';
+    const { ok, data } = await apiCall('/api/system/kernels/check', method);
+
+    btn.disabled = false;
+    btn.innerHTML = '<span class="material-icons">refresh</span> Check Now';
+
+    if (ok) {
+        // Update last checked time
+        if (data.checked_at) {
+            const checkedAt = new Date(data.checked_at);
+            if (checkedAt.getTime() > 0) {
+                lastCheckedSpan.textContent = checkedAt.toLocaleString();
+            } else {
+                lastCheckedSpan.textContent = 'never';
+            }
+        }
+
+        // Show available versions
+        if (data.available_versions && data.available_versions.length > 0) {
+            let hasNewVersions = false;
+            let html = '<div style="display: flex; flex-direction: column; gap: 8px;">';
+            data.available_versions.forEach(v => {
+                const isInstalled = installedKernelVersions.includes(v);
+                if (isInstalled) {
+                    html += '<div style="display: flex; align-items: center; gap: 10px;">';
+                    html += '<span class="badge badge-secondary" style="font-size: 13px;">v' + v + '</span>';
+                    html += '<span style="color: var(--success); font-size: 12px;">Installed</span>';
+                    html += '</div>';
+                } else {
+                    hasNewVersions = true;
+                    html += '<div style="display: flex; align-items: center; gap: 10px;">';
+                    html += '<span class="badge badge-warning" style="font-size: 13px;">v' + v + '</span>';
+                    html += '<button class="btn btn-primary btn-sm" onclick="downloadKernel(\'' + v + '\')">';
+                    html += '<span class="material-icons">download</span> Download';
+                    html += '</button>';
+                    html += '</div>';
+                }
+            });
+            html += '</div>';
+            listDiv.innerHTML = html;
+
+            // Show/hide update badge
+            if (hasNewVersions) {
+                badge.style.display = 'inline-block';
+                badge.className = 'badge badge-warning';
+                badge.textContent = 'New versions available';
+            } else {
+                badge.style.display = 'inline-block';
+                badge.className = 'badge badge-success';
+                badge.textContent = 'Up to date';
+            }
+        } else {
+            listDiv.innerHTML = '<p style="color: var(--text-secondary);">No versions found. Try checking again.</p>';
+            badge.style.display = 'none';
+        }
+    } else {
+        listDiv.innerHTML = '<p style="color: var(--danger);">Failed to check: ' + (data.error || 'Unknown error') + '</p>';
+        badge.style.display = 'none';
+    }
+}
+
+let kernelDownloadPollInterval = null;
+
+async function downloadKernel(version) {
+    const modal = document.getElementById('kernelDownloadModal');
+    const versionSpan = document.getElementById('downloadKernelVersion');
+    const progressBar = document.getElementById('kernelDownloadProgress');
+    const statusP = document.getElementById('kernelDownloadStatus');
+    const closeBtn = document.getElementById('kernelDownloadCloseBtn');
+
+    versionSpan.textContent = version;
+    progressBar.style.width = '0%%';
+    statusP.textContent = 'Starting download...';
+    closeBtn.disabled = true;
+
+    openModal('kernelDownloadModal');
+
+    const { ok, data } = await apiCall('/api/system/kernels/download', 'POST', { version: version });
+    if (!ok) {
+        statusP.innerHTML = '<span style="color: var(--danger);">Failed: ' + (data.error || 'Unknown error') + '</span>';
+        closeBtn.disabled = false;
+        return;
+    }
+
+    const jobID = data.job_id;
+    if (!jobID) {
+        statusP.innerHTML = '<span style="color: var(--danger);">Failed: No job ID returned</span>';
+        closeBtn.disabled = false;
+        return;
+    }
+
+    // Poll for progress
+    kernelDownloadPollInterval = setInterval(async () => {
+        const progResp = await apiCall('/api/system/kernels/download/' + jobID);
+        if (progResp.ok) {
+            const progress = progResp.data;
+            progressBar.style.width = progress.percent + '%%';
+
+            if (progress.error) {
+                statusP.innerHTML = '<span style="color: var(--danger);">Error: ' + progress.error + '</span>';
+                clearInterval(kernelDownloadPollInterval);
+                closeBtn.disabled = false;
+            } else if (progress.complete) {
+                statusP.innerHTML = '<span style="color: var(--success);">Download complete!</span>';
+                clearInterval(kernelDownloadPollInterval);
+                closeBtn.disabled = false;
+                // Refresh the lists
+                loadInstalledKernels();
+                checkKernelUpdates(false);
+            } else {
+                statusP.textContent = progress.message || 'Downloading...';
+            }
+        }
+    }, 1000);
+}
+
 // Load system status immediately (fast)
 loadSystemStatus();
 // Load jailer configuration
@@ -6892,6 +7608,9 @@ loadJailerConfig();
 loadProxyConfig();
 // Load cached version info (fast - reads from local JSON cache)
 checkFirecrackerUpdate();
+// Load installed kernels and cached kernel update info
+loadInstalledKernels();
+checkKernelUpdates(false);
 // Refresh local status every 30 seconds
 setInterval(loadSystemStatus, 30000);
 </script>
@@ -6900,6 +7619,16 @@ setInterval(loadSystemStatus, 30000);
 
 func (wc *WebConsole) renderUsersPage() string {
 	return `
+<div class="tab-buttons" style="margin-bottom: 20px;">
+    <a href="/users" class="btn btn-primary">
+        <span class="material-icons">people</span>
+        Users
+    </a>
+    <a href="/groups" class="btn btn-secondary">
+        <span class="material-icons">group_work</span>
+        Groups
+    </a>
+</div>
 <div class="card">
     <div class="card-header">
         <h3>Users</h3>
@@ -7038,6 +7767,16 @@ loadUsers();
 
 func (wc *WebConsole) renderGroupsPage() string {
 	return `
+<div class="tab-buttons" style="margin-bottom: 20px;">
+    <a href="/users" class="btn btn-secondary">
+        <span class="material-icons">people</span>
+        Users
+    </a>
+    <a href="/groups" class="btn btn-primary">
+        <span class="material-icons">group_work</span>
+        Groups
+    </a>
+</div>
 <div class="card">
     <div class="card-header">
         <h3>Groups</h3>
@@ -7082,7 +7821,7 @@ func (wc *WebConsole) renderGroupsPage() string {
                     <input type="text" name="description" placeholder="Optional description">
                 </div>
                 <div class="form-group">
-                    <label>Permissions</label>
+                    <label>VM Permissions</label>
                     <div style="display: flex; flex-wrap: wrap; gap: 15px; margin-top: 8px;">
                         <label style="display: flex; align-items: center; cursor: pointer;">
                             <input type="checkbox" name="perm_start" checked style="width: auto; margin-right: 5px;"> Start
@@ -7104,6 +7843,21 @@ func (wc *WebConsole) renderGroupsPage() string {
                         </label>
                     </div>
                     <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Select which operations group members can perform on assigned VMs.</small>
+                </div>
+                <div class="form-group">
+                    <label>Feature Permissions</label>
+                    <div style="display: flex; flex-wrap: wrap; gap: 15px; margin-top: 8px;">
+                        <label style="display: flex; align-items: center; cursor: pointer;">
+                            <input type="checkbox" name="perm_networks" style="width: auto; margin-right: 5px;"> Networks
+                        </label>
+                        <label style="display: flex; align-items: center; cursor: pointer;">
+                            <input type="checkbox" name="perm_images" style="width: auto; margin-right: 5px;"> Images
+                        </label>
+                        <label style="display: flex; align-items: center; cursor: pointer;">
+                            <input type="checkbox" name="perm_admin" style="width: auto; margin-right: 5px;"> Administrator
+                        </label>
+                    </div>
+                    <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Networks: access to network management. Images: access to kernels and root filesystems. Administrator: full access to all features.</small>
                 </div>
             </form>
         </div>
@@ -7188,20 +7942,21 @@ async function loadGroups() {
 
     tbody.innerHTML = groupsWithCounts.map(group => ` + "`" + `
         <tr>
-            <td><strong>${group.name}</strong></td>
+            <td><a href="#" onclick="editGroup('${group.id}'); return false;" style="font-weight: bold; text-decoration: none;">${group.name}</a></td>
             <td>${group.description || '-'}</td>
             <td>
-                ${group.permissions.split(',').map(p => ` + "`" + `<span class="badge badge-info" style="margin: 1px;">${p.trim()}</span>` + "`" + `).join('')}
+                <ul class="permission-list">
+                    ${group.permissions.split(',').map(p => ` + "`" + `<li><span class="material-icons" style="font-size: 14px; color: var(--success); vertical-align: middle;">check</span> ${p.trim()}</li>` + "`" + `).join('')}
+                </ul>
             </td>
             <td><span class="badge badge-secondary">${group.memberCount}</span></td>
             <td><span class="badge badge-secondary">${group.vmCount}</span></td>
-            <td class="actions">
-                <button class="btn btn-secondary btn-sm" onclick="editGroup('${group.id}')" title="Edit">
-                    <span class="material-icons">edit</span>
-                </button>
-                <button class="btn btn-danger btn-sm" onclick="deleteGroup('${group.id}')" title="Delete">
-                    <span class="material-icons">delete</span>
-                </button>
+            <td>
+                <div class="actions">
+                    <button class="btn btn-danger btn-sm" onclick="deleteGroup('${group.id}')" title="Delete">
+                        <span class="material-icons">delete</span>
+                    </button>
+                </div>
             </td>
         </tr>
     ` + "`" + `).join('');
@@ -7215,6 +7970,9 @@ function getPermissionsFromForm() {
     if (document.querySelector('[name="perm_edit"]').checked) perms.push('edit');
     if (document.querySelector('[name="perm_snapshot"]').checked) perms.push('snapshot');
     if (document.querySelector('[name="perm_disk"]').checked) perms.push('disk');
+    if (document.querySelector('[name="perm_networks"]').checked) perms.push('networks');
+    if (document.querySelector('[name="perm_images"]').checked) perms.push('images');
+    if (document.querySelector('[name="perm_admin"]').checked) perms.push('admin');
     return perms.join(',');
 }
 
@@ -7648,7 +8406,7 @@ func (wc *WebConsole) renderMigrationPage() string {
         </form>
         <div id="migrationProgress" style="display: none; margin-top: 20px;">
             <div class="progress-bar">
-                <div class="progress-fill" id="progressFill" style="width: 0%;"></div>
+                <div class="progress-fill" id="progressFill" style="width: 0%%;"></div>
             </div>
             <p id="progressText">Preparing migration...</p>
         </div>
@@ -7713,14 +8471,14 @@ func (wc *WebConsole) renderMigrationPage() string {
 
 <style>
 .progress-bar {
-    width: 100%;
+    width: 100%%;
     height: 20px;
     background: #333;
     border-radius: 4px;
     overflow: hidden;
 }
 .progress-fill {
-    height: 100%;
+    height: 100%%;
     background: linear-gradient(90deg, #2196f3, #64b5f6);
     transition: width 0.3s ease;
 }
@@ -7886,7 +8644,7 @@ document.getElementById('migrateForm').addEventListener('submit', async function
     document.getElementById('migrateBtn').disabled = true;
     document.getElementById('migrationProgress').style.display = 'block';
     document.getElementById('progressText').textContent = 'Starting migration...';
-    document.getElementById('progressFill').style.width = '0%';
+    document.getElementById('progressFill').style.width = '0%%';
 
     const { ok, data: resp } = await apiCall('/api/migration/send', 'POST', data);
 
@@ -7916,13 +8674,13 @@ function pollMigrationStatus(vmId) {
         const bytesSent = data.status.bytes_sent || 0;
         const bytesTotal = data.status.bytes_total || 0;
 
-        document.getElementById('progressFill').style.width = progress + '%';
+        document.getElementById('progressFill').style.width = progress + '%%';
 
         if (bytesTotal > 0) {
             const sentMB = (bytesSent / 1024 / 1024).toFixed(2);
             const totalMB = (bytesTotal / 1024 / 1024).toFixed(2);
             document.getElementById('progressText').textContent =
-                'Transferring: ' + sentMB + ' MB / ' + totalMB + ' MB (' + progress.toFixed(1) + '%)';
+                'Transferring: ' + sentMB + ' MB / ' + totalMB + ' MB (' + progress.toFixed(1) + '%%)';
         }
 
         if (data.status.state === 'completed') {
@@ -8060,7 +8818,7 @@ func (wc *WebConsole) renderHostNetworkPage() string {
 
                 <div class="form-group">
                     <label>IP Addresses (CIDR format, one per line)</label>
-                    <textarea id="configAddresses" rows="3" placeholder="192.168.1.10/24&#10;10.0.0.1/8" style="width: 100%; font-family: monospace;"></textarea>
+                    <textarea id="configAddresses" rows="3" placeholder="192.168.1.10/24&#10;10.0.0.1/8" style="width: 100%%; font-family: monospace;"></textarea>
                 </div>
 
                 <div class="form-group">
@@ -8123,7 +8881,7 @@ func (wc *WebConsole) renderHostNetworkPage() string {
             <form id="dnsForm">
                 <div class="form-group">
                     <label>DNS Servers (one per line)</label>
-                    <textarea id="dnsServersInput" rows="4" placeholder="8.8.8.8&#10;8.8.4.4&#10;1.1.1.1" style="width: 100%; font-family: monospace;"></textarea>
+                    <textarea id="dnsServersInput" rows="4" placeholder="8.8.8.8&#10;8.8.4.4&#10;1.1.1.1" style="width: 100%%; font-family: monospace;"></textarea>
                 </div>
 
                 <div style="display: flex; gap: 10px; justify-content: flex-end;">
@@ -8176,7 +8934,7 @@ func (wc *WebConsole) renderHostNetworkPage() string {
     to { transform: rotate(360deg); }
 }
 #interfacesTable, #routesTable {
-    width: 100%;
+    width: 100%%;
     border-collapse: collapse;
 }
 #interfacesTable th, #interfacesTable td,
@@ -8537,7 +9295,6 @@ func (wc *WebConsole) handleVMGroupsPage(w http.ResponseWriter, r *http.Request)
 func (wc *WebConsole) renderVMGroupsPage() string {
 	return `
 <div class="page-header">
-    <h3>VM Groups</h3>
     <button class="btn btn-primary" onclick="openModal('createGroupModal')">
         <span class="material-icons">add</span> Create Group
     </button>
@@ -8989,7 +9746,7 @@ func (wc *WebConsole) renderAccountPage() string {
     <div class="card-body">
         <div class="account-info">
             <div class="account-details">
-                <table style="width: 100%; max-width: 500px;">
+                <table style="width: 100%%; max-width: 500px;">
                     <tr>
                         <td style="width: 140px;"><strong>Username:</strong></td>
                         <td id="accountUsername">-</td>
@@ -9177,7 +9934,7 @@ func (wc *WebConsole) renderAccountPage() string {
 .group-vm-item .vm-status.error { background: var(--danger); }
 
 .accessible-vms-table {
-    width: 100%;
+    width: 100%%;
 }
 .accessible-vms-table th {
     text-align: left;
@@ -9387,13 +10144,13 @@ func (wc *WebConsole) renderAppliancesPage() string {
         <h3>Exported VMs</h3>
     </div>
     <div class="card-body">
-        <table class="data-table" style="table-layout: fixed; width: 100%;">
+        <table class="data-table" style="table-layout: fixed; width: 100%%;">
             <thead>
                 <tr>
                     <th style="width: auto;">NAME</th>
+                    <th style="width: 100px;">OWNER</th>
                     <th style="width: 180px;">EXPORTED DATE</th>
                     <th style="width: 100px;">SIZE</th>
-                    <th style="width: 100px; text-align: center;">ACTIONS</th>
                 </tr>
             </thead>
             <tbody id="appliancesList">
@@ -9405,7 +10162,192 @@ func (wc *WebConsole) renderAppliancesPage() string {
     </div>
 </div>
 
+<!-- Appliance Actions Modal -->
+<div id="applianceActionsModal" class="modal">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <h3 id="appActionsTitle">Appliance Actions</h3>
+            <span class="material-icons modal-close" onclick="closeModal('applianceActionsModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <input type="hidden" id="appActionsFilename">
+            <input type="hidden" id="appActionsVmName">
+            <input type="hidden" id="appActionsCanWrite">
+            <input type="hidden" id="appActionsDescription">
+
+            <div style="margin-bottom: 20px;">
+                <p style="color: var(--text-secondary); margin-bottom: 5px;">Filename:</p>
+                <code id="appActionsFilenameDisplay" style="font-size: 12px; word-break: break-all;"></code>
+            </div>
+            <div style="margin-bottom: 20px;" id="appActionsDescriptionContainer">
+                <p style="color: var(--text-secondary); margin-bottom: 5px;">Description:</p>
+                <span id="appActionsDescriptionDisplay" style="font-size: 13px; font-style: italic; color: var(--text-muted);">No description</span>
+            </div>
+
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+                <button class="btn btn-success" onclick="openRestoreFromActions()" style="justify-content: flex-start;">
+                    <span class="material-icons">restore</span>
+                    Restore as New VM
+                </button>
+                <button class="btn btn-primary" onclick="downloadFromActions()" style="justify-content: flex-start;">
+                    <span class="material-icons">download</span>
+                    Download Appliance
+                </button>
+                <button class="btn btn-secondary" id="btnManagePrivileges" onclick="openPrivilegesFromActions()" style="justify-content: flex-start; display: none;">
+                    <span class="material-icons">security</span>
+                    Manage Privileges
+                </button>
+                <button class="btn btn-secondary" id="btnEditApplianceDescription" onclick="openEditApplianceDescription()" style="justify-content: flex-start; display: none;">
+                    <span class="material-icons">edit_note</span>
+                    Edit Description
+                </button>
+                <hr style="border: none; border-top: 1px solid var(--border); margin: 10px 0;">
+                <button class="btn btn-danger" id="btnDeleteAppliance" onclick="deleteFromActions()" style="justify-content: flex-start; display: none;">
+                    <span class="material-icons">delete</span>
+                    Delete Appliance
+                </button>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('applianceActionsModal')">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Privileges Modal -->
+<div id="privilegesModal" class="modal">
+    <div class="modal-content" style="max-width: 600px;">
+        <div class="modal-header">
+            <h3>Manage Privileges: <span id="privModalFilename"></span></h3>
+            <span class="material-icons modal-close" onclick="closeModal('privilegesModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <input type="hidden" id="privFilename">
+
+            <!-- Add Privilege Form -->
+            <div style="margin-bottom: 20px; padding: 15px; background: var(--bg-secondary); border-radius: 8px;">
+                <h4 style="margin-bottom: 10px;">Add Privilege</h4>
+                <div style="display: flex; gap: 10px; align-items: end; flex-wrap: wrap;">
+                    <div style="flex: 1; min-width: 150px;">
+                        <label style="font-size: 12px;">Type</label>
+                        <select id="privType" onchange="updatePrivTarget()" style="width: 100%%;">
+                            <option value="user">User</option>
+                            <option value="group">Group</option>
+                        </select>
+                    </div>
+                    <div style="flex: 2; min-width: 200px;">
+                        <label style="font-size: 12px;">Target</label>
+                        <select id="privTarget" style="width: 100%%;">
+                            <option value="">Select...</option>
+                        </select>
+                    </div>
+                    <div style="min-width: 80px;">
+                        <label style="font-size: 12px; display: flex; align-items: center; gap: 5px;">
+                            <input type="checkbox" id="privRead" checked style="width: auto;"> Read
+                        </label>
+                    </div>
+                    <div style="min-width: 80px;">
+                        <label style="font-size: 12px; display: flex; align-items: center; gap: 5px;">
+                            <input type="checkbox" id="privWrite" style="width: auto;"> Write
+                        </label>
+                    </div>
+                    <button class="btn btn-primary btn-sm" onclick="addPrivilege()">
+                        <span class="material-icons">add</span> Add
+                    </button>
+                </div>
+            </div>
+
+            <!-- Privileges List -->
+            <h4 style="margin-bottom: 10px;">Current Privileges</h4>
+            <div id="privilegesList" style="max-height: 300px; overflow-y: auto;">
+                <p style="color: var(--text-secondary);">Loading...</p>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('privilegesModal')">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Appliance Description Modal -->
+<div id="editApplianceDescModal" class="modal">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <h3>Edit Appliance Description</h3>
+            <span class="material-icons modal-close" onclick="closeEditAppDescModal()">close</span>
+        </div>
+        <div class="modal-body">
+            <input type="hidden" id="editAppDescFilename">
+            <p style="margin-bottom: 10px; color: var(--text-secondary);">
+                Appliance: <strong id="editAppDescFilenameDisplay"></strong>
+            </p>
+            <div class="form-group">
+                <label for="editAppDescText">Description</label>
+                <textarea id="editAppDescText" rows="4" placeholder="Enter appliance description..." style="width: 100%%;"></textarea>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeEditAppDescModal()">Cancel</button>
+            <button type="button" class="btn btn-primary" onclick="saveApplianceDescription()">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- Restore Appliance Modal -->
+<div id="restoreModal" class="modal">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <h3>Restore Appliance</h3>
+            <span class="material-icons modal-close" onclick="closeRestoreModal()">close</span>
+        </div>
+        <form id="restoreForm" onsubmit="submitRestore(event)">
+            <div class="modal-body">
+                <input type="hidden" id="restoreFilename">
+                <!-- Form fields -->
+                <div id="restoreFormFields">
+                    <p style="margin-bottom: 15px; color: var(--text-secondary);">
+                        This will create a new VM from the selected appliance.
+                    </p>
+                    <div class="form-group">
+                        <label for="restoreVmName">VM Name</label>
+                        <input type="text" name="name" id="restoreVmName" required placeholder="Enter VM name">
+                    </div>
+                    <div class="form-group">
+                        <label for="restoreKernelSelect">Kernel</label>
+                        <select name="kernel_id" id="restoreKernelSelect" required>
+                            <option value="">Loading kernels...</option>
+                        </select>
+                    </div>
+                </div>
+                <!-- Progress display -->
+                <div id="restoreProgress" style="display: none;">
+                    <div style="text-align: center; margin-bottom: 15px;">
+                        <span class="material-icons" style="font-size: 48px; color: var(--primary); animation: spin 1s linear infinite;">sync</span>
+                    </div>
+                    <div id="restoreStage" style="text-align: center; margin-bottom: 10px; color: var(--text-secondary);">
+                        Preparing restore...
+                    </div>
+                    <div style="background: #e0e0e0; border-radius: 4px; height: 20px; overflow: hidden;">
+                        <div id="restoreProgressBar" style="background: linear-gradient(90deg, #1ab394, #23c6a5); height: 100%%; width: 0%%; transition: width 0.3s ease;"></div>
+                    </div>
+                    <div id="restorePercent" style="text-align: center; margin-top: 5px; font-weight: 500;">0%%</div>
+                </div>
+            </div>
+            <div class="modal-footer" id="restoreFooter">
+                <button type="button" class="btn btn-secondary" onclick="closeRestoreModal()">Cancel</button>
+                <button type="submit" class="btn btn-success" id="restoreSubmitBtn">
+                    <span class="material-icons">restore</span> Restore
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
+let allUsers = [];
+let allGroups = [];
+let kernelsLoaded = false;
+
 function formatBytes(bytes) {
     if (bytes === 0) return '0 B';
     const k = 1024;
@@ -9434,31 +10376,266 @@ async function loadAppliances() {
         tbody.innerHTML = data.appliances.map(app => ` + "`" + `
             <tr>
                 <td>
-                    <span class="material-icons" style="vertical-align: middle; margin-right: 8px; color: var(--primary);">folder_zip</span>
-                    <strong>${app.vm_name}</strong>
-                    <br><small style="color: var(--text-secondary); margin-left: 32px;">${app.filename}</small>
+                    <a href="#" onclick="openApplianceActions('${app.filename}', '${app.vm_name}', ${app.is_owner || app.can_write}, '${encodeURIComponent(app.description || '')}'); return false;" style="text-decoration: none; color: inherit;">
+                        <svg xmlns="http://www.w3.org/2000/svg" height="48px" viewBox="0 -960 960 960" width="48px" fill="#1ab394" style="vertical-align: middle; margin-right: 8px;"><path d="M480-80q-10 0-19-3t-17-9L204-252q-8-6-12-14.5T188-284v-248q0-9 4-17.5t12-14.5l240-160q8-6 17-9t19-3q10 0 19 3t17 9l240 160q8 6 12 14.5t4 17.5v248q0 9-4 17.5T756-252L516-92q-8 6-17 9t-19 3Zm0-308 168-110-168-112-168 112 168 110Zm40 203 160-106v-150l-160 106v150Zm-80 0v-150l-160-106v150l160 106Zm40-203Z"/></svg>
+                        <div class="appliance-name">${app.vm_name}</div>
+                    </a>
+                    <div class="appliance-explain">${app.description || app.filename}</div>
+                </td>
+                <td>
+                    ${app.owner_name ? '<span class="badge badge-secondary">' + app.owner_name + '</span>' : '<span style="color: var(--text-secondary);">-</span>'}
+                    ${app.is_owner ? '<span class="badge badge-primary" style="margin-left: 4px;">You</span>' : ''}
                 </td>
                 <td>${app.exported_date}</td>
                 <td>${formatBytes(app.size)}</td>
-                <td>
-                    <div class="actions">
-                        <button class="btn btn-primary btn-sm" onclick="downloadAppliance('${app.filename}')" title="Download">
-                            <span class="material-icons">download</span>
-                        </button>
-                        <button class="btn btn-danger btn-sm" onclick="deleteAppliance('${app.filename}')" title="Delete">
-                            <span class="material-icons">delete</span>
-                        </button>
-                    </div>
-                </td>
             </tr>
         ` + "`" + `).join('');
     } catch (error) {
-        tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><span class="material-icons">error</span><p>Error loading appliances</p></td></tr>';
+        console.error('loadAppliances error:', error);
+        tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><span class="material-icons">error</span><p>Error: ' + error.message + '</p></td></tr>';
+    }
+}
+
+function openApplianceActions(filename, vmName, canWrite, descEncoded) {
+    const description = decodeURIComponent(descEncoded || '');
+    document.getElementById('appActionsFilename').value = filename;
+    document.getElementById('appActionsVmName').value = vmName;
+    document.getElementById('appActionsCanWrite').value = canWrite ? '1' : '0';
+    document.getElementById('appActionsDescription').value = description;
+    document.getElementById('appActionsTitle').textContent = vmName;
+    document.getElementById('appActionsFilenameDisplay').textContent = filename;
+    document.getElementById('appActionsDescriptionDisplay').textContent = description || 'No description';
+
+    // Show/hide write-only actions
+    document.getElementById('btnManagePrivileges').style.display = canWrite ? 'flex' : 'none';
+    document.getElementById('btnEditApplianceDescription').style.display = canWrite ? 'flex' : 'none';
+    document.getElementById('btnDeleteAppliance').style.display = canWrite ? 'flex' : 'none';
+
+    openModal('applianceActionsModal');
+}
+
+function openRestoreFromActions() {
+    const filename = document.getElementById('appActionsFilename').value;
+    const vmName = document.getElementById('appActionsVmName').value;
+    closeModal('applianceActionsModal');
+    openRestoreModal(filename, vmName);
+}
+
+function downloadFromActions() {
+    const filename = document.getElementById('appActionsFilename').value;
+    closeModal('applianceActionsModal');
+    downloadAppliance(filename);
+}
+
+function openPrivilegesFromActions() {
+    const filename = document.getElementById('appActionsFilename').value;
+    closeModal('applianceActionsModal');
+    openPrivilegesModal(filename);
+}
+
+async function deleteFromActions() {
+    const filename = document.getElementById('appActionsFilename').value;
+    closeModal('applianceActionsModal');
+    await deleteAppliance(filename);
+}
+
+// Store data for reopening actions modal
+let editAppDescData = {};
+
+function openEditApplianceDescription() {
+    // Store current modal data
+    editAppDescData = {
+        filename: document.getElementById('appActionsFilename').value,
+        vmName: document.getElementById('appActionsVmName').value,
+        canWrite: document.getElementById('appActionsCanWrite').value === '1',
+        description: document.getElementById('appActionsDescription').value
+    };
+
+    // Set edit modal values
+    document.getElementById('editAppDescFilename').value = editAppDescData.filename;
+    document.getElementById('editAppDescFilenameDisplay').textContent = editAppDescData.filename;
+    document.getElementById('editAppDescText').value = editAppDescData.description;
+
+    // Close actions modal, open edit modal
+    closeModal('applianceActionsModal');
+    openModal('editApplianceDescModal');
+}
+
+function closeEditAppDescModal() {
+    // Close edit modal
+    closeModal('editApplianceDescModal');
+    // Reopen actions modal with stored data
+    openApplianceActions(editAppDescData.filename, editAppDescData.vmName, editAppDescData.canWrite, encodeURIComponent(editAppDescData.description));
+}
+
+async function saveApplianceDescription() {
+    const filename = document.getElementById('editAppDescFilename').value;
+    const description = document.getElementById('editAppDescText').value.trim();
+
+    if (!filename) {
+        showToast('No appliance selected', 'error');
+        return;
+    }
+
+    try {
+        const { ok, data } = await apiCall('/api/appliances/' + encodeURIComponent(filename), 'PUT', { description: description });
+
+        if (ok) {
+            showToast('Description updated successfully', 'success');
+            // Update stored data
+            editAppDescData.description = description;
+            // Close edit modal
+            closeModal('editApplianceDescModal');
+            // Reopen actions modal with updated description
+            openApplianceActions(editAppDescData.filename, editAppDescData.vmName, editAppDescData.canWrite, encodeURIComponent(description));
+            // Refresh the table in background
+            loadAppliances();
+        } else {
+            showToast(data.error || 'Failed to update description', 'error');
+        }
+    } catch (err) {
+        console.error('Save description error:', err);
+        showToast('Error saving description: ' + err.message, 'error');
     }
 }
 
 function downloadAppliance(filename) {
     window.location.href = '/api/appliances/' + encodeURIComponent(filename);
+}
+
+async function openRestoreModal(filename, vmName) {
+    document.getElementById('restoreFilename').value = filename;
+    document.getElementById('restoreVmName').value = vmName || '';
+
+    // Load kernels if not already loaded
+    if (!kernelsLoaded) {
+        try {
+            const response = await fetch('/api/kernels', { credentials: 'include' });
+            const data = await response.json();
+
+            const select = document.getElementById('restoreKernelSelect');
+            if (data.kernels && data.kernels.length > 0) {
+                select.innerHTML = data.kernels.map(k =>
+                    ` + "`" + `<option value="${k.id}">${k.name} (${k.version})</option>` + "`" + `
+                ).join('');
+                kernelsLoaded = true;
+            } else {
+                select.innerHTML = '<option value="">No kernels available</option>';
+            }
+        } catch (error) {
+            document.getElementById('restoreKernelSelect').innerHTML = '<option value="">Error loading kernels</option>';
+        }
+    }
+
+    openModal('restoreModal');
+}
+
+let restoreProgressInterval = null;
+
+function closeRestoreModal() {
+    if (restoreProgressInterval) {
+        clearInterval(restoreProgressInterval);
+        restoreProgressInterval = null;
+    }
+    closeModal('restoreModal');
+    // Reset modal state
+    document.getElementById('restoreFormFields').style.display = 'block';
+    document.getElementById('restoreProgress').style.display = 'none';
+    document.getElementById('restoreFooter').style.display = 'flex';
+    document.getElementById('restoreSubmitBtn').disabled = false;
+    document.getElementById('restoreSubmitBtn').innerHTML = '<span class="material-icons">restore</span> Restore';
+}
+
+async function submitRestore(event) {
+    event.preventDefault();
+
+    const filename = document.getElementById('restoreFilename').value;
+    const name = document.getElementById('restoreVmName').value;
+    const kernelId = document.getElementById('restoreKernelSelect').value;
+
+    if (!name || !kernelId) {
+        alert('Please fill in all fields');
+        return;
+    }
+
+    const submitBtn = document.getElementById('restoreSubmitBtn');
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = '<span class="material-icons">hourglass_empty</span> Starting...';
+
+    try {
+        const response = await fetch('/api/appliances/restore/' + encodeURIComponent(filename), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ name: name, kernel_id: kernelId })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.progress_key) {
+            // Show progress UI
+            document.getElementById('restoreFormFields').style.display = 'none';
+            document.getElementById('restoreProgress').style.display = 'block';
+            document.getElementById('restoreFooter').style.display = 'none';
+
+            // Start polling for progress
+            pollRestoreProgress(data.progress_key, name);
+        } else {
+            alert(data.error || 'Failed to start restore');
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = '<span class="material-icons">restore</span> Restore';
+        }
+    } catch (error) {
+        alert('Error restoring appliance: ' + error.message);
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '<span class="material-icons">restore</span> Restore';
+    }
+}
+
+function pollRestoreProgress(progressKey, vmName) {
+    restoreProgressInterval = setInterval(async () => {
+        try {
+            const response = await fetch('/api/operations/' + progressKey, { credentials: 'include' });
+            const progress = await response.json();
+
+            if (progress.error) {
+                clearInterval(restoreProgressInterval);
+                restoreProgressInterval = null;
+                alert('Restore failed: ' + progress.error);
+                closeRestoreModal();
+                return;
+            }
+
+            // Update progress UI
+            document.getElementById('restoreStage').textContent = progress.stage || 'Processing...';
+            document.getElementById('restoreProgressBar').style.width = (progress.percent || 0) + '%%';
+            document.getElementById('restorePercent').textContent = (progress.percent || 0) + '%%';
+
+            if (progress.status === 'completed') {
+                clearInterval(restoreProgressInterval);
+                restoreProgressInterval = null;
+
+                // Show success
+                document.getElementById('restoreProgress').innerHTML = ` + "`" + `
+                    <div style="text-align: center;">
+                        <span class="material-icons" style="font-size: 64px; color: #1ab394;">check_circle</span>
+                        <h3 style="margin: 15px 0;">Restore Complete!</h3>
+                        <p style="color: var(--text-secondary);">VM "${progress.result_name || vmName}" has been created.</p>
+                        <button class="btn btn-success" onclick="window.location.href='/vms'" style="margin-top: 15px;">
+                            <span class="material-icons">visibility</span> View VMs
+                        </button>
+                    </div>
+                ` + "`" + `;
+            } else if (progress.status === 'error') {
+                clearInterval(restoreProgressInterval);
+                restoreProgressInterval = null;
+                alert('Restore failed: ' + (progress.error || 'Unknown error'));
+                closeRestoreModal();
+            }
+        } catch (error) {
+            console.error('Error polling progress:', error);
+        }
+    }, 500);
 }
 
 async function deleteAppliance(filename) {
@@ -9483,8 +10660,565 @@ async function deleteAppliance(filename) {
     }
 }
 
+async function openPrivilegesModal(filename) {
+    document.getElementById('privFilename').value = filename;
+    document.getElementById('privModalFilename').textContent = filename;
+
+    // Load users and groups for dropdowns
+    const [usersResp, groupsResp] = await Promise.all([
+        fetch('/api/users', { credentials: 'include' }).then(r => r.json()).catch(() => ({ users: [] })),
+        fetch('/api/groups', { credentials: 'include' }).then(r => r.json()).catch(() => ({ groups: [] }))
+    ]);
+    allUsers = usersResp.users || [];
+    allGroups = groupsResp.groups || [];
+
+    updatePrivTarget();
+    await loadPrivileges(filename);
+    openModal('privilegesModal');
+}
+
+function updatePrivTarget() {
+    const type = document.getElementById('privType').value;
+    const select = document.getElementById('privTarget');
+
+    if (type === 'user') {
+        select.innerHTML = '<option value="">Select user...</option>' +
+            allUsers.map(u => ` + "`" + `<option value="${u.id}">${u.username}</option>` + "`" + `).join('');
+    } else {
+        select.innerHTML = '<option value="">Select group...</option>' +
+            allGroups.map(g => ` + "`" + `<option value="${g.id}">${g.name}</option>` + "`" + `).join('');
+    }
+}
+
+async function loadPrivileges(filename) {
+    const container = document.getElementById('privilegesList');
+
+    try {
+        const response = await fetch('/api/appliances/' + encodeURIComponent(filename) + '/privileges', { credentials: 'include' });
+        const data = await response.json();
+
+        if (!response.ok) {
+            container.innerHTML = '<p style="color: var(--danger);">' + (data.error || 'Failed to load privileges') + '</p>';
+            return;
+        }
+
+        const privileges = data.privileges || [];
+
+        if (privileges.length === 0) {
+            container.innerHTML = '<p style="color: var(--text-secondary);">No privileges assigned. Only the owner can access this appliance.</p>';
+            return;
+        }
+
+        container.innerHTML = '<table style="width: 100%%;"><thead><tr><th>Type</th><th>Name</th><th>Read</th><th>Write</th><th></th></tr></thead><tbody>' +
+            privileges.map(p => ` + "`" + `
+                <tr>
+                    <td><span class="badge badge-${p.user_id ? 'primary' : 'secondary'}">${p.user_id ? 'User' : 'Group'}</span></td>
+                    <td>${p.username || p.group_name || 'Unknown'}</td>
+                    <td>${p.can_read ? '<span class="material-icons" style="color: var(--success);">check</span>' : '<span class="material-icons" style="color: var(--text-secondary);">close</span>'}</td>
+                    <td>${p.can_write ? '<span class="material-icons" style="color: var(--success);">check</span>' : '<span class="material-icons" style="color: var(--text-secondary);">close</span>'}</td>
+                    <td>
+                        <button class="btn btn-danger btn-sm" onclick="removePrivilege('${p.user_id ? 'user' : 'group'}', '${p.user_id || p.group_id}')" title="Remove">
+                            <span class="material-icons">delete</span>
+                        </button>
+                    </td>
+                </tr>
+            ` + "`" + `).join('') + '</tbody></table>';
+    } catch (error) {
+        container.innerHTML = '<p style="color: var(--danger);">Error loading privileges</p>';
+    }
+}
+
+async function addPrivilege() {
+    const filename = document.getElementById('privFilename').value;
+    const type = document.getElementById('privType').value;
+    const targetId = document.getElementById('privTarget').value;
+    const canRead = document.getElementById('privRead').checked;
+    const canWrite = document.getElementById('privWrite').checked;
+
+    if (!targetId) {
+        alert('Please select a ' + type);
+        return;
+    }
+
+    if (!canRead && !canWrite) {
+        alert('Please select at least read or write permission');
+        return;
+    }
+
+    const body = {
+        can_read: canRead,
+        can_write: canWrite
+    };
+
+    if (type === 'user') {
+        body.user_id = parseInt(targetId);
+    } else {
+        body.group_id = targetId;
+    }
+
+    try {
+        const response = await fetch('/api/appliances/' + encodeURIComponent(filename) + '/privileges', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(body)
+        });
+        const data = await response.json();
+
+        if (response.ok) {
+            document.getElementById('privTarget').value = '';
+            await loadPrivileges(filename);
+        } else {
+            alert(data.error || 'Failed to add privilege');
+        }
+    } catch (error) {
+        alert('Error adding privilege: ' + error.message);
+    }
+}
+
+async function removePrivilege(type, id) {
+    const filename = document.getElementById('privFilename').value;
+
+    if (!confirm('Are you sure you want to remove this privilege?')) {
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/appliances/' + encodeURIComponent(filename) + '/privileges/' + type + '/' + id, {
+            method: 'DELETE',
+            credentials: 'include'
+        });
+        const data = await response.json();
+
+        if (response.ok) {
+            await loadPrivileges(filename);
+        } else {
+            alert(data.error || 'Failed to remove privilege');
+        }
+    } catch (error) {
+        alert('Error removing privilege: ' + error.message);
+    }
+}
+
 // Load appliances on page load
 loadAppliances();
+</script>
+`
+}
+
+func (wc *WebConsole) renderStorePage() string {
+	return `
+<style>
+.store-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+    gap: 20px;
+    margin-top: 20px;
+}
+
+.store-card {
+    background: var(--card-bg);
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.store-card-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.store-card-header .material-icons {
+    font-size: 32px;
+    color: var(--primary);
+}
+
+.store-card-title {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin: 0;
+}
+
+.store-card-description {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    margin-bottom: 16px;
+    line-height: 1.4;
+}
+
+.store-card-meta {
+    display: flex;
+    gap: 16px;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-bottom: 16px;
+}
+
+.store-card-meta span {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.store-card-meta .material-icons {
+    font-size: 16px;
+}
+
+.store-card-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.download-progress {
+    display: none;
+    margin-top: 12px;
+}
+
+.download-progress.active {
+    display: block;
+}
+
+.progress-bar-container {
+    background: var(--border);
+    border-radius: 4px;
+    height: 8px;
+    overflow: hidden;
+    margin-bottom: 8px;
+}
+
+.progress-bar-fill {
+    background: var(--primary);
+    height: 100%%;
+    width: 0%%;
+    transition: width 0.3s ease;
+}
+
+.progress-info {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    display: flex;
+    justify-content: space-between;
+}
+
+.store-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+.store-header h3 {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.store-header .material-icons {
+    color: var(--primary);
+}
+
+.last-update {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+.empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-muted);
+}
+
+.empty-state .material-icons {
+    font-size: 64px;
+    margin-bottom: 16px;
+    opacity: 0.5;
+}
+
+.store-card.downloading .btn-download {
+    display: none;
+}
+
+.store-card.downloading .download-progress {
+    display: block;
+}
+
+.btn-download.completed {
+    background: var(--success);
+}
+</style>
+
+<div class="store-header">
+    <h3>
+        <span class="material-icons">store</span>
+        Appliance Store
+    </h3>
+    <div style="display: flex; align-items: center; gap: 16px;">
+        <span class="last-update" id="lastUpdate">Loading...</span>
+        <button class="btn btn-secondary" onclick="refreshCatalog()">
+            <span class="material-icons">refresh</span>
+            Refresh
+        </button>
+    </div>
+</div>
+
+<div id="storeContent">
+    <div class="empty-state">
+        <span class="material-icons">hourglass_empty</span>
+        <p>Loading store catalog...</p>
+    </div>
+</div>
+
+<script>
+let activeDownloads = {};
+
+async function loadStore() {
+    try {
+        const response = await fetch('/api/store');
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to load store');
+        }
+
+        renderStore(data);
+    } catch (error) {
+        document.getElementById('storeContent').innerHTML = ` + "`" + `
+            <div class="empty-state">
+                <span class="material-icons">error_outline</span>
+                <p>Failed to load store: ${error.message}</p>
+                <button class="btn btn-primary" onclick="loadStore()">Retry</button>
+            </div>
+        ` + "`" + `;
+    }
+}
+
+function renderStore(data) {
+    const container = document.getElementById('storeContent');
+    const lastUpdate = document.getElementById('lastUpdate');
+
+    if (data.last_update) {
+        const date = new Date(data.last_update);
+        if (date.getTime() > 0) {
+            lastUpdate.textContent = 'Last updated: ' + date.toLocaleString();
+        } else {
+            lastUpdate.textContent = 'Catalog not yet loaded';
+        }
+    }
+
+    if (!data.appliances || data.appliances.length === 0) {
+        container.innerHTML = ` + "`" + `
+            <div class="empty-state">
+                <span class="material-icons">inventory_2</span>
+                <p>No appliances available in the store</p>
+                <button class="btn btn-primary" onclick="refreshCatalog()">Refresh Catalog</button>
+            </div>
+        ` + "`" + `;
+        return;
+    }
+
+    let html = '<div class="store-grid">';
+
+    for (const app of data.appliances) {
+        const sizeFormatted = formatBytes(app.size);
+        const dateFormatted = app.date ? new Date(app.date * 1000).toLocaleDateString() : 'Unknown';
+        const partsCount = app.parts ? app.parts.length : 0;
+
+        html += ` + "`" + `
+            <div class="store-card" id="card-${app.name}" data-name="${app.name}">
+                <div class="store-card-header">
+                    <span class="material-icons">apps</span>
+                    <h4 class="store-card-title">${escapeHtml(app.title || app.name)}</h4>
+                </div>
+                <p class="store-card-description">${escapeHtml(app.description || 'No description available')}</p>
+                <div class="store-card-meta">
+                    <span><span class="material-icons">folder</span> ${sizeFormatted}</span>
+                    <span><span class="material-icons">calendar_today</span> ${dateFormatted}</span>
+                    <span><span class="material-icons">layers</span> ${partsCount} parts</span>
+                </div>
+                <div class="store-card-actions">
+                    <button class="btn btn-primary btn-download" onclick="startDownload('${app.name}')">
+                        <span class="material-icons">download</span>
+                        Download
+                    </button>
+                </div>
+                <div class="download-progress">
+                    <div class="progress-bar-container">
+                        <div class="progress-bar-fill" id="progress-${app.name}"></div>
+                    </div>
+                    <div class="progress-info">
+                        <span id="stage-${app.name}">Preparing...</span>
+                        <span id="percent-${app.name}">0%</span>
+                    </div>
+                    <div class="progress-info" style="margin-top: 4px;">
+                        <span id="speed-${app.name}"></span>
+                        <span id="bytes-${app.name}"></span>
+                    </div>
+                </div>
+            </div>
+        ` + "`" + `;
+    }
+
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+async function startDownload(name) {
+    const card = document.getElementById('card-' + name);
+    if (!card) return;
+
+    try {
+        const response = await fetch('/api/store/download/' + encodeURIComponent(name), {
+            method: 'POST'
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to start download');
+        }
+
+        // Show progress UI
+        card.classList.add('downloading');
+        activeDownloads[name] = data.key;
+
+        // Start polling for progress
+        pollProgress(name, data.key);
+
+    } catch (error) {
+        alert('Failed to start download: ' + error.message);
+    }
+}
+
+async function pollProgress(name, key) {
+    try {
+        const response = await fetch('/api/store/progress/' + encodeURIComponent(key));
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to get progress');
+        }
+
+        updateProgress(name, data);
+
+        // Continue polling if download is still active
+        if (data.status === 'downloading' || data.status === 'verifying' || data.status === 'merging' || data.status === 'pending') {
+            setTimeout(() => pollProgress(name, key), 500);
+        } else if (data.status === 'completed') {
+            // Download completed
+            delete activeDownloads[name];
+            const card = document.getElementById('card-' + name);
+            if (card) {
+                const btn = card.querySelector('.btn-download');
+                if (btn) {
+                    btn.innerHTML = '<span class="material-icons">check</span> Downloaded';
+                    btn.classList.add('completed');
+                    btn.disabled = true;
+                }
+                card.classList.remove('downloading');
+            }
+            // Optionally redirect to appliances page or show success message
+            showNotification('Download completed: ' + name, 'success');
+        } else if (data.status === 'error') {
+            // Download failed
+            delete activeDownloads[name];
+            const card = document.getElementById('card-' + name);
+            if (card) {
+                card.classList.remove('downloading');
+            }
+            alert('Download failed: ' + (data.error || 'Unknown error'));
+        }
+
+    } catch (error) {
+        console.error('Error polling progress:', error);
+        // Retry after a delay
+        setTimeout(() => pollProgress(name, key), 2000);
+    }
+}
+
+function updateProgress(name, data) {
+    const progressBar = document.getElementById('progress-' + name);
+    const stage = document.getElementById('stage-' + name);
+    const percent = document.getElementById('percent-' + name);
+    const speed = document.getElementById('speed-' + name);
+    const bytes = document.getElementById('bytes-' + name);
+
+    if (progressBar) {
+        progressBar.style.width = Math.min(data.percent || 0, 100) + '%%';
+    }
+
+    if (stage) {
+        stage.textContent = data.stage || data.status || 'Processing...';
+    }
+
+    if (percent) {
+        percent.textContent = (data.percent || 0).toFixed(1) + '%%';
+    }
+
+    if (speed && data.speed) {
+        speed.textContent = formatBytes(data.speed) + '/s';
+    }
+
+    if (bytes && data.bytes_downloaded && data.total_bytes) {
+        bytes.textContent = formatBytes(data.bytes_downloaded) + ' / ' + formatBytes(data.total_bytes);
+    }
+}
+
+async function refreshCatalog() {
+    try {
+        const response = await fetch('/api/store/refresh', {
+            method: 'POST'
+        });
+
+        if (!response.ok) {
+            const data = await response.json();
+            throw new Error(data.error || 'Failed to refresh');
+        }
+
+        showNotification('Catalog refresh initiated', 'info');
+
+        // Reload after a short delay to allow refresh to complete
+        setTimeout(loadStore, 2000);
+
+    } catch (error) {
+        alert('Failed to refresh catalog: ' + error.message);
+    }
+}
+
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function showNotification(message, type) {
+    // Simple notification - can be enhanced
+    console.log('[' + type + '] ' + message);
+
+    // Create toast notification
+    const toast = document.createElement('div');
+    toast.style.cssText = 'position: fixed; bottom: 20px; right: 20px; padding: 12px 24px; border-radius: 4px; color: white; z-index: 10000; animation: slideIn 0.3s ease;';
+    toast.style.background = type === 'success' ? 'var(--success)' : type === 'error' ? 'var(--danger)' : 'var(--primary)';
+    toast.textContent = message;
+    document.body.appendChild(toast);
+
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => toast.remove(), 300);
+    }, 3000);
+}
+
+// Load store on page load
+loadStore();
 </script>
 `
 }

@@ -18,9 +18,11 @@ import (
 	"firecrackmanager/internal/database"
 	"firecrackmanager/internal/hostnet"
 	"firecrackmanager/internal/kernel"
+	"firecrackmanager/internal/kernelupdater"
 	"firecrackmanager/internal/network"
 	"firecrackmanager/internal/rootfs"
 	"firecrackmanager/internal/setup"
+	"firecrackmanager/internal/store"
 	"firecrackmanager/internal/updater"
 	"firecrackmanager/internal/vm"
 	"firecrackmanager/internal/webconsole"
@@ -196,6 +198,13 @@ func main() {
 		logger("Warning: failed to start updater: %v", err)
 	}
 
+	// Initialize kernel updater (background kernel version checker)
+	kernelUpd := kernelupdater.NewKernelUpdater(config.DataDir, db, logger)
+	if err := kernelUpd.Start(); err != nil {
+		logger("Warning: failed to start kernel updater: %v", err)
+	}
+	logger("Kernel updater initialized (checks daily at 3:30 AM)")
+
 	// Initialize rootfs scanner (background disk type detection)
 	rootfsScanner := rootfs.NewScanner(db, config.DataDir, logger)
 	rootfsScanner.Start()
@@ -204,11 +213,19 @@ func main() {
 	hostNetMgr := hostnet.NewManager(logger)
 	logger("Host network manager initialized (enabled: %v)", config.EnableHostNetworkManagement)
 
+	// Initialize store (appliance store)
+	applianceStore := store.New(config.DataDir, logger)
+	applianceStore.Start()
+	logger("Appliance store initialized")
+
 	// Initialize API server
 	apiServer := api.NewServer(db, vmMgr, netMgr, kernelMgr, upd, logger)
 	apiServer.SetHostNetManager(hostNetMgr, config.EnableHostNetworkManagement)
 	apiServer.SetBuilderDir(config.BuilderDir)
 	apiServer.SetDataDir(config.DataDir)
+	apiServer.SetStore(applianceStore)
+	apiServer.SetRootFSScanner(rootfsScanner)
+	apiServer.SetKernelUpdater(kernelUpd)
 
 	// Initialize default admin user
 	if err := apiServer.InitDefaultAdmin(); err != nil {
@@ -333,6 +350,12 @@ func main() {
 
 	// Stop updater
 	upd.Stop()
+
+	// Stop kernel updater
+	kernelUpd.Stop()
+
+	// Stop store
+	applianceStore.Stop()
 
 	// Stop rootfs scanner
 	rootfsScanner.Stop()

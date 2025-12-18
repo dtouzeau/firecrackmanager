@@ -157,8 +157,11 @@ const MainLayoutCSS = `
     --sidebar-hover: #37474f;
     --text-primary: #333;
     --text-secondary: #666;
+    --text-muted: #999;
     --border-color: #e0e0e0;
+    --border: #e0e0e0;
     --bg-secondary: #f5f5f5;
+    --card-bg: #ffffff;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -605,10 +608,14 @@ th {
 	min-width: 54px;
 }
 .badge-success { background: #1ab394; color: #FFFFFF; border:1px solid #e8f5e9; }
-.badge-danger { background: ; #ed5565;color: #FFFFFF; border:1px solid #ffebee }
+.badge-danger { background: #dc3545; color: #FFFFFF; border:1px solid #ffebee; }
 .badge-warning { background: #f8ac59 ; color:#FFFFFF; border:1px solid #fff3e0; }
 .badge-info { background: #1565c0; color: #e3f2fd;border:1px solid #e3f2fd; }
 .badge-secondary { background: #d1dade; color: #5e5e5e;font-weight: 600;border:1px solid #5e5e5e; }
+a.badge.badge-success { color: white; }
+.rfs-description { font-size: 10px; color: var(--text-secondary); margin-top: 2px; text-transform: capitalize; font-style: italic; }
+.permission-list { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+.permission-list li { padding: 2px 0; text-transform: capitalize; }
 
 /* Stats Cards (legacy) */
 .stat-card {
@@ -995,6 +1002,77 @@ td.actions {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
 }
+.appliance-name {
+    display: inline;
+    font-size: 16px;
+    font-weight: 400;
+    cursor: pointer;
+}
+.appliance-name:hover {
+    font-weight: 500;
+}
+.appliance-explain {
+    margin-left: 57px;
+    margin-top: -15px;
+    border-top: 1px solid #CCCC;
+    font-style: italic;
+    font-size: 12px;
+    color: #595858;
+}
+.appliance-description {
+    margin-left: 57px;
+    margin-top: 2px;
+    font-size: 11px;
+    color: #888;
+    font-style: italic;
+}
+.vm-title {
+    display: inline;
+    margin-left: 10px;
+    font-size: 14px;
+    font-weight: 400;
+    color: #5a5a5a;
+}
+.description-vm-title {
+    font-size: 13px;
+    color: #888;
+    font-style: italic;
+    margin-top: 5px;
+    margin-left: 0;
+}
+.edit-description-link {
+    font-size: 12px;
+    color: var(--primary);
+    font-style: normal;
+    margin-left: 8px;
+}
+.edit-description-link:hover {
+    text-decoration: underline;
+}
+tbody a:hover {
+    font-weight: normal;
+    color: #005447;
+    text-decoration: underline;
+}
+.vm-descriptions-row {
+    font-size: 11px;
+    color: #888;
+    font-style: italic;
+    margin-left: 24px;
+    margin-top: 2px;
+}
+#vmList tr td {
+    vertical-align: middle;
+}
+#vmList td:last-child,
+table th:last-child {
+    text-align: right !important;
+    width: 70px !important;
+    min-width: 70px !important;
+}
+#vmList td:last-child .action-menu {
+    display: inline-block;
+}
 `
 
 // DockerPageCSS contains styles specific to the Docker/Registry page
@@ -1182,6 +1260,65 @@ const DockerPageCSS = `
 .service-item .service-image {
     color: var(--text-secondary);
     font-size: 13px;
+}
+.service-item .service-env {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-left: 10px;
+}
+.service-item .service-env .env-badge {
+    display: inline-block;
+    padding: 2px 6px;
+    background: rgba(25, 118, 210, 0.1);
+    border-radius: 4px;
+    margin-right: 4px;
+    font-family: monospace;
+}
+
+/* Environment Variables Container */
+.env-vars-container {
+    max-height: 200px;
+    overflow-y: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 10px;
+    background: #fafafa;
+}
+.env-var-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+    align-items: center;
+}
+.env-var-row:last-child {
+    margin-bottom: 0;
+}
+.env-var-row input[type="text"] {
+    flex: 1;
+    padding: 8px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    font-size: 13px;
+    font-family: monospace;
+}
+.env-var-row input[type="text"]:first-child {
+    max-width: 150px;
+}
+.env-var-row .btn-icon {
+    padding: 6px;
+    min-width: auto;
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text-secondary);
+}
+.env-var-row .btn-icon:hover {
+    background: #f0f0f0;
+    color: var(--danger);
+}
+.env-var-row .btn-icon .material-icons {
+    font-size: 18px;
 }
 `
 

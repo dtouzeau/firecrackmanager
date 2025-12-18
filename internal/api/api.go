@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,9 +25,11 @@ import (
 	"firecrackmanager/internal/database"
 	"firecrackmanager/internal/hostnet"
 	"firecrackmanager/internal/kernel"
+	"firecrackmanager/internal/kernelupdater"
 	"firecrackmanager/internal/network"
 	"firecrackmanager/internal/proxyconfig"
 	"firecrackmanager/internal/setup"
+	"firecrackmanager/internal/store"
 	"firecrackmanager/internal/updater"
 	"firecrackmanager/internal/version"
 	"firecrackmanager/internal/vm"
@@ -46,11 +49,19 @@ type Server struct {
 	sessionCache                map[string]*database.Session
 	logger                      func(string, ...interface{})
 	updater                     *updater.Updater
+	kernelUpdater               *kernelupdater.KernelUpdater
 	migrationSrv                *vm.MigrationServer
 	dataDir                     string
 	hostNetMgr                  *hostnet.Manager
 	enableHostNetworkManagement bool
 	builderDir                  string
+	store                       *store.Store
+	rootfsScanner               RootFSScanner
+}
+
+// RootFSScanner interface for triggering rootfs scans
+type RootFSScanner interface {
+	TriggerScan()
 }
 
 func NewServer(db *database.DB, vmMgr *vm.Manager, netMgr *network.Manager, kernelMgr *kernel.Manager, upd *updater.Updater, logger func(string, ...interface{})) *Server {
@@ -72,6 +83,16 @@ func NewServer(db *database.DB, vmMgr *vm.Manager, netMgr *network.Manager, kern
 // SetBuilderDir sets the directory used for building Debian images
 func (s *Server) SetBuilderDir(dir string) {
 	s.builderDir = dir
+}
+
+// SetRootFSScanner sets the rootfs scanner for triggering scans after conversions
+func (s *Server) SetRootFSScanner(scanner RootFSScanner) {
+	s.rootfsScanner = scanner
+}
+
+// SetKernelUpdater sets the kernel updater for kernel version management
+func (s *Server) SetKernelUpdater(ku *kernelupdater.KernelUpdater) {
+	s.kernelUpdater = ku
 }
 
 // GetBuilderDir returns the current builder directory
@@ -116,23 +137,24 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/vmgroups", s.requireAuth(s.handleVMGroups))
 	s.mux.HandleFunc("/api/vmgroups/", s.requireAuth(s.handleVMGroup))
 
-	// Network routes
-	s.mux.HandleFunc("/api/networks", s.requireAuth(s.handleNetworks))
-	s.mux.HandleFunc("/api/networks/", s.requireAuth(s.handleNetwork))
-	s.mux.HandleFunc("/api/interfaces", s.requireAuth(s.handlePhysicalInterfaces))
+	// Network routes (requires networks permission)
+	s.mux.HandleFunc("/api/networks", s.requirePermission("networks", s.handleNetworks))
+	s.mux.HandleFunc("/api/networks/", s.requirePermission("networks", s.handleNetwork))
+	s.mux.HandleFunc("/api/interfaces", s.requirePermission("networks", s.handlePhysicalInterfaces))
 
-	// Kernel routes
-	s.mux.HandleFunc("/api/kernels", s.requireAuth(s.handleKernels))
-	s.mux.HandleFunc("/api/kernels/", s.requireAuth(s.handleKernel))
-	s.mux.HandleFunc("/api/kernels/download", s.requireAuth(s.handleKernelDownload))
+	// Kernel routes (requires images permission)
+	s.mux.HandleFunc("/api/kernels", s.requirePermission("images", s.handleKernels))
+	s.mux.HandleFunc("/api/kernels/", s.requirePermission("images", s.handleKernel))
+	s.mux.HandleFunc("/api/kernels/download", s.requirePermission("images", s.handleKernelDownload))
 
-	// RootFS routes
-	s.mux.HandleFunc("/api/rootfs", s.requireAuth(s.handleRootFSList))
-	s.mux.HandleFunc("/api/rootfs/", s.requireAuth(s.handleRootFS))
-	s.mux.HandleFunc("/api/rootfs/download", s.requireAuth(s.handleRootFSDownload))
-	s.mux.HandleFunc("/api/rootfs/create", s.requireAuth(s.handleRootFSCreate))
-	s.mux.HandleFunc("/api/rootfs/upload", s.requireAuth(s.handleRootFSUpload))
-	s.mux.HandleFunc("/api/rootfs/extend/", s.requireAuth(s.handleRootFSExtend))
+	// RootFS routes (requires images permission)
+	s.mux.HandleFunc("/api/rootfs", s.requirePermission("images", s.handleRootFSList))
+	s.mux.HandleFunc("/api/rootfs/", s.requirePermission("images", s.handleRootFS))
+	s.mux.HandleFunc("/api/rootfs/download", s.requirePermission("images", s.handleRootFSDownload))
+	s.mux.HandleFunc("/api/rootfs/create", s.requirePermission("images", s.handleRootFSCreate))
+	s.mux.HandleFunc("/api/rootfs/upload", s.requirePermission("images", s.handleRootFSUpload))
+	s.mux.HandleFunc("/api/rootfs/extend/", s.requirePermission("images", s.handleRootFSExtend))
+	s.mux.HandleFunc("/api/rootfs/convert-qemu", s.requirePermission("images", s.handleQemuConvert))
 
 	// User routes (admin only)
 	s.mux.HandleFunc("/api/users", s.requireAdmin(s.handleUsers))
@@ -162,6 +184,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/system/firecracker/upgrade", s.requireAdmin(s.handleFirecrackerUpgrade))
 	s.mux.HandleFunc("/api/system/jailer", s.requireAdmin(s.handleJailerConfig))
 
+	// Kernel update management
+	s.mux.HandleFunc("/api/system/kernels/check", s.requireAuth(s.handleKernelUpdateCheck))
+	s.mux.HandleFunc("/api/system/kernels/download", s.requireAdmin(s.handleKernelUpdateDownload))
+	s.mux.HandleFunc("/api/system/kernels/download/", s.requireAuth(s.handleKernelDownloadProgress))
+
 	// Ping endpoint for checking VM reachability
 	s.mux.HandleFunc("/api/ping/", s.requireAuth(s.handlePing))
 
@@ -169,18 +196,19 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/vms/console/", s.handleVMConsole)
 
 	// Registry/Container image routes
-	s.mux.HandleFunc("/api/registry/search", s.requireAuth(s.handleRegistrySearch))
-	s.mux.HandleFunc("/api/registry/convert", s.requireAuth(s.handleRegistryConvert))
-	s.mux.HandleFunc("/api/registry/convert/", s.requireAuth(s.handleRegistryConversionStatus))
-	s.mux.HandleFunc("/api/registry/jobs", s.requireAuth(s.handleRegistryJobs))
+	// Docker registry routes (requires images permission)
+	s.mux.HandleFunc("/api/registry/search", s.requirePermission("images", s.handleRegistrySearch))
+	s.mux.HandleFunc("/api/registry/convert", s.requirePermission("images", s.handleRegistryConvert))
+	s.mux.HandleFunc("/api/registry/convert/", s.requirePermission("images", s.handleRegistryConversionStatus))
+	s.mux.HandleFunc("/api/registry/jobs", s.requirePermission("images", s.handleRegistryJobs))
 
-	// Docker Compose routes
-	s.mux.HandleFunc("/api/compose/services", s.requireAuth(s.handleComposeServices))
-	s.mux.HandleFunc("/api/compose/convert", s.requireAuth(s.handleComposeConvert))
-	s.mux.HandleFunc("/api/compose/upload", s.requireAuth(s.handleComposeUpload))
+	// Docker Compose routes (requires images permission)
+	s.mux.HandleFunc("/api/compose/services", s.requirePermission("images", s.handleComposeServices))
+	s.mux.HandleFunc("/api/compose/convert", s.requirePermission("images", s.handleComposeConvert))
+	s.mux.HandleFunc("/api/compose/upload", s.requirePermission("images", s.handleComposeUpload))
 
-	// Data disk creation
-	s.mux.HandleFunc("/api/rootfs/create-data-disk", s.requireAuth(s.handleCreateDataDisk))
+	// Data disk creation (requires images permission)
+	s.mux.HandleFunc("/api/rootfs/create-data-disk", s.requirePermission("images", s.handleCreateDataDisk))
 
 	// Debian image builder
 	s.mux.HandleFunc("/api/rootfs/build-debian", s.requireAdmin(s.handleBuildDebianImage))
@@ -191,6 +219,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/system/proxy", s.requireAdmin(s.handleProxyConfig))
 	s.mux.HandleFunc("/api/system/proxy/test", s.requireAdmin(s.handleProxyTest))
 
+	// QEMU utils status and installation (admin only for install)
+	s.mux.HandleFunc("/api/system/qemu-utils", s.requireAuth(s.handleQemuUtilsStatus))
+	s.mux.HandleFunc("/api/system/qemu-utils/install", s.requireAdmin(s.handleQemuUtilsInstall))
+
 	// Migration routes (admin only)
 	s.mux.HandleFunc("/api/migration/keys", s.requireAdmin(s.handleMigrationKeys))
 	s.mux.HandleFunc("/api/migration/keys/", s.requireAdmin(s.handleMigrationKey))
@@ -200,7 +232,14 @@ func (s *Server) registerRoutes() {
 
 	// Appliances routes (exported VMs)
 	s.mux.HandleFunc("/api/appliances", s.requireAuth(s.handleAppliances))
+	s.mux.HandleFunc("/api/appliances/restore/", s.requireAuth(s.handleApplianceRestore))
 	s.mux.HandleFunc("/api/appliances/", s.requireAuth(s.handleAppliance))
+
+	// Store routes (appliance store)
+	s.mux.HandleFunc("/api/store", s.requireAuth(s.handleStore))
+	s.mux.HandleFunc("/api/store/download/", s.requireAuth(s.handleStoreDownload))
+	s.mux.HandleFunc("/api/store/progress/", s.requireAuth(s.handleStoreProgress))
+	s.mux.HandleFunc("/api/store/refresh", s.requireAuth(s.handleStoreRefresh))
 
 	// Host network management routes (admin only)
 	s.registerHostNetRoutes()
@@ -229,6 +268,31 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if session.Role != "admin" {
 			s.jsonError(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		s.db.ExtendSession(session.ID, 24*time.Hour)
+		next(w, r)
+	}
+}
+
+// requirePermission creates middleware that checks if user has a specific permission
+func (s *Server) requirePermission(permission string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := s.getSession(r)
+		if session == nil {
+			s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// Admins have all permissions
+		if session.Role == "admin" {
+			s.db.ExtendSession(session.ID, 24*time.Hour)
+			next(w, r)
+			return
+		}
+		// Check if user has the required permission from their groups
+		perms := s.db.GetUserPermissions(session.UserID, session.Role)
+		if !perms[permission] && !perms["admin"] {
+			s.jsonError(w, "Forbidden: requires "+permission+" permission", http.StatusForbidden)
 			return
 		}
 		s.db.ExtendSession(session.ID, 24*time.Hour)
@@ -374,7 +438,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		vms, err := s.db.ListVMs()
+		// Get session for access control
+		sess := s.getSession(r)
+		if sess == nil {
+			s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		// Filter VMs based on user role and group membership
+		vms, err := s.db.GetUserAccessibleVMs(sess.UserID, sess.Role)
 		if err != nil {
 			s.jsonError(w, "Failed to list VMs", http.StatusInternalServerError)
 			return
@@ -384,6 +456,7 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var req struct {
 			Name         string `json:"name"`
+			Description  string `json:"description"`
 			VCPU         int    `json:"vcpu"`
 			MemoryMB     int    `json:"memory_mb"`
 			KernelID     string `json:"kernel_id"`
@@ -432,6 +505,7 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 		vmObj := &database.VM{
 			ID:           vmID,
 			Name:         req.Name,
+			Description:  req.Description,
 			VCPU:         req.VCPU,
 			MemoryMB:     req.MemoryMB,
 			KernelPath:   kernelImg.Path,
@@ -544,10 +618,30 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		action = parts[1]
 	}
 
+	// Get session for access control
+	sess := s.getSession(r)
+	if sess == nil {
+		s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Helper to check VM access with specific permission
+	checkAccess := func(permission string) bool {
+		canAccess, err := s.db.CanUserAccessVM(sess.UserID, sess.Role, vmID, permission)
+		if err != nil || !canAccess {
+			return false
+		}
+		return true
+	}
+
 	switch action {
 	case "start":
 		if r.Method != http.MethodPost {
 			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAccess("start") {
+			s.jsonError(w, "Access denied: no permission to start this VM", http.StatusForbidden)
 			return
 		}
 		if err := s.vmMgr.StartVM(vmID); err != nil {
@@ -561,6 +655,10 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if !checkAccess("stop") {
+			s.jsonError(w, "Access denied: no permission to stop this VM", http.StatusForbidden)
+			return
+		}
 		if err := s.vmMgr.StopVM(vmID); err != nil {
 			s.jsonError(w, "Failed to stop VM: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -572,6 +670,10 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if !checkAccess("stop") {
+			s.jsonError(w, "Access denied: no permission to stop this VM", http.StatusForbidden)
+			return
+		}
 		if err := s.vmMgr.ForceStopVM(vmID); err != nil {
 			s.jsonError(w, "Failed to force stop VM: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -579,6 +681,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		s.jsonResponse(w, map[string]string{"status": "success", "message": "VM force stopped"})
 
 	case "status":
+		// Any permission grants read access to status
+		if !checkAccess("start") && !checkAccess("stop") && !checkAccess("console") {
+			s.jsonError(w, "Access denied: no permission to view this VM", http.StatusForbidden)
+			return
+		}
 		status, err := s.vmMgr.GetVMStatus(vmID)
 		if err != nil {
 			s.jsonError(w, "Failed to get status: "+err.Error(), http.StatusInternalServerError)
@@ -587,6 +694,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		s.jsonResponse(w, map[string]string{"status": status})
 
 	case "info":
+		// Any permission grants read access to info
+		if !checkAccess("start") && !checkAccess("stop") && !checkAccess("console") {
+			s.jsonError(w, "Access denied: no permission to view this VM", http.StatusForbidden)
+			return
+		}
 		info, err := s.vmMgr.GetVMInfo(vmID)
 		if err != nil {
 			s.jsonError(w, "Failed to get info: "+err.Error(), http.StatusInternalServerError)
@@ -595,6 +707,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		s.jsonResponse(w, info)
 
 	case "metrics":
+		// Any permission grants read access to metrics
+		if !checkAccess("start") && !checkAccess("stop") && !checkAccess("console") {
+			s.jsonError(w, "Access denied: no permission to view this VM", http.StatusForbidden)
+			return
+		}
 		metrics, err := s.vmMgr.GetVMMetrics(vmID)
 		if err != nil {
 			s.jsonError(w, "Failed to get metrics: "+err.Error(), http.StatusInternalServerError)
@@ -606,6 +723,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		// GET /api/vms/{id}/metrics-history?period=realtime|hour|day|week|month
 		if r.Method != http.MethodGet {
 			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// Any permission grants read access to metrics
+		if !checkAccess("start") && !checkAccess("stop") && !checkAccess("console") {
+			s.jsonError(w, "Access denied: no permission to view this VM", http.StatusForbidden)
 			return
 		}
 
@@ -707,6 +829,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case "snapshot":
+		// Check snapshot permission
+		if !checkAccess("snapshot") {
+			s.jsonError(w, "Access denied: no permission for snapshots on this VM", http.StatusForbidden)
+			return
+		}
 		// POST /api/vms/{id}/snapshot - create snapshot
 		if r.Method == http.MethodPost {
 			result, err := s.vmMgr.CreateSnapshot(vmID)
@@ -736,6 +863,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 
 	case "snapshots":
+		// Check snapshot permission
+		if !checkAccess("snapshot") {
+			s.jsonError(w, "Access denied: no permission for snapshots on this VM", http.StatusForbidden)
+			return
+		}
 		// Handle /api/vms/{id}/snapshots/{snapshotId} routes
 		if len(parts) < 3 {
 			s.jsonError(w, "Snapshot ID required", http.StatusBadRequest)
@@ -818,8 +950,20 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Parse request body for optional description
+		var exportReq struct {
+			Description string `json:"description"`
+		}
+		if r.Body != nil {
+			json.NewDecoder(r.Body).Decode(&exportReq)
+		}
+
 		// Generate operation key for progress tracking
 		opKey := fmt.Sprintf("export-%s-%d", vmID, time.Now().UnixNano())
+
+		// Capture user ID for ownership and description
+		ownerID := sess.UserID
+		exportDescription := exportReq.Description
 
 		// Initialize progress
 		s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
@@ -842,7 +986,7 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 				// Continue with export even if shrink fails
 			}
 
-			archivePath, err := s.vmMgr.ExportVMWithProgress(vmID, opKey)
+			archivePath, err := s.vmMgr.ExportVMWithProgress(vmID, opKey, exportDescription)
 			if err != nil {
 				s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
 					Status: "error",
@@ -855,6 +999,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			// Get just the filename for the download URL
 			filename := filepath.Base(archivePath)
 			s.db.AddVMLog(vmID, "info", "VM exported to "+filename)
+
+			// Set appliance owner
+			if err := s.db.SetApplianceOwner(filename, ownerID); err != nil {
+				s.logger("Warning: failed to set appliance owner: %v", err)
+			}
 
 			s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
 				Status:     "completed",
@@ -1305,6 +1454,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 	case "":
 		switch r.Method {
 		case http.MethodGet:
+			// Any permission grants read access
+			if !checkAccess("start") && !checkAccess("stop") && !checkAccess("console") {
+				s.jsonError(w, "Access denied: no permission to view this VM", http.StatusForbidden)
+				return
+			}
 			vmObj, err := s.db.GetVM(vmID)
 			if err != nil {
 				s.jsonError(w, "Failed to get VM", http.StatusInternalServerError)
@@ -1317,8 +1471,14 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			s.jsonResponse(w, vmObj)
 
 		case http.MethodPut:
+			// Edit permission required for modification
+			if !checkAccess("edit") {
+				s.jsonError(w, "Access denied: no permission to edit this VM", http.StatusForbidden)
+				return
+			}
 			var req struct {
 				Name         string  `json:"name"`
+				Description  *string `json:"description"` // Pointer to allow clearing
 				VCPU         int     `json:"vcpu"`
 				MemoryMB     int     `json:"memory_mb"`
 				KernelArgs   string  `json:"kernel_args"`
@@ -1345,6 +1505,9 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 
 			if req.Name != "" {
 				vmObj.Name = req.Name
+			}
+			if req.Description != nil {
+				vmObj.Description = *req.Description
 			}
 			if req.VCPU > 0 {
 				vmObj.VCPU = req.VCPU
@@ -1417,6 +1580,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			s.jsonResponse(w, map[string]interface{}{"status": "success", "vm": vmObj})
 
 		case http.MethodDelete:
+			// Only admins can delete VMs
+			if sess.Role != "admin" {
+				s.jsonError(w, "Access denied: only admins can delete VMs", http.StatusForbidden)
+				return
+			}
 			vmObj, err := s.db.GetVM(vmID)
 			if err != nil || vmObj == nil {
 				s.jsonError(w, "VM not found", http.StatusNotFound)
@@ -2117,6 +2285,13 @@ func (s *Server) handleVMSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get session for access control
+	sess := s.getSession(r)
+	if sess == nil {
+		s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	params := &database.VMSearchParams{}
 
 	if r.Method == http.MethodGet {
@@ -2142,10 +2317,34 @@ func (s *Server) handleVMSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	vms, err := s.db.SearchVMs(params)
+	// Get all VMs matching the search criteria
+	allVMs, err := s.db.SearchVMs(params)
 	if err != nil {
 		s.jsonError(w, "Search failed: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Filter VMs based on user access (unless admin)
+	var vms []*database.VM
+	if sess.Role == "admin" {
+		vms = allVMs
+	} else {
+		// Get list of VM IDs the user can access
+		accessibleVMs, err := s.db.GetUserAccessibleVMs(sess.UserID, sess.Role)
+		if err != nil {
+			s.jsonError(w, "Failed to check access", http.StatusInternalServerError)
+			return
+		}
+		accessibleIDs := make(map[string]bool)
+		for _, v := range accessibleVMs {
+			accessibleIDs[v.ID] = true
+		}
+		// Filter search results
+		for _, vm := range allVMs {
+			if accessibleIDs[vm.ID] {
+				vms = append(vms, vm)
+			}
+		}
 	}
 
 	// Enrich results with additional info
@@ -4363,6 +4562,13 @@ func (s *Server) handleVMConsole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check console permission
+	canAccess, err := s.db.CanUserAccessVM(session.UserID, session.Role, vmID, "console")
+	if err != nil || !canAccess {
+		http.Error(w, "Access denied: no permission to access console for this VM", http.StatusForbidden)
+		return
+	}
+
 	// Check if VM exists and is running
 	if !s.vmMgr.IsRunning(vmID) {
 		http.Error(w, "VM is not running", http.StatusBadRequest)
@@ -4871,6 +5077,11 @@ func (s *Server) SetDataDir(dataDir string) {
 	s.dataDir = dataDir
 }
 
+// SetStore sets the store manager
+func (s *Server) SetStore(st *store.Store) {
+	s.store = st
+}
+
 // Migration API handlers
 
 // handleMigrationKeys handles GET/POST /api/migration/keys
@@ -5248,12 +5459,24 @@ type ApplianceInfo struct {
 	Size         int64  `json:"size"`
 	ExportedDate string `json:"exported_date"`
 	VMName       string `json:"vm_name"`
+	Description  string `json:"description,omitempty"`
+	OwnerID      int    `json:"owner_id,omitempty"`
+	OwnerName    string `json:"owner_name,omitempty"`
+	CanWrite     bool   `json:"can_write"`
+	IsOwner      bool   `json:"is_owner"`
 }
 
 // handleAppliances handles GET /api/appliances - list all exported VM appliances
 func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get session for access control
+	sess := s.getSession(r)
+	if sess == nil {
+		s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -5265,9 +5488,25 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Collect existing filenames for orphan cleanup
+	var existingFiles []string
+
 	var appliances []ApplianceInfo
 	for _, file := range files {
 		if file.IsDir() || !strings.HasSuffix(file.Name(), ".fcrack") {
+			continue
+		}
+
+		filename := file.Name()
+		existingFiles = append(existingFiles, filename)
+
+		// Check access using CanUserAccessAppliance which handles:
+		// - Admins have full access
+		// - No privileges defined = available to everyone (read-only)
+		// - Owner has full access
+		// - Users/groups with explicit privileges
+		canAccess, _, _ := s.db.CanUserAccessAppliance(filename, sess.UserID, sess.Role)
+		if !canAccess {
 			continue
 		}
 
@@ -5278,7 +5517,6 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 
 		// Parse filename to extract VM name and date
 		// Format: <vm-name>-<YYYYMMDD-HHMMSS>.fcrack
-		filename := file.Name()
 		baseName := strings.TrimSuffix(filename, ".fcrack")
 
 		vmName := baseName
@@ -5299,13 +5537,40 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 		// Replace underscores back to spaces for display
 		vmName = strings.ReplaceAll(vmName, "_", " ")
 
+		// Get write/owner info (we already checked canAccess above)
+		_, canWrite, isOwner := s.db.CanUserAccessAppliance(filename, sess.UserID, sess.Role)
+
+		// Get owner info
+		ownerID, _ := s.db.GetApplianceOwner(filename)
+		ownerName := ""
+		if ownerID > 0 {
+			if owner, err := s.db.GetUser(ownerID); err == nil && owner != nil {
+				ownerName = owner.Username
+			}
+		}
+
+		// Read description (checks metadata file first, then archive manifest)
+		description := s.vmMgr.GetApplianceDescription(filename)
+
 		appliances = append(appliances, ApplianceInfo{
 			Filename:     filename,
 			Size:         info.Size(),
 			ExportedDate: exportedDate,
 			VMName:       vmName,
+			Description:  description,
+			OwnerID:      ownerID,
+			OwnerName:    ownerName,
+			CanWrite:     canWrite,
+			IsOwner:      isOwner,
 		})
 	}
+
+	// Cleanup orphan privileges (async)
+	go func() {
+		if deleted, err := s.db.CleanupOrphanAppliancePrivileges(existingFiles); err == nil && deleted > 0 {
+			s.logger("Cleaned up %d orphan appliance privileges", deleted)
+		}
+	}()
 
 	// Sort by date descending (most recent first)
 	sort.Slice(appliances, func(i, j int) bool {
@@ -5321,10 +5586,23 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 // handleAppliance handles individual appliance operations
 // DELETE /api/appliances/{filename} - delete an appliance
 // GET /api/appliances/{filename} - download an appliance
-func (s *Server) handleAppliance(w http.ResponseWriter, r *http.Request) {
+// handleApplianceRestore handles POST /api/appliances/restore/{filename} - restore appliance to a new VM
+func (s *Server) handleApplianceRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get session for access control
+	sess := s.getSession(r)
+	if sess == nil {
+		s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	// Extract filename from path
-	path := strings.TrimPrefix(r.URL.Path, "/api/appliances/")
-	filename := strings.TrimSuffix(path, "/")
+	filename := strings.TrimPrefix(r.URL.Path, "/api/appliances/restore/")
+	filename = strings.TrimSuffix(filename, "/")
 
 	if filename == "" {
 		s.jsonError(w, "Filename is required", http.StatusBadRequest)
@@ -5345,11 +5623,151 @@ func (s *Server) handleAppliance(w http.ResponseWriter, r *http.Request) {
 
 	filePath := filepath.Join(s.vmMgr.GetDataDir(), filename)
 
+	// Check if file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		s.jsonError(w, "Appliance not found", http.StatusNotFound)
+		return
+	}
+
+	// Check user access
+	canAccess, _, _ := s.db.CanUserAccessAppliance(filename, sess.UserID, sess.Role)
+	if !canAccess {
+		s.jsonError(w, "Access denied", http.StatusForbidden)
+		return
+	}
+
+	// Parse request body for VM name and kernel
+	var req struct {
+		Name     string `json:"name"`
+		KernelID string `json:"kernel_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.jsonError(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Name == "" {
+		s.jsonError(w, "Name is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.KernelID == "" {
+		s.jsonError(w, "Kernel ID is required", http.StatusBadRequest)
+		return
+	}
+
+	// Verify kernel exists
+	kernelImg, err := s.db.GetKernelImage(req.KernelID)
+	if err != nil || kernelImg == nil {
+		s.jsonError(w, "Kernel not found", http.StatusBadRequest)
+		return
+	}
+
+	// Generate operation key for progress tracking
+	opKey := fmt.Sprintf("restore-%s-%d", filename, time.Now().UnixNano())
+
+	// Initialize progress
+	s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
+		Status:  "starting",
+		Stage:   "Preparing restore...",
+		Percent: 0,
+	})
+
+	// Run import in background
+	go func() {
+		newVM, err := s.vmMgr.ImportVMWithProgress(filePath, req.Name, req.KernelID, opKey)
+		if err != nil {
+			s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
+				Status: "error",
+				Stage:  "Restore failed",
+				Error:  err.Error(),
+			})
+			return
+		}
+
+		s.db.AddVMLog(newVM.ID, "info", "VM restored from appliance "+filename)
+		s.logger("Restored appliance %s as VM %s (%s)", filename, req.Name, newVM.ID)
+
+		s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
+			Status:     "completed",
+			Stage:      "Restore completed",
+			Percent:    100,
+			ResultID:   newVM.ID,
+			ResultName: newVM.Name,
+		})
+	}()
+
+	s.jsonResponse(w, map[string]interface{}{
+		"status":       "started",
+		"progress_key": opKey,
+	})
+}
+
+// GET /api/appliances/{filename}/privileges - list privileges
+// POST /api/appliances/{filename}/privileges - add privilege
+// DELETE /api/appliances/{filename}/privileges/{type}/{id} - remove privilege
+func (s *Server) handleAppliance(w http.ResponseWriter, r *http.Request) {
+	// Get session for access control
+	sess := s.getSession(r)
+	if sess == nil {
+		s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract filename and action from path
+	path := strings.TrimPrefix(r.URL.Path, "/api/appliances/")
+	parts := strings.Split(strings.TrimSuffix(path, "/"), "/")
+	filename := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
+
+	// URL decode the filename
+	if decoded, err := url.PathUnescape(filename); err == nil {
+		filename = decoded
+	}
+
+	if filename == "" {
+		s.jsonError(w, "Filename is required", http.StatusBadRequest)
+		return
+	}
+
+	// Security check: ensure filename doesn't contain path traversal
+	if strings.Contains(filename, "/") || strings.Contains(filename, "\\") || strings.Contains(filename, "..") {
+		s.jsonError(w, "Invalid filename", http.StatusBadRequest)
+		return
+	}
+
+	// Ensure it's a .fcrack file
+	if !strings.HasSuffix(filename, ".fcrack") {
+		s.jsonError(w, "Invalid file type", http.StatusBadRequest)
+		return
+	}
+
+	filePath := filepath.Join(s.vmMgr.GetDataDir(), filename)
+
+	// Check if file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		s.jsonError(w, "Appliance not found", http.StatusNotFound)
+		return
+	}
+
+	// Check user access
+	canAccess, canWrite, isOwner := s.db.CanUserAccessAppliance(filename, sess.UserID, sess.Role)
+
+	// Handle privilege management routes
+	if action == "privileges" {
+		s.handleAppliancePrivileges(w, r, filename, sess, isOwner, parts)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		// Download the appliance file
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			s.jsonError(w, "Appliance not found", http.StatusNotFound)
+		// Download the appliance file - requires read access
+		if !canAccess {
+			s.jsonError(w, "Access denied", http.StatusForbidden)
 			return
 		}
 
@@ -5358,9 +5776,9 @@ func (s *Server) handleAppliance(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, filePath)
 
 	case http.MethodDelete:
-		// Delete the appliance file
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			s.jsonError(w, "Appliance not found", http.StatusNotFound)
+		// Delete the appliance file - requires write access
+		if !canWrite {
+			s.jsonError(w, "Access denied: write permission required", http.StatusForbidden)
 			return
 		}
 
@@ -5369,13 +5787,379 @@ func (s *Server) handleAppliance(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Delete associated privileges
+		if err := s.db.DeleteAppliancePrivileges(filename); err != nil {
+			s.logger("Warning: failed to delete appliance privileges: %v", err)
+		}
+
 		s.logger("Deleted appliance: %s", filename)
 		s.jsonResponse(w, map[string]interface{}{
 			"success": true,
 			"message": "Appliance deleted successfully",
 		})
 
+	case http.MethodPut:
+		// Update appliance description - requires write access
+		if !canWrite {
+			s.jsonError(w, "Access denied: write permission required", http.StatusForbidden)
+			return
+		}
+
+		var req struct {
+			Description string `json:"description"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if err := s.vmMgr.UpdateApplianceDescription(filename, req.Description); err != nil {
+			s.jsonError(w, "Failed to update description: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.logger("Updated description for appliance: %s", filename)
+		s.jsonResponse(w, map[string]interface{}{
+			"success": true,
+			"message": "Description updated successfully",
+		})
+
 	default:
 		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleAppliancePrivileges manages privileges for an appliance
+func (s *Server) handleAppliancePrivileges(w http.ResponseWriter, r *http.Request, filename string, sess *database.Session, isOwner bool, parts []string) {
+	// Only owner or admin can manage privileges
+	if !isOwner && sess.Role != "admin" {
+		s.jsonError(w, "Access denied: only owner can manage privileges", http.StatusForbidden)
+		return
+	}
+
+	ownerID, _ := s.db.GetApplianceOwner(filename)
+	if ownerID == 0 {
+		ownerID = sess.UserID // Fallback to current user if no owner set
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		// List privileges
+		privileges, err := s.db.GetAppliancePrivileges(filename)
+		if err != nil {
+			s.jsonError(w, "Failed to get privileges: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.jsonResponse(w, map[string]interface{}{
+			"privileges": privileges,
+			"owner_id":   ownerID,
+		})
+
+	case http.MethodPost:
+		// Add privilege
+		var req struct {
+			UserID   *int    `json:"user_id"`
+			GroupID  *string `json:"group_id"`
+			CanRead  bool    `json:"can_read"`
+			CanWrite bool    `json:"can_write"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if req.UserID == nil && req.GroupID == nil {
+			s.jsonError(w, "Either user_id or group_id is required", http.StatusBadRequest)
+			return
+		}
+
+		if req.UserID != nil && req.GroupID != nil {
+			s.jsonError(w, "Cannot specify both user_id and group_id", http.StatusBadRequest)
+			return
+		}
+
+		if req.UserID != nil {
+			if err := s.db.AddApplianceUserPrivilege(filename, ownerID, *req.UserID, req.CanRead, req.CanWrite); err != nil {
+				s.jsonError(w, "Failed to add privilege: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			if err := s.db.AddApplianceGroupPrivilege(filename, ownerID, *req.GroupID, req.CanRead, req.CanWrite); err != nil {
+				s.jsonError(w, "Failed to add privilege: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		s.jsonResponse(w, map[string]interface{}{
+			"success": true,
+			"message": "Privilege added successfully",
+		})
+
+	case http.MethodDelete:
+		// Remove privilege: DELETE /api/appliances/{filename}/privileges/user/{id} or /group/{id}
+		if len(parts) < 4 {
+			s.jsonError(w, "Invalid path: expected /privileges/user/{id} or /privileges/group/{id}", http.StatusBadRequest)
+			return
+		}
+
+		privType := parts[2] // "user" or "group"
+		privID := parts[3]
+
+		switch privType {
+		case "user":
+			userID, err := strconv.Atoi(privID)
+			if err != nil {
+				s.jsonError(w, "Invalid user ID", http.StatusBadRequest)
+				return
+			}
+			if err := s.db.RemoveApplianceUserPrivilege(filename, userID); err != nil {
+				s.jsonError(w, "Failed to remove privilege: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		case "group":
+			if err := s.db.RemoveApplianceGroupPrivilege(filename, privID); err != nil {
+				s.jsonError(w, "Failed to remove privilege: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		default:
+			s.jsonError(w, "Invalid privilege type: expected 'user' or 'group'", http.StatusBadRequest)
+			return
+		}
+
+		s.jsonResponse(w, map[string]interface{}{
+			"success": true,
+			"message": "Privilege removed successfully",
+		})
+
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// Store API handlers
+
+// handleStore handles GET /api/store - list store catalog
+func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.store == nil {
+		s.jsonError(w, "Store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	catalog := s.store.GetCatalog()
+	lastFetch := s.store.GetLastFetch()
+
+	s.jsonResponse(w, map[string]interface{}{
+		"appliances":  catalog,
+		"last_update": lastFetch.Format(time.RFC3339),
+		"count":       len(catalog),
+	})
+}
+
+// handleStoreDownload handles POST /api/store/download/{name} - start download
+func (s *Server) handleStoreDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.store == nil {
+		s.jsonError(w, "Store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Extract appliance name from URL
+	path := strings.TrimPrefix(r.URL.Path, "/api/store/download/")
+	name := strings.TrimSuffix(path, "/")
+	if name == "" {
+		s.jsonError(w, "Appliance name required", http.StatusBadRequest)
+		return
+	}
+
+	// Start download
+	key, err := s.store.StartDownload(name)
+	if err != nil {
+		s.jsonError(w, "Failed to start download: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.logger("Store download started: %s (key: %s)", name, key)
+
+	s.jsonResponse(w, map[string]interface{}{
+		"success": true,
+		"key":     key,
+		"message": "Download started",
+	})
+}
+
+// handleStoreProgress handles GET /api/store/progress/{key} - get download progress
+func (s *Server) handleStoreProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.store == nil {
+		s.jsonError(w, "Store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Extract progress key from URL
+	path := strings.TrimPrefix(r.URL.Path, "/api/store/progress/")
+	key := strings.TrimSuffix(path, "/")
+	if key == "" {
+		s.jsonError(w, "Progress key required", http.StatusBadRequest)
+		return
+	}
+
+	progress := s.store.GetDownloadProgress(key)
+	if progress == nil {
+		s.jsonError(w, "Download not found", http.StatusNotFound)
+		return
+	}
+
+	s.jsonResponse(w, progress)
+}
+
+// handleStoreRefresh handles POST /api/store/refresh - force catalog refresh
+func (s *Server) handleStoreRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.store == nil {
+		s.jsonError(w, "Store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	s.store.RefreshCatalog()
+
+	s.jsonResponse(w, map[string]interface{}{
+		"success": true,
+		"message": "Catalog refresh initiated",
+	})
+}
+
+// Kernel Update Handlers
+
+// handleKernelUpdateCheck handles GET /api/system/kernels/check
+// Returns kernel update status and available versions
+func (s *Server) handleKernelUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		// Force refresh check
+		if s.kernelUpdater == nil {
+			s.jsonError(w, "Kernel updater not initialized", http.StatusServiceUnavailable)
+			return
+		}
+		go s.kernelUpdater.CheckForUpdates()
+		s.jsonResponse(w, map[string]interface{}{
+			"status":  "checking",
+			"message": "Kernel version check initiated",
+		})
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.kernelUpdater == nil {
+		s.jsonError(w, "Kernel updater not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Get cached version info from kernel updater
+	cache := s.kernelUpdater.GetCache()
+
+	result := map[string]interface{}{
+		"installed_kernels":   cache.InstalledKernels,
+		"available_kernels":   cache.AvailableKernels,
+		"update_available":    cache.UpdateAvailable,
+		"latest_version":      cache.LatestVersion,
+		"current_max_version": cache.CurrentMaxVersion,
+		"checked_at":          cache.CheckedAt,
+	}
+
+	if cache.Error != "" {
+		result["error"] = cache.Error
+	}
+
+	s.jsonResponse(w, result)
+}
+
+// handleKernelUpdateDownload handles POST /api/system/kernels/download
+// Starts downloading a specific kernel version
+func (s *Server) handleKernelUpdateDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.kernelUpdater == nil {
+		s.jsonError(w, "Kernel updater not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.jsonError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Version == "" {
+		s.jsonError(w, "Version is required", http.StatusBadRequest)
+		return
+	}
+
+	// Start download
+	jobID, err := s.kernelUpdater.DownloadKernel(req.Version)
+	if err != nil {
+		s.jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.jsonResponse(w, map[string]interface{}{
+		"status":  "started",
+		"job_id":  jobID,
+		"message": "Kernel download started",
+	})
+}
+
+// handleKernelDownloadProgress handles GET /api/system/kernels/download/{jobID}
+// Returns download progress for a kernel download job
+func (s *Server) handleKernelDownloadProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.kernelUpdater == nil {
+		s.jsonError(w, "Kernel updater not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Extract job ID from path
+	path := strings.TrimPrefix(r.URL.Path, "/api/system/kernels/download/")
+	jobID := strings.TrimSuffix(path, "/")
+
+	if jobID == "" {
+		s.jsonError(w, "Job ID is required", http.StatusBadRequest)
+		return
+	}
+
+	progress := s.kernelUpdater.GetDownloadProgress(jobID)
+	if progress == nil {
+		s.jsonError(w, "Download job not found", http.StatusNotFound)
+		return
+	}
+
+	s.jsonResponse(w, progress)
 }

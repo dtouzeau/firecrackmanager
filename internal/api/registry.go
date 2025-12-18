@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"firecrackmanager/internal/Compose2FC"
+	"firecrackmanager/internal/QemuToFC"
 	"firecrackmanager/internal/RegistryToFC"
 	"firecrackmanager/internal/database"
 	"firecrackmanager/internal/network"
@@ -441,6 +443,11 @@ func (s *Server) runConversion(job *ConversionJob, name string, injectMinInit bo
 	conversionJobsMu.Unlock()
 
 	s.logger("Image conversion completed: %s -> %s (%d GiB)", job.ImageRef, outputPath, result.EstimatedGiB)
+
+	// Trigger rootfs scan to update the UI immediately
+	if s.rootfsScanner != nil {
+		s.rootfsScanner.TriggerScan()
+	}
 }
 
 // handleRegistryConversionStatus handles GET /api/registry/convert/{jobId}
@@ -581,7 +588,8 @@ func (s *Server) handleComposeServices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	services, err := Compose2FC.ListServices(req.ComposePath)
+	// Get detailed service info including environment variables
+	services, err := Compose2FC.GetServicesDetails(req.ComposePath)
 	if err != nil {
 		s.jsonError(w, fmt.Sprintf("Failed to list services: %v", err), http.StatusBadRequest)
 		return
@@ -601,11 +609,12 @@ func (s *Server) handleComposeConvert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ComposePath   string `json:"compose_path"`
-		ServiceName   string `json:"service_name"`
-		OutputName    string `json:"output_name"`
-		UseDocker     bool   `json:"use_docker"`
-		InjectMinInit bool   `json:"inject_min_init"`
+		ComposePath   string            `json:"compose_path"`
+		ServiceName   string            `json:"service_name"`
+		OutputName    string            `json:"output_name"`
+		UseDocker     bool              `json:"use_docker"`
+		InjectMinInit bool              `json:"inject_min_init"`
+		Environment   map[string]string `json:"environment"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -636,7 +645,7 @@ func (s *Server) handleComposeConvert(w http.ResponseWriter, r *http.Request) {
 	conversionJobsMu.Unlock()
 
 	// Start conversion in background
-	go s.runComposeConversion(job, req.ComposePath, req.ServiceName, req.OutputName, req.UseDocker, req.InjectMinInit)
+	go s.runComposeConversion(job, req.ComposePath, req.ServiceName, req.OutputName, req.UseDocker, req.InjectMinInit, req.Environment)
 
 	s.jsonResponse(w, map[string]interface{}{
 		"job_id":  jobID,
@@ -646,7 +655,7 @@ func (s *Server) handleComposeConvert(w http.ResponseWriter, r *http.Request) {
 }
 
 // runComposeConversion executes compose-based conversion in background
-func (s *Server) runComposeConversion(job *ConversionJob, composePath, serviceName, outputName string, useDocker, injectMinInit bool) {
+func (s *Server) runComposeConversion(job *ConversionJob, composePath, serviceName, outputName string, useDocker, injectMinInit bool, environment map[string]string) {
 	updateJob := func(status string, progress int, message string) {
 		conversionJobsMu.Lock()
 		job.Status = status
@@ -684,6 +693,7 @@ func (s *Server) runComposeConversion(job *ConversionJob, composePath, serviceNa
 			OutputImage:   outputPath,
 			InjectMinInit: injectMinInit,
 			UseDocker:     useDocker,
+			Environment:   environment,
 		},
 		progressCb,
 	)
@@ -752,6 +762,11 @@ func (s *Server) runComposeConversion(job *ConversionJob, composePath, serviceNa
 	conversionJobsMu.Unlock()
 
 	s.logger("Compose conversion completed: %s (service: %s) -> %s", composePath, result.ServiceName, outputPath)
+
+	// Trigger rootfs scan to update the UI immediately
+	if s.rootfsScanner != nil {
+		s.rootfsScanner.TriggerScan()
+	}
 }
 
 // handleComposeUpload handles POST /api/compose/upload
@@ -1335,4 +1350,258 @@ func CleanupOldJobs() {
 		}
 		debianBuildJobsMu.Unlock()
 	}
+}
+
+// handleQemuConvert handles POST /api/rootfs/convert-qemu
+// Converts QEMU/VMDK disk images to Firecracker ext4 rootfs
+func (s *Server) handleQemuConvert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse multipart form with a max memory of 64MB (rest will be written to temp files)
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		s.jsonError(w, "Failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Get output name from form
+	outputName := r.FormValue("name")
+	if outputName == "" {
+		s.jsonError(w, "name is required", http.StatusBadRequest)
+		return
+	}
+
+	// Sanitize output name
+	outputName = strings.ReplaceAll(outputName, " ", "-")
+	outputName = strings.ReplaceAll(outputName, "/", "-")
+
+	// Get the uploaded file
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		s.jsonError(w, "Failed to get uploaded file: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Validate file extension
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if ext != ".qcow2" && ext != ".vmdk" && ext != ".raw" && ext != ".img" {
+		s.jsonError(w, "Unsupported file format. Supported formats: .qcow2, .vmdk, .raw, .img", http.StatusBadRequest)
+		return
+	}
+
+	// Check if output already exists
+	rootfsDir := s.kernelMgr.GetRootFSDir()
+	outputPath := filepath.Join(rootfsDir, outputName+".ext4")
+	if _, err := os.Stat(outputPath); err == nil {
+		s.jsonError(w, "A rootfs with this name already exists", http.StatusConflict)
+		return
+	}
+
+	// Save uploaded file to temp location
+	tempDir, err := os.MkdirTemp("", "qemu-upload-*")
+	if err != nil {
+		s.jsonError(w, "Failed to create temp directory: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	tempPath := filepath.Join(tempDir, header.Filename)
+	tempFile, err := os.Create(tempPath)
+	if err != nil {
+		os.RemoveAll(tempDir)
+		s.jsonError(w, "Failed to create temp file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	written, err := io.Copy(tempFile, file)
+	tempFile.Close()
+	if err != nil {
+		os.RemoveAll(tempDir)
+		s.jsonError(w, "Failed to save uploaded file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.logger("QEMU image uploaded: %s (%d bytes)", header.Filename, written)
+
+	// Generate job ID
+	jobID := generateID()
+
+	// Create job entry
+	job := &ConversionJob{
+		ID:        jobID,
+		ImageRef:  fmt.Sprintf("qemu:%s", header.Filename),
+		Status:    "pending",
+		Progress:  0,
+		Message:   "Queued",
+		StartedAt: time.Now(),
+	}
+
+	conversionJobsMu.Lock()
+	conversionJobs[jobID] = job
+	conversionJobsMu.Unlock()
+
+	// Start conversion in background
+	go s.runQemuConversion(job, tempPath, tempDir, outputName, rootfsDir)
+
+	s.jsonResponse(w, map[string]interface{}{
+		"job_id":  jobID,
+		"status":  "pending",
+		"message": "QEMU image conversion started",
+	})
+}
+
+// runQemuConversion executes the QEMU/VMDK to ext4 conversion in background
+func (s *Server) runQemuConversion(job *ConversionJob, inputPath, tempDir, outputName, rootfsDir string) {
+	// Cleanup temp files when done
+	defer os.RemoveAll(tempDir)
+
+	updateJob := func(status string, progress int, message string) {
+		conversionJobsMu.Lock()
+		job.Status = status
+		job.Progress = progress
+		job.Message = message
+		conversionJobsMu.Unlock()
+	}
+
+	updateJob("running", 5, "Starting QEMU image conversion")
+
+	outputPath := filepath.Join(rootfsDir, outputName+".ext4")
+
+	// Progress callback
+	progressCb := func(pct int, msg string) {
+		updateJob("running", pct, msg)
+	}
+
+	// Run conversion
+	result, err := QemuToFC.ConvertQemuImage(inputPath, QemuToFC.ConvertOptions{
+		OutputImage: outputPath,
+		Label:       "rootfs",
+		TempDir:     tempDir,
+	}, progressCb)
+
+	if err != nil {
+		conversionJobsMu.Lock()
+		job.Status = "failed"
+		job.Progress = 0
+		job.Message = "Conversion failed"
+		job.Error = err.Error()
+		job.EndedAt = time.Now()
+		conversionJobsMu.Unlock()
+		s.logger("QEMU image conversion failed: %v", err)
+		return
+	}
+
+	// Get file size
+	fileInfo, err := os.Stat(outputPath)
+	if err != nil {
+		conversionJobsMu.Lock()
+		job.Status = "failed"
+		job.Progress = 0
+		job.Message = "Failed to get file info"
+		job.Error = err.Error()
+		job.EndedAt = time.Now()
+		conversionJobsMu.Unlock()
+		s.logger("Failed to get file info: %v", err)
+		return
+	}
+
+	// Register the rootfs in database
+	rootfsID := generateID()
+	rootfs := &database.RootFS{
+		ID:        rootfsID,
+		Name:      outputName,
+		Path:      outputPath,
+		Size:      fileInfo.Size(),
+		Format:    "ext4",
+		BaseImage: fmt.Sprintf("qemu:%s", result.InputFormat),
+	}
+
+	if err := s.db.CreateRootFS(rootfs); err != nil {
+		conversionJobsMu.Lock()
+		job.Status = "failed"
+		job.Progress = 0
+		job.Message = "Failed to register rootfs"
+		job.Error = err.Error()
+		job.EndedAt = time.Now()
+		conversionJobsMu.Unlock()
+		s.logger("Failed to register rootfs: %v", err)
+		return
+	}
+
+	// Update job with success
+	conversionJobsMu.Lock()
+	job.Status = "completed"
+	job.Progress = 100
+	job.Message = "Conversion completed"
+	job.EndedAt = time.Now()
+	job.Result = &ConversionResult{
+		RootFSID:     rootfsID,
+		ImageRef:     result.InputPath,
+		OutputPath:   result.OutputImage,
+		EstimatedGiB: result.SizeGiB,
+	}
+	conversionJobsMu.Unlock()
+
+	s.logger("QEMU image conversion completed: %s -> %s (%d GiB)", result.InputPath, outputPath, result.SizeGiB)
+}
+
+// handleQemuUtilsStatus handles GET /api/system/qemu-utils
+// Returns the status of qemu-utils availability
+func (s *Server) handleQemuUtilsStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	status := QemuToFC.CheckQemuUtils()
+	s.jsonResponse(w, status)
+}
+
+// handleQemuUtilsInstall handles POST /api/system/qemu-utils/install
+// Attempts to install qemu-utils package
+func (s *Server) handleQemuUtilsInstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check if already available
+	if QemuToFC.IsAvailable() {
+		s.jsonResponse(w, map[string]interface{}{
+			"status":  "success",
+			"message": "qemu-utils is already installed",
+		})
+		return
+	}
+
+	// Check if we can install
+	status := QemuToFC.CheckQemuUtils()
+	if !status.CanInstall {
+		s.jsonError(w, "Cannot install qemu-utils: "+status.Error, http.StatusBadRequest)
+		return
+	}
+
+	// Attempt installation
+	s.logger("Installing qemu-utils...")
+	if err := QemuToFC.InstallQemuUtils(); err != nil {
+		s.logger("Failed to install qemu-utils: %v", err)
+		s.jsonError(w, "Installation failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Verify installation
+	newStatus := QemuToFC.CheckQemuUtils()
+	if !newStatus.Available {
+		s.jsonError(w, "Installation completed but qemu-img still not available", http.StatusInternalServerError)
+		return
+	}
+
+	s.logger("qemu-utils installed successfully: %s", newStatus.Version)
+	s.jsonResponse(w, map[string]interface{}{
+		"status":  "success",
+		"message": "qemu-utils installed successfully",
+		"version": newStatus.Version,
+	})
 }

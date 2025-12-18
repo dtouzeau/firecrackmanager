@@ -1868,6 +1868,7 @@ func (m *Manager) GetVMInfo(vmID string) (map[string]interface{}, error) {
 	info := map[string]interface{}{
 		"id":            vm.ID,
 		"name":          vm.Name,
+		"description":   vm.Description,
 		"vcpu":          vm.VCPU,
 		"memory_mb":     vm.MemoryMB,
 		"status":        vm.Status,
@@ -1879,6 +1880,7 @@ func (m *Manager) GetVMInfo(vmID string) (map[string]interface{}, error) {
 		"mac_address":   vm.MacAddress,
 		"ip_address":    vm.IPAddress,
 		"tap_device":    vm.TapDevice,
+		"dns_servers":   vm.DNSServers,
 		"created_at":    vm.CreatedAt,
 		"updated_at":    vm.UpdatedAt,
 		"error_message": vm.ErrorMessage,
@@ -2659,6 +2661,7 @@ type VMExportManifest struct {
 	Version      string            `json:"version"`
 	ExportedAt   string            `json:"exported_at"`
 	Name         string            `json:"name"`
+	Description  string            `json:"description,omitempty"`
 	VCPU         int               `json:"vcpu"`
 	MemoryMB     int               `json:"memory_mb"`
 	KernelArgs   string            `json:"kernel_args"`
@@ -3028,11 +3031,11 @@ func (m *Manager) GenerateMAC() string {
 
 // ExportVM creates a .fcrack archive containing the VM configuration, rootfs, and snapshots
 func (m *Manager) ExportVM(vmID string) (string, error) {
-	return m.ExportVMWithProgress(vmID, "")
+	return m.ExportVMWithProgress(vmID, "", "")
 }
 
 // ExportVMWithProgress creates a .fcrack archive with progress tracking
-func (m *Manager) ExportVMWithProgress(vmID, opKey string) (string, error) {
+func (m *Manager) ExportVMWithProgress(vmID, opKey, description string) (string, error) {
 	// Helper to update progress
 	updateProgress := func(stage string, copied, total int64) {
 		if opKey == "" {
@@ -3168,11 +3171,18 @@ func (m *Manager) ExportVMWithProgress(vmID, opKey string) (string, error) {
 
 	updateProgress("Creating manifest...", totalSize, totalSize)
 
+	// Use provided description or fall back to VM description
+	exportDescription := description
+	if exportDescription == "" {
+		exportDescription = vm.Description
+	}
+
 	// Create manifest
 	manifest := VMExportManifest{
 		Version:      "1.0",
 		ExportedAt:   time.Now().Format(time.RFC3339),
 		Name:         vm.Name,
+		Description:  exportDescription,
 		VCPU:         vm.VCPU,
 		MemoryMB:     vm.MemoryMB,
 		KernelArgs:   vm.KernelArgs,
@@ -3372,6 +3382,7 @@ func (m *Manager) ImportVM(archivePath, newName, kernelID string) (*database.VM,
 	newVM := &database.VM{
 		ID:           newID,
 		Name:         vmName,
+		Description:  manifest.Description,
 		VCPU:         manifest.VCPU,
 		MemoryMB:     manifest.MemoryMB,
 		KernelPath:   kernelPath,
@@ -3394,9 +3405,406 @@ func (m *Manager) ImportVM(archivePath, newName, kernelID string) (*database.VM,
 	return newVM, nil
 }
 
+// ImportVMWithProgress imports a VM from a .fcrack archive with progress tracking
+func (m *Manager) ImportVMWithProgress(archivePath, newName, kernelID, progressKey string) (*database.VM, error) {
+	m.logger("Importing VM from %s with progress tracking...", archivePath)
+
+	// Get archive file size for progress calculation
+	archiveInfo, err := os.Stat(archivePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat archive: %w", err)
+	}
+	totalSize := archiveInfo.Size()
+
+	m.SetOperationProgress(progressKey, &OperationProgress{
+		Status:  "starting",
+		Stage:   "Opening archive...",
+		Percent: 0,
+	})
+
+	// Open archive
+	archiveFile, err := os.Open(archivePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open archive: %w", err)
+	}
+	defer archiveFile.Close()
+
+	m.SetOperationProgress(progressKey, &OperationProgress{
+		Status:  "extracting",
+		Stage:   "Decompressing archive...",
+		Percent: 5,
+	})
+
+	// Create gzip reader
+	gzReader, err := gzip.NewReader(archiveFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read gzip: %w", err)
+	}
+	defer gzReader.Close()
+
+	// Create tar reader
+	tarReader := tar.NewReader(gzReader)
+
+	// Temp directory for extraction
+	tempDir, err := os.MkdirTemp("", "fcrack-import-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	m.SetOperationProgress(progressKey, &OperationProgress{
+		Status:  "extracting",
+		Stage:   "Extracting files...",
+		Percent: 10,
+	})
+
+	// Extract all files with progress
+	var extractedSize int64
+	fileCount := 0
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read archive: %w", err)
+		}
+
+		targetPath := filepath.Join(tempDir, header.Name)
+
+		// Create directories as needed
+		if header.Typeflag == tar.TypeDir {
+			if err := os.MkdirAll(targetPath, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create directory: %w", err)
+			}
+			continue
+		}
+
+		// Ensure parent directory exists
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return nil, fmt.Errorf("failed to create parent directory: %w", err)
+		}
+
+		// Extract file
+		outFile, err := os.Create(targetPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create file: %w", err)
+		}
+
+		written, err := io.Copy(outFile, tarReader)
+		outFile.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract file: %w", err)
+		}
+
+		extractedSize += written
+		fileCount++
+
+		// Update progress (10-60% for extraction)
+		progress := 10.0 + float64(extractedSize)/float64(totalSize)*50.0
+		if progress > 60.0 {
+			progress = 60.0
+		}
+		m.SetOperationProgress(progressKey, &OperationProgress{
+			Status:  "extracting",
+			Stage:   fmt.Sprintf("Extracting files... (%d files)", fileCount),
+			Percent: progress,
+		})
+	}
+
+	m.SetOperationProgress(progressKey, &OperationProgress{
+		Status:  "processing",
+		Stage:   "Reading manifest...",
+		Percent: 65,
+	})
+
+	// Read manifest
+	manifestPath := filepath.Join(tempDir, "manifest.json")
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("manifest not found in archive")
+	}
+
+	var manifest VMExportManifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return nil, fmt.Errorf("invalid manifest: %w", err)
+	}
+
+	// Determine VM name
+	vmName := newName
+	if vmName == "" {
+		vmName = manifest.Name
+	}
+
+	// Check if name already exists and append suffix if needed
+	baseName := vmName
+	suffix := 1
+	for {
+		existingVM, _ := m.db.GetVMByName(vmName)
+		if existingVM == nil {
+			break
+		}
+		vmName = fmt.Sprintf("%s-%d", baseName, suffix)
+		suffix++
+	}
+
+	m.SetOperationProgress(progressKey, &OperationProgress{
+		Status:  "processing",
+		Stage:   "Verifying kernel...",
+		Percent: 70,
+	})
+
+	// Get kernel
+	var kernelPath string
+	if kernelID != "" {
+		kernel, err := m.db.GetKernelImage(kernelID)
+		if err != nil || kernel == nil {
+			return nil, fmt.Errorf("kernel %s not found", kernelID)
+		}
+		kernelPath = kernel.Path
+	} else {
+		kernel, err := m.db.GetDefaultKernel()
+		if err != nil || kernel == nil {
+			return nil, fmt.Errorf("no default kernel available, please specify a kernel_id")
+		}
+		kernelPath = kernel.Path
+	}
+
+	// Generate new VM ID
+	newID := generateVMID()
+
+	m.SetOperationProgress(progressKey, &OperationProgress{
+		Status:  "copying",
+		Stage:   "Copying rootfs...",
+		Percent: 75,
+	})
+
+	// Move rootfs to final location
+	rootfsDir := filepath.Join(m.dataDir, "rootfs")
+	rootfsExt := filepath.Ext(manifest.RootFSName)
+	newRootFSPath := filepath.Join(rootfsDir, fmt.Sprintf("%s%s", newID, rootfsExt))
+
+	srcRootFS := filepath.Join(tempDir, manifest.RootFSName)
+
+	// Verify checksum if available
+	if expectedChecksum, ok := manifest.Checksum[manifest.RootFSName]; ok {
+		m.SetOperationProgress(progressKey, &OperationProgress{
+			Status:  "verifying",
+			Stage:   "Verifying checksum...",
+			Percent: 80,
+		})
+		actualChecksum, err := calculateMD5(srcRootFS)
+		if err != nil {
+			m.logger("Warning: could not verify rootfs checksum: %v", err)
+		} else if actualChecksum != expectedChecksum {
+			return nil, fmt.Errorf("rootfs checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
+		}
+	}
+
+	m.SetOperationProgress(progressKey, &OperationProgress{
+		Status:  "copying",
+		Stage:   "Copying rootfs to destination...",
+		Percent: 85,
+	})
+
+	// Copy rootfs to destination
+	if err := copyFile(srcRootFS, newRootFSPath); err != nil {
+		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
+	}
+
+	// Copy snapshots
+	if len(manifest.Snapshots) > 0 {
+		m.SetOperationProgress(progressKey, &OperationProgress{
+			Status:  "copying",
+			Stage:   "Copying snapshots...",
+			Percent: 90,
+		})
+
+		snapshotsDir := filepath.Join(tempDir, "snapshots")
+		for _, snap := range manifest.Snapshots {
+			srcVmstate := filepath.Join(snapshotsDir, fmt.Sprintf("vmstate-%s.fc", snap.ID))
+			dstVmstate := filepath.Join(rootfsDir, fmt.Sprintf("snapshot-%s-vmstate-%s.fc", newID, snap.ID))
+			if err := copyFile(srcVmstate, dstVmstate); err != nil {
+				m.logger("Warning: failed to copy snapshot vmstate: %v", err)
+			}
+
+			srcMemfile := filepath.Join(snapshotsDir, fmt.Sprintf("memfile-%s.fc", snap.ID))
+			dstMemfile := filepath.Join(rootfsDir, fmt.Sprintf("snapshot-%s-memfile-%s.fc", newID, snap.ID))
+			if err := copyFile(srcMemfile, dstMemfile); err != nil {
+				m.logger("Warning: failed to copy snapshot memfile: %v", err)
+			}
+		}
+	}
+
+	m.SetOperationProgress(progressKey, &OperationProgress{
+		Status:  "finalizing",
+		Stage:   "Creating VM record...",
+		Percent: 95,
+	})
+
+	// Create VM record
+	newVM := &database.VM{
+		ID:           newID,
+		Name:         vmName,
+		Description:  manifest.Description,
+		VCPU:         manifest.VCPU,
+		MemoryMB:     manifest.MemoryMB,
+		KernelPath:   kernelPath,
+		RootFSPath:   newRootFSPath,
+		KernelArgs:   manifest.KernelArgs,
+		DNSServers:   manifest.DNSServers,
+		SnapshotType: manifest.SnapshotType,
+		Status:       "stopped",
+	}
+
+	if err := m.db.CreateVM(newVM); err != nil {
+		os.Remove(newRootFSPath)
+		return nil, fmt.Errorf("failed to create VM record: %w", err)
+	}
+
+	m.logger("Imported VM %s from %s", vmName, filepath.Base(archivePath))
+	m.db.AddVMLog(newID, "info", fmt.Sprintf("VM imported from %s", filepath.Base(archivePath)))
+
+	return newVM, nil
+}
+
 // GetExportPath returns the path to an exported .fcrack file
 func (m *Manager) GetExportPath(filename string) string {
 	return filepath.Join(m.dataDir, filename)
+}
+
+// ReadApplianceManifest reads the manifest from a .fcrack archive
+func (m *Manager) ReadApplianceManifest(filename string) (*VMExportManifest, error) {
+	archivePath := filepath.Join(m.dataDir, filename)
+
+	archiveFile, err := os.Open(archivePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open archive: %w", err)
+	}
+	defer archiveFile.Close()
+
+	gzReader, err := gzip.NewReader(archiveFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read gzip: %w", err)
+	}
+	defer gzReader.Close()
+
+	tarReader := tar.NewReader(gzReader)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read archive: %w", err)
+		}
+
+		if header.Name == "manifest.json" {
+			manifestData, err := io.ReadAll(tarReader)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read manifest: %w", err)
+			}
+
+			var manifest VMExportManifest
+			if err := json.Unmarshal(manifestData, &manifest); err != nil {
+				return nil, fmt.Errorf("invalid manifest: %w", err)
+			}
+			return &manifest, nil
+		}
+	}
+
+	return nil, fmt.Errorf("manifest not found in archive")
+}
+
+// ApplianceMetadata stores metadata for appliances in a separate file for fast access
+type ApplianceMetadata struct {
+	Descriptions map[string]string `json:"descriptions"`
+}
+
+// getApplianceMetadataPath returns the path to the appliance metadata file
+func (m *Manager) getApplianceMetadataPath() string {
+	return filepath.Join(m.dataDir, "appliance-metadata.json")
+}
+
+// loadApplianceMetadata loads the appliance metadata from disk
+func (m *Manager) loadApplianceMetadata() (*ApplianceMetadata, error) {
+	metaPath := m.getApplianceMetadataPath()
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &ApplianceMetadata{Descriptions: make(map[string]string)}, nil
+		}
+		return nil, err
+	}
+
+	var meta ApplianceMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	if meta.Descriptions == nil {
+		meta.Descriptions = make(map[string]string)
+	}
+	return &meta, nil
+}
+
+// saveApplianceMetadata saves the appliance metadata to disk
+func (m *Manager) saveApplianceMetadata(meta *ApplianceMetadata) error {
+	metaPath := m.getApplianceMetadataPath()
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(metaPath, data, 0644)
+}
+
+// GetApplianceDescription gets the description for an appliance (checks metadata file first, then archive)
+func (m *Manager) GetApplianceDescription(filename string) string {
+	// First check metadata file (fast)
+	meta, err := m.loadApplianceMetadata()
+	if err == nil {
+		if desc, ok := meta.Descriptions[filename]; ok {
+			return desc
+		}
+	}
+
+	// Fall back to reading from archive manifest (slower)
+	manifest, err := m.ReadApplianceManifest(filename)
+	if err == nil && manifest != nil {
+		return manifest.Description
+	}
+
+	return ""
+}
+
+// UpdateApplianceDescription updates the description in the metadata file (fast, no archive rewrite)
+func (m *Manager) UpdateApplianceDescription(filename, description string) error {
+	// Verify the appliance file exists
+	archivePath := filepath.Join(m.dataDir, filename)
+	if _, err := os.Stat(archivePath); os.IsNotExist(err) {
+		return fmt.Errorf("appliance not found: %s", filename)
+	}
+
+	// Load existing metadata
+	meta, err := m.loadApplianceMetadata()
+	if err != nil {
+		return fmt.Errorf("failed to load metadata: %w", err)
+	}
+
+	// Update description
+	if description == "" {
+		delete(meta.Descriptions, filename)
+	} else {
+		meta.Descriptions[filename] = description
+	}
+
+	// Save metadata
+	if err := m.saveApplianceMetadata(meta); err != nil {
+		return fmt.Errorf("failed to save metadata: %w", err)
+	}
+
+	m.logger("Updated description for appliance %s", filename)
+	return nil
 }
 
 // AttachDisk creates a new disk, formats it with ext4, and prepares it for VM attachment

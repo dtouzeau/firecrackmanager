@@ -67,6 +67,9 @@ type Options struct {
 	// when UseDocker == false. Leave empty to use direct connection or environment
 	// variables (HTTP_PROXY/HTTPS_PROXY) via default transport.
 	RegistryProxy string
+	// Environment variables to inject into the init script
+	// These will be exported before the application starts
+	Environment map[string]string
 }
 
 // Result contains build outputs & metadata.
@@ -138,7 +141,9 @@ func BuildExt4FromComposeWithProgress(ctx context.Context, opts Options, progres
 
 	reportProgress(20, "Preparing to export image")
 
-	// Export filesystem tar (daemon or registry)
+	// Export filesystem tar (daemon or registry) and get image config
+	var imgConfig *ImageConfig
+
 	if opts.UseDocker {
 		// Support compose build: requires a Docker-compatible daemon.
 		if buildCfg != nil {
@@ -149,7 +154,9 @@ func BuildExt4FromComposeWithProgress(ctx context.Context, opts Options, progres
 			}
 		}
 		reportProgress(40, "Exporting image via Docker")
-		if err := exportImageTarViaDocker(ctx, img, tarPath); err != nil {
+		var err error
+		imgConfig, err = exportImageTarViaDocker(ctx, img, tarPath)
+		if err != nil {
 			return nil, err
 		}
 	} else {
@@ -174,7 +181,9 @@ func BuildExt4FromComposeWithProgress(ctx context.Context, opts Options, progres
 		}
 
 		reportProgress(30, "Pulling image from registry: "+img)
-		if err := exportImageTarViaRegistry(img, tarPath, craneOpts...); err != nil {
+		var err error
+		imgConfig, err = exportImageTarViaRegistry(img, tarPath, craneOpts...)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -223,7 +232,7 @@ func BuildExt4FromComposeWithProgress(ctx context.Context, opts Options, progres
 
 	if opts.InjectMinInit {
 		reportProgress(90, "Installing minimal init")
-		if err := installMinInit(mnt); err != nil {
+		if err := installMinInit(mnt, opts.Environment, imgConfig); err != nil {
 			return nil, err
 		}
 	}
@@ -509,7 +518,7 @@ func mkdev(major, minor int64) uint64 {
 
 /* -------------------- Minimal init -------------------- */
 
-func installMinInit(root string) error {
+func installMinInit(root string, environment map[string]string, imgConfig *ImageConfig) error {
 	initPath := filepath.Join(root, "sbin", "init")
 	if _, err := os.Stat(initPath); err == nil {
 		// real init exists; don't replace
@@ -518,13 +527,189 @@ func installMinInit(root string) error {
 	if err := os.MkdirAll(filepath.Dir(initPath), 0o755); err != nil {
 		return err
 	}
-	script := `#!/bin/sh
+
+	// Build environment exports - start with image's environment
+	var envExports strings.Builder
+	envMap := make(map[string]string)
+
+	// First, add image's environment variables
+	if imgConfig != nil && len(imgConfig.Env) > 0 {
+		for _, env := range imgConfig.Env {
+			parts := strings.SplitN(env, "=", 2)
+			if len(parts) == 2 {
+				envMap[parts[0]] = parts[1]
+			}
+		}
+	}
+
+	// Then, override with compose environment variables
+	for k, v := range environment {
+		envMap[k] = v
+	}
+
+	if len(envMap) > 0 {
+		envExports.WriteString("\n# Environment variables\n")
+		// Sort keys for consistent output
+		keys := make([]string, 0, len(envMap))
+		for k := range envMap {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := envMap[k]
+			// Escape single quotes in values
+			escapedVal := strings.ReplaceAll(v, "'", "'\\''")
+			envExports.WriteString(fmt.Sprintf("export %s='%s'\n", k, escapedVal))
+		}
+		envExports.WriteString("\n")
+	}
+
+	// Determine the command to run
+	var cmdLine string
+	var workDir string
+
+	if imgConfig != nil {
+		workDir = imgConfig.WorkingDir
+
+		// Build command from ENTRYPOINT + CMD (Docker convention)
+		// ENTRYPOINT provides the executable, CMD provides default arguments
+		var cmdParts []string
+		if len(imgConfig.Entrypoint) > 0 {
+			cmdParts = append(cmdParts, imgConfig.Entrypoint...)
+		}
+		if len(imgConfig.Cmd) > 0 {
+			cmdParts = append(cmdParts, imgConfig.Cmd...)
+		}
+
+		if len(cmdParts) > 0 {
+			// Quote each argument properly for shell
+			var quotedParts []string
+			for _, part := range cmdParts {
+				// Escape single quotes and wrap in single quotes
+				escaped := strings.ReplaceAll(part, "'", "'\\''")
+				quotedParts = append(quotedParts, "'"+escaped+"'")
+			}
+			cmdLine = strings.Join(quotedParts, " ")
+		}
+	}
+
+	// Fallback to /bin/sh if no command is specified
+	if cmdLine == "" {
+		cmdLine = "/bin/sh"
+	}
+
+	// Build the working directory change
+	var cdLine string
+	if workDir != "" {
+		cdLine = fmt.Sprintf("cd '%s' 2>/dev/null || true\n", strings.ReplaceAll(workDir, "'", "'\\''"))
+	}
+
+	// Build user switch command if needed
+	var userSwitch string
+	if imgConfig != nil && imgConfig.User != "" && imgConfig.User != "root" && imgConfig.User != "0" {
+		// Escape single quotes in the command for embedding in su -c '...'
+		escapedCmd := strings.ReplaceAll(cmdLine, "'", "'\"'\"'")
+		escapedCd := ""
+		if workDir != "" {
+			escapedCd = fmt.Sprintf("cd %s && ", strings.ReplaceAll(workDir, "'", "'\"'\"'"))
+		}
+		// Use su if available, otherwise try setpriv
+		userSwitch = fmt.Sprintf(`
+# Switch to user: %s
+if command -v su >/dev/null 2>&1; then
+    exec su -s /bin/sh '%s' -c '%s%s'
+elif command -v setpriv >/dev/null 2>&1; then
+    exec setpriv --reuid='%s' --regid='%s' --init-groups -- %s
+fi
+# Fallback: run as root if user switch fails
+`, imgConfig.User, imgConfig.User, escapedCd, escapedCmd, imgConfig.User, imgConfig.User, cmdLine)
+	}
+
+	script := fmt.Sprintf(`#!/bin/sh
+# Compose2FC minimal init - compatible with containerized applications
+set -e
+
+echo "[init] Starting minimal init..."
+
+# Mount essential filesystems
 mount -t proc proc /proc 2>/dev/null || true
 mount -t sysfs sys /sys 2>/dev/null || true
-mount -t devtmpfs dev /dev 2>/dev/null || true
-echo "[compose2fc] minimal init started; exec /bin/sh"
-exec /bin/sh
-`
+
+# Mount devtmpfs or create device nodes manually
+if ! mount -t devtmpfs dev /dev 2>/dev/null; then
+    # Fallback: create essential device nodes
+    mkdir -p /dev
+    [ -e /dev/null ] || mknod -m 666 /dev/null c 1 3
+    [ -e /dev/zero ] || mknod -m 666 /dev/zero c 1 5
+    [ -e /dev/full ] || mknod -m 666 /dev/full c 1 7
+    [ -e /dev/random ] || mknod -m 666 /dev/random c 1 8
+    [ -e /dev/urandom ] || mknod -m 666 /dev/urandom c 1 9
+    [ -e /dev/tty ] || mknod -m 666 /dev/tty c 5 0
+    [ -e /dev/console ] || mknod -m 600 /dev/console c 5 1
+    [ -e /dev/ptmx ] || mknod -m 666 /dev/ptmx c 5 2
+fi
+
+# Create /dev/pts for PTY support
+mkdir -p /dev/pts 2>/dev/null || true
+mount -t devpts devpts /dev/pts -o gid=5,mode=620 2>/dev/null || true
+
+# Create /dev/shm for shared memory (required by many apps including Node.js)
+mkdir -p /dev/shm 2>/dev/null || true
+mount -t tmpfs tmpfs /dev/shm -o mode=1777 2>/dev/null || true
+
+# Setup /tmp with proper permissions
+mkdir -p /tmp 2>/dev/null || true
+chmod 1777 /tmp 2>/dev/null || true
+mount -t tmpfs tmpfs /tmp -o mode=1777 2>/dev/null || true
+
+# Setup /run for runtime data
+mkdir -p /run 2>/dev/null || true
+mount -t tmpfs tmpfs /run -o mode=755 2>/dev/null || true
+
+# Set hostname
+hostname firecracker 2>/dev/null || true
+
+# Setup loopback interface
+ip link set lo up 2>/dev/null || true
+
+# Setup networking if eth0 exists
+if [ -e /sys/class/net/eth0 ]; then
+    ip link set eth0 up 2>/dev/null || true
+    # Try DHCP if udhcpc is available and no IP is configured
+    if ! ip addr show eth0 | grep -q 'inet '; then
+        if command -v udhcpc >/dev/null 2>&1; then
+            udhcpc -i eth0 -q -f -n 2>/dev/null &
+        fi
+    fi
+fi
+
+# Setup DNS resolver if /etc/resolv.conf doesn't exist or is empty
+if [ ! -s /etc/resolv.conf ]; then
+    # Try to get DNS from kernel command line or use defaults
+    mkdir -p /etc 2>/dev/null || true
+    cat > /etc/resolv.conf << 'DNSEOF'
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+DNSEOF
+fi
+
+# Create /etc/hosts if missing
+if [ ! -f /etc/hosts ]; then
+    cat > /etc/hosts << 'HOSTSEOF'
+127.0.0.1   localhost
+::1         localhost ip6-localhost ip6-loopback
+HOSTSEOF
+fi
+
+# Ensure HOME is set
+export HOME="${HOME:-/root}"
+%s
+echo "[init] Environment configured"
+%s
+echo "[init] Starting application: %s"
+%sexec %s
+`, envExports.String(), cdLine, cmdLine, userSwitch, cmdLine)
 	return os.WriteFile(initPath, []byte(script), 0o755)
 }
 
@@ -570,10 +755,20 @@ func requireRoot() error {
 
 /* -------------------- Image export backends -------------------- */
 
+// ImageConfig holds the extracted configuration from a container image
+type ImageConfig struct {
+	Entrypoint []string
+	Cmd        []string
+	Env        []string
+	WorkingDir string
+	User       string
+}
+
 // exportImageTarViaRegistry pulls an image from a registry and writes a merged
 // filesystem tar to destTar. Uses ~/.docker/config.json creds if present.
 // Extra crane options can be supplied (e.g., transport with proxy).
-func exportImageTarViaRegistry(imageRef, destTar string, copts ...crane.Option) error {
+// Returns the image configuration (ENTRYPOINT, CMD, ENV, etc.)
+func exportImageTarViaRegistry(imageRef, destTar string, copts ...crane.Option) (*ImageConfig, error) {
 	// Accept bare names like "redis" -> docker.io/library/redis"
 	if !strings.Contains(imageRef, "/") && !strings.Contains(imageRef, ".") {
 		imageRef = "docker.io/library/" + imageRef
@@ -582,31 +777,90 @@ func exportImageTarViaRegistry(imageRef, destTar string, copts ...crane.Option) 
 	// Pull the image
 	img, err := crane.Pull(imageRef, copts...)
 	if err != nil {
-		return fmt.Errorf("pull %q: %w", imageRef, err)
+		return nil, fmt.Errorf("pull %q: %w", imageRef, err)
+	}
+
+	// Extract image configuration
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("get config: %w", err)
+	}
+
+	imgConfig := &ImageConfig{}
+	if cfg != nil && cfg.Config.Entrypoint != nil {
+		imgConfig.Entrypoint = cfg.Config.Entrypoint
+	}
+	if cfg != nil && cfg.Config.Cmd != nil {
+		imgConfig.Cmd = cfg.Config.Cmd
+	}
+	if cfg != nil && cfg.Config.Env != nil {
+		imgConfig.Env = cfg.Config.Env
+	}
+	if cfg != nil {
+		imgConfig.WorkingDir = cfg.Config.WorkingDir
+		imgConfig.User = cfg.Config.User
 	}
 
 	// Export merged filesystem as a tar
 	f, err := os.Create(destTar)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
-	return crane.Export(img, f)
+	if err := crane.Export(img, f); err != nil {
+		return nil, err
+	}
+	return imgConfig, nil
 }
 
 // exportImageTarViaDocker exports an image via Docker CLI (fallback when SDK not available)
-func exportImageTarViaDocker(ctx context.Context, img, destTar string) error {
+// Returns the image configuration (ENTRYPOINT, CMD, ENV, etc.)
+func exportImageTarViaDocker(ctx context.Context, img, destTar string) (*ImageConfig, error) {
 	// Pull image first
 	pullCmd := exec.CommandContext(ctx, "docker", "pull", img)
 	if out, err := pullCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("docker pull %q: %v: %s", img, err, string(out))
+		return nil, fmt.Errorf("docker pull %q: %v: %s", img, err, string(out))
+	}
+
+	// Extract image configuration using docker inspect
+	imgConfig := &ImageConfig{}
+	inspectCmd := exec.CommandContext(ctx, "docker", "inspect", "--format",
+		`{{json .Config.Entrypoint}}||{{json .Config.Cmd}}||{{json .Config.Env}}||{{.Config.WorkingDir}}||{{.Config.User}}`, img)
+	inspectOut, err := inspectCmd.Output()
+	if err == nil {
+		parts := strings.Split(strings.TrimSpace(string(inspectOut)), "||")
+		if len(parts) >= 5 {
+			// Parse Entrypoint (JSON array or null)
+			if ep := strings.TrimSpace(parts[0]); ep != "null" && ep != "" {
+				var entrypoint []string
+				if err := parseJSONArray(ep, &entrypoint); err == nil {
+					imgConfig.Entrypoint = entrypoint
+				}
+			}
+			// Parse Cmd (JSON array or null)
+			if cmd := strings.TrimSpace(parts[1]); cmd != "null" && cmd != "" {
+				var cmdArr []string
+				if err := parseJSONArray(cmd, &cmdArr); err == nil {
+					imgConfig.Cmd = cmdArr
+				}
+			}
+			// Parse Env (JSON array or null)
+			if env := strings.TrimSpace(parts[2]); env != "null" && env != "" {
+				var envArr []string
+				if err := parseJSONArray(env, &envArr); err == nil {
+					imgConfig.Env = envArr
+				}
+			}
+			imgConfig.WorkingDir = strings.TrimSpace(parts[3])
+			imgConfig.User = strings.TrimSpace(parts[4])
+		}
 	}
 
 	// Create temporary container
 	createCmd := exec.CommandContext(ctx, "docker", "create", img)
 	createOut, err := createCmd.Output()
 	if err != nil {
-		return fmt.Errorf("docker create: %v", err)
+		return nil, fmt.Errorf("docker create: %v", err)
 	}
 	containerID := strings.TrimSpace(string(createOut))
 
@@ -620,15 +874,62 @@ func exportImageTarViaDocker(ctx context.Context, img, destTar string) error {
 	exportCmd := exec.CommandContext(ctx, "docker", "export", containerID)
 	tarFile, err := os.Create(destTar)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tarFile.Close()
 
 	exportCmd.Stdout = tarFile
 	if err := exportCmd.Run(); err != nil {
-		return fmt.Errorf("docker export: %v", err)
+		return nil, fmt.Errorf("docker export: %v", err)
 	}
 
+	return imgConfig, nil
+}
+
+// parseJSONArray parses a JSON array string into a slice
+func parseJSONArray(s string, v *[]string) error {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "null" {
+		return nil
+	}
+	// Simple JSON array parsing without importing encoding/json
+	s = strings.TrimPrefix(s, "[")
+	s = strings.TrimSuffix(s, "]")
+	if s == "" {
+		return nil
+	}
+	// Split by comma, handling quoted strings
+	var result []string
+	var current strings.Builder
+	inQuote := false
+	escaped := false
+	for _, r := range s {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if r == ',' && !inQuote {
+			if str := strings.TrimSpace(current.String()); str != "" {
+				result = append(result, str)
+			}
+			current.Reset()
+			continue
+		}
+		current.WriteRune(r)
+	}
+	if str := strings.TrimSpace(current.String()); str != "" {
+		result = append(result, str)
+	}
+	*v = result
 	return nil
 }
 
@@ -652,11 +953,112 @@ func proxyTransport(proxyURL string) (http.RoundTripper, error) {
 
 /* -------------------- Convenience helpers -------------------- */
 
+// ServiceDetails contains full details of a compose service
+type ServiceDetails struct {
+	Name        string            `json:"name"`
+	Image       string            `json:"image,omitempty"`
+	HasBuild    bool              `json:"has_build"`
+	Environment map[string]string `json:"environment,omitempty"`
+	Ports       []string          `json:"ports,omitempty"`
+	Command     string            `json:"command,omitempty"`
+	Entrypoint  string            `json:"entrypoint,omitempty"`
+	WorkingDir  string            `json:"working_dir,omitempty"`
+	User        string            `json:"user,omitempty"`
+}
+
 // ListServices returns the list of service names in a docker-compose.yml
 func ListServices(composePath string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return listComposeServices(ctx, composePath)
+}
+
+// GetServicesDetails returns detailed info about all services in a docker-compose.yml
+func GetServicesDetails(composePath string) ([]ServiceDetails, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return getServicesDetails(ctx, composePath)
+}
+
+func getServicesDetails(ctx context.Context, composePath string) ([]ServiceDetails, error) {
+	opts, err := cli.NewProjectOptions(
+		[]string{composePath},
+		cli.WithWorkingDirectory(filepath.Dir(composePath)),
+		cli.WithOsEnv,
+	)
+	if err != nil {
+		return nil, err
+	}
+	project, err := opts.LoadProject(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var services []ServiceDetails
+	for name, svc := range project.Services {
+		svcName := svc.Name
+		if svcName == "" {
+			svcName = name
+		}
+
+		details := ServiceDetails{
+			Name:     svcName,
+			Image:    svc.Image,
+			HasBuild: svc.Build != nil,
+		}
+
+		// Extract environment variables
+		if svc.Environment != nil {
+			details.Environment = make(map[string]string)
+			for k, v := range svc.Environment {
+				if v != nil {
+					details.Environment[k] = *v
+				} else {
+					details.Environment[k] = ""
+				}
+			}
+		}
+
+		// Extract ports
+		if len(svc.Ports) > 0 {
+			for _, p := range svc.Ports {
+				portStr := ""
+				if p.HostIP != "" {
+					portStr = p.HostIP + ":"
+				}
+				portStr += fmt.Sprintf("%s:%s", p.Published, p.Target)
+				if p.Protocol != "" && p.Protocol != "tcp" {
+					portStr += "/" + p.Protocol
+				}
+				details.Ports = append(details.Ports, portStr)
+			}
+		}
+
+		// Extract command
+		if len(svc.Command) > 0 {
+			details.Command = strings.Join(svc.Command, " ")
+		}
+
+		// Extract entrypoint
+		if len(svc.Entrypoint) > 0 {
+			details.Entrypoint = strings.Join(svc.Entrypoint, " ")
+		}
+
+		// Extract working dir
+		details.WorkingDir = svc.WorkingDir
+
+		// Extract user
+		details.User = svc.User
+
+		services = append(services, details)
+	}
+
+	// Sort by name for consistent ordering
+	sort.Slice(services, func(i, j int) bool {
+		return services[i].Name < services[j].Name
+	})
+
+	return services, nil
 }
 
 func listComposeServices(ctx context.Context, composePath string) ([]string, error) {

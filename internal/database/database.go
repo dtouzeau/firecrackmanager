@@ -19,6 +19,7 @@ type DB struct {
 type VM struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
+	Description  string    `json:"description"`
 	VCPU         int       `json:"vcpu"`
 	MemoryMB     int       `json:"memory_mb"`
 	KernelPath   string    `json:"kernel_path"`
@@ -247,6 +248,21 @@ type MigrationKey struct {
 	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
 }
 
+// AppliancePrivilege represents access privileges for exported VM appliances
+type AppliancePrivilege struct {
+	ID        int       `json:"id"`
+	Filename  string    `json:"filename"`
+	OwnerID   int       `json:"owner_id"`
+	UserID    *int      `json:"user_id,omitempty"`  // nil if group-based privilege
+	GroupID   *string   `json:"group_id,omitempty"` // nil if user-based privilege
+	CanRead   bool      `json:"can_read"`
+	CanWrite  bool      `json:"can_write"`
+	CreatedAt time.Time `json:"created_at"`
+	// Joined fields for display
+	Username  string `json:"username,omitempty"`
+	GroupName string `json:"group_name,omitempty"`
+}
+
 func New(dbPath string) (*DB, error) {
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
@@ -381,6 +397,8 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_vm_disks_vm_id ON vm_disks(vm_id)`,
 		// Migration: Add autorun column to vms table
 		`ALTER TABLE vms ADD COLUMN autorun BOOLEAN DEFAULT 0`,
+		// Migration: Add description column to vms table
+		`ALTER TABLE vms ADD COLUMN description TEXT DEFAULT ''`,
 		// Groups table for privilege management
 		`CREATE TABLE IF NOT EXISTS groups (
 			id TEXT PRIMARY KEY,
@@ -562,6 +580,24 @@ func (d *DB) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_vm_networks_vm_id ON vm_networks(vm_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_vm_networks_network_id ON vm_networks(network_id)`,
+		// Appliance privileges table
+		`CREATE TABLE IF NOT EXISTS appliance_privileges (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			filename TEXT NOT NULL,
+			owner_id INTEGER NOT NULL,
+			user_id INTEGER,
+			group_id TEXT,
+			can_read BOOLEAN DEFAULT 1,
+			can_write BOOLEAN DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_appliance_privileges_filename ON appliance_privileges(filename)`,
+		`CREATE INDEX IF NOT EXISTS idx_appliance_privileges_owner ON appliance_privileges(owner_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_appliance_privileges_user ON appliance_privileges(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_appliance_privileges_group ON appliance_privileges(group_id)`,
 	}
 
 	for _, migration := range migrations {
@@ -582,10 +618,10 @@ func (d *DB) CreateVM(vm *VM) error {
 	defer d.mu.Unlock()
 
 	_, err := d.db.Exec(`
-		INSERT INTO vms (id, name, vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
+		INSERT INTO vms (id, name, description, vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
 			network_id, mac_address, ip_address, dns_servers, snapshot_type, tap_device, socket_path, status, pid, autorun, error_message)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		vm.ID, vm.Name, vm.VCPU, vm.MemoryMB, vm.KernelPath, vm.RootFSPath, vm.KernelArgs,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		vm.ID, vm.Name, vm.Description, vm.VCPU, vm.MemoryMB, vm.KernelPath, vm.RootFSPath, vm.KernelArgs,
 		vm.NetworkID, vm.MacAddress, vm.IPAddress, vm.DNSServers, vm.SnapshotType, vm.TapDevice, vm.SocketPath, vm.Status, vm.PID, vm.Autorun, vm.ErrorMessage)
 	return err
 }
@@ -596,12 +632,12 @@ func (d *DB) GetVM(id string) (*VM, error) {
 
 	vm := &VM{}
 	err := d.db.QueryRow(`
-		SELECT id, name, vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
+		SELECT id, name, COALESCE(description, ''), vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
 			COALESCE(network_id, ''), COALESCE(mac_address, ''), COALESCE(ip_address, ''),
 			COALESCE(dns_servers, ''), COALESCE(snapshot_type, ''), COALESCE(tap_device, ''), COALESCE(socket_path, ''), status, pid,
 			COALESCE(autorun, 0), COALESCE(error_message, ''), created_at, updated_at
 		FROM vms WHERE id = ?`, id).Scan(
-		&vm.ID, &vm.Name, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
+		&vm.ID, &vm.Name, &vm.Description, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
 		&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType, &vm.TapDevice, &vm.SocketPath,
 		&vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage, &vm.CreatedAt, &vm.UpdatedAt)
 	if err == sql.ErrNoRows {
@@ -616,12 +652,12 @@ func (d *DB) GetVMByName(name string) (*VM, error) {
 
 	vm := &VM{}
 	err := d.db.QueryRow(`
-		SELECT id, name, vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
+		SELECT id, name, COALESCE(description, ''), vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
 			COALESCE(network_id, ''), COALESCE(mac_address, ''), COALESCE(ip_address, ''),
 			COALESCE(dns_servers, ''), COALESCE(snapshot_type, ''), COALESCE(tap_device, ''), COALESCE(socket_path, ''), status, pid,
 			COALESCE(autorun, 0), COALESCE(error_message, ''), created_at, updated_at
 		FROM vms WHERE name = ?`, name).Scan(
-		&vm.ID, &vm.Name, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
+		&vm.ID, &vm.Name, &vm.Description, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
 		&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType, &vm.TapDevice, &vm.SocketPath,
 		&vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage, &vm.CreatedAt, &vm.UpdatedAt)
 	if err == sql.ErrNoRows {
@@ -635,7 +671,7 @@ func (d *DB) ListVMs() ([]*VM, error) {
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT id, name, vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
+		SELECT id, name, COALESCE(description, ''), vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
 			COALESCE(network_id, ''), COALESCE(mac_address, ''), COALESCE(ip_address, ''),
 			COALESCE(dns_servers, ''), COALESCE(snapshot_type, ''), COALESCE(tap_device, ''), COALESCE(socket_path, ''), status, pid,
 			COALESCE(autorun, 0), COALESCE(error_message, ''), created_at, updated_at
@@ -649,7 +685,7 @@ func (d *DB) ListVMs() ([]*VM, error) {
 	for rows.Next() {
 		vm := &VM{}
 		if err := rows.Scan(
-			&vm.ID, &vm.Name, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
+			&vm.ID, &vm.Name, &vm.Description, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
 			&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType, &vm.TapDevice, &vm.SocketPath,
 			&vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage, &vm.CreatedAt, &vm.UpdatedAt); err != nil {
 			return nil, err
@@ -664,11 +700,11 @@ func (d *DB) UpdateVM(vm *VM) error {
 	defer d.mu.Unlock()
 
 	_, err := d.db.Exec(`
-		UPDATE vms SET name=?, vcpu=?, memory_mb=?, kernel_path=?, rootfs_path=?, kernel_args=?,
+		UPDATE vms SET name=?, description=?, vcpu=?, memory_mb=?, kernel_path=?, rootfs_path=?, kernel_args=?,
 			network_id=?, mac_address=?, ip_address=?, dns_servers=?, snapshot_type=?, tap_device=?, socket_path=?,
 			status=?, pid=?, autorun=?, error_message=?, updated_at=CURRENT_TIMESTAMP
 		WHERE id=?`,
-		vm.Name, vm.VCPU, vm.MemoryMB, vm.KernelPath, vm.RootFSPath, vm.KernelArgs,
+		vm.Name, vm.Description, vm.VCPU, vm.MemoryMB, vm.KernelPath, vm.RootFSPath, vm.KernelArgs,
 		vm.NetworkID, vm.MacAddress, vm.IPAddress, vm.DNSServers, vm.SnapshotType, vm.TapDevice, vm.SocketPath,
 		vm.Status, vm.PID, vm.Autorun, vm.ErrorMessage, vm.ID)
 	return err
@@ -1700,6 +1736,44 @@ func (d *DB) GetUserGroups(userID int) ([]*Group, error) {
 		groups = append(groups, group)
 	}
 	return groups, nil
+}
+
+// GetUserPermissions returns a map of all permissions a user has from all their groups
+// Available permissions: start, stop, console, edit, snapshot, disk, networks, images, admin
+func (d *DB) GetUserPermissions(userID int, userRole string) map[string]bool {
+	perms := make(map[string]bool)
+
+	// Admins have all permissions
+	if userRole == "admin" {
+		perms["start"] = true
+		perms["stop"] = true
+		perms["console"] = true
+		perms["edit"] = true
+		perms["snapshot"] = true
+		perms["disk"] = true
+		perms["networks"] = true
+		perms["images"] = true
+		perms["admin"] = true
+		return perms
+	}
+
+	// Get all groups for the user
+	groups, err := d.GetUserGroups(userID)
+	if err != nil {
+		return perms
+	}
+
+	// Combine permissions from all groups
+	for _, group := range groups {
+		for _, perm := range strings.Split(group.Permissions, ",") {
+			perm = strings.TrimSpace(perm)
+			if perm != "" {
+				perms[perm] = true
+			}
+		}
+	}
+
+	return perms
 }
 
 // GroupVM operations
@@ -2764,7 +2838,7 @@ func (d *DB) SearchVMs(params *VMSearchParams) ([]*VM, error) {
 	defer d.mu.RUnlock()
 
 	query := `
-		SELECT DISTINCT v.id, v.name, v.vcpu, v.memory_mb, v.kernel_path, v.rootfs_path, v.kernel_args,
+		SELECT DISTINCT v.id, v.name, COALESCE(v.description, ''), v.vcpu, v.memory_mb, v.kernel_path, v.rootfs_path, v.kernel_args,
 			COALESCE(v.network_id, ''), COALESCE(v.mac_address, ''), COALESCE(v.ip_address, ''),
 			COALESCE(v.dns_servers, ''), COALESCE(v.snapshot_type, ''), COALESCE(v.tap_device, ''),
 			COALESCE(v.socket_path, ''), v.status, v.pid, COALESCE(v.autorun, 0),
@@ -2778,11 +2852,11 @@ func (d *DB) SearchVMs(params *VMSearchParams) ([]*VM, error) {
 
 	var args []interface{}
 
-	// General search query (searches name, IP, MAC)
+	// General search query (searches name, IP, MAC, description)
 	if params.Query != "" {
-		query += ` AND (v.name LIKE ? OR v.ip_address LIKE ? OR v.mac_address LIKE ?)`
+		query += ` AND (v.name LIKE ? OR v.ip_address LIKE ? OR v.mac_address LIKE ? OR v.description LIKE ?)`
 		searchTerm := "%" + params.Query + "%"
-		args = append(args, searchTerm, searchTerm, searchTerm)
+		args = append(args, searchTerm, searchTerm, searchTerm, searchTerm)
 	}
 
 	// Specific filters
@@ -2842,7 +2916,7 @@ func (d *DB) SearchVMs(params *VMSearchParams) ([]*VM, error) {
 	var vms []*VM
 	for rows.Next() {
 		vm := &VM{}
-		if err := rows.Scan(&vm.ID, &vm.Name, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
+		if err := rows.Scan(&vm.ID, &vm.Name, &vm.Description, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
 			&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType, &vm.TapDevice,
 			&vm.SocketPath, &vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage, &vm.CreatedAt, &vm.UpdatedAt); err != nil {
 			return nil, err
@@ -2859,4 +2933,317 @@ type VMSearchResult struct {
 	Kernel   *KernelImage `json:"kernel,omitempty"`
 	Network  *Network     `json:"network,omitempty"`
 	VMGroups []*VMGroup   `json:"vm_groups,omitempty"`
+}
+
+// ============================================================================
+// Appliance Privilege operations
+// ============================================================================
+
+// SetApplianceOwner creates an ownership record for an appliance (called after export)
+func (d *DB) SetApplianceOwner(filename string, ownerID int) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Insert owner record (owner has implicit full access)
+	_, err := d.db.Exec(`
+		INSERT INTO appliance_privileges (filename, owner_id, user_id, group_id, can_read, can_write)
+		VALUES (?, ?, NULL, NULL, 1, 1)`,
+		filename, ownerID)
+	return err
+}
+
+// GetApplianceOwner returns the owner ID for an appliance
+func (d *DB) GetApplianceOwner(filename string) (int, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var ownerID int
+	err := d.db.QueryRow(`
+		SELECT owner_id FROM appliance_privileges
+		WHERE filename = ? AND user_id IS NULL AND group_id IS NULL
+		LIMIT 1`, filename).Scan(&ownerID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return ownerID, err
+}
+
+// AddApplianceUserPrivilege grants a user access to an appliance
+func (d *DB) AddApplianceUserPrivilege(filename string, ownerID int, userID int, canRead, canWrite bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Check if privilege already exists
+	var exists int
+	d.db.QueryRow(`SELECT 1 FROM appliance_privileges WHERE filename = ? AND user_id = ?`,
+		filename, userID).Scan(&exists)
+	if exists == 1 {
+		// Update existing
+		_, err := d.db.Exec(`
+			UPDATE appliance_privileges SET can_read = ?, can_write = ?
+			WHERE filename = ? AND user_id = ?`,
+			canRead, canWrite, filename, userID)
+		return err
+	}
+
+	_, err := d.db.Exec(`
+		INSERT INTO appliance_privileges (filename, owner_id, user_id, group_id, can_read, can_write)
+		VALUES (?, ?, ?, NULL, ?, ?)`,
+		filename, ownerID, userID, canRead, canWrite)
+	return err
+}
+
+// AddApplianceGroupPrivilege grants a group access to an appliance
+func (d *DB) AddApplianceGroupPrivilege(filename string, ownerID int, groupID string, canRead, canWrite bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Check if privilege already exists
+	var exists int
+	d.db.QueryRow(`SELECT 1 FROM appliance_privileges WHERE filename = ? AND group_id = ?`,
+		filename, groupID).Scan(&exists)
+	if exists == 1 {
+		// Update existing
+		_, err := d.db.Exec(`
+			UPDATE appliance_privileges SET can_read = ?, can_write = ?
+			WHERE filename = ? AND group_id = ?`,
+			canRead, canWrite, filename, groupID)
+		return err
+	}
+
+	_, err := d.db.Exec(`
+		INSERT INTO appliance_privileges (filename, owner_id, user_id, group_id, can_read, can_write)
+		VALUES (?, ?, NULL, ?, ?, ?)`,
+		filename, ownerID, groupID, canRead, canWrite)
+	return err
+}
+
+// RemoveApplianceUserPrivilege removes a user's access to an appliance
+func (d *DB) RemoveApplianceUserPrivilege(filename string, userID int) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM appliance_privileges WHERE filename = ? AND user_id = ?`,
+		filename, userID)
+	return err
+}
+
+// RemoveApplianceGroupPrivilege removes a group's access to an appliance
+func (d *DB) RemoveApplianceGroupPrivilege(filename string, groupID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM appliance_privileges WHERE filename = ? AND group_id = ?`,
+		filename, groupID)
+	return err
+}
+
+// GetAppliancePrivileges returns all privileges for an appliance
+func (d *DB) GetAppliancePrivileges(filename string) ([]*AppliancePrivilege, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT ap.id, ap.filename, ap.owner_id, ap.user_id, ap.group_id, ap.can_read, ap.can_write, ap.created_at,
+			COALESCE(u.username, ''), COALESCE(g.name, '')
+		FROM appliance_privileges ap
+		LEFT JOIN users u ON ap.user_id = u.id
+		LEFT JOIN groups g ON ap.group_id = g.id
+		WHERE ap.filename = ? AND (ap.user_id IS NOT NULL OR ap.group_id IS NOT NULL)
+		ORDER BY ap.created_at`, filename)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var privileges []*AppliancePrivilege
+	for rows.Next() {
+		p := &AppliancePrivilege{}
+		var userID sql.NullInt64
+		var groupID sql.NullString
+		if err := rows.Scan(&p.ID, &p.Filename, &p.OwnerID, &userID, &groupID,
+			&p.CanRead, &p.CanWrite, &p.CreatedAt, &p.Username, &p.GroupName); err != nil {
+			return nil, err
+		}
+		if userID.Valid {
+			uid := int(userID.Int64)
+			p.UserID = &uid
+		}
+		if groupID.Valid {
+			p.GroupID = &groupID.String
+		}
+		privileges = append(privileges, p)
+	}
+	return privileges, rows.Err()
+}
+
+// CanUserAccessAppliance checks if a user can access an appliance (read or write)
+// Returns: canAccess, canWrite, isOwner
+// If no privileges are defined for an appliance, it is available to everyone (read-only)
+func (d *DB) CanUserAccessAppliance(filename string, userID int, userRole string) (bool, bool, bool) {
+	// Admins have full access to everything
+	if userRole == "admin" {
+		return true, true, false
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Check if any privileges exist for this appliance
+	var count int
+	err := d.db.QueryRow(`
+		SELECT COUNT(*) FROM appliance_privileges
+		WHERE filename = ?`, filename).Scan(&count)
+	if err != nil || count == 0 {
+		// No privileges defined - appliance is available to everyone (read-only)
+		return true, false, false
+	}
+
+	// Check if user is the owner
+	var ownerID int
+	err = d.db.QueryRow(`
+		SELECT owner_id FROM appliance_privileges
+		WHERE filename = ? AND user_id IS NULL AND group_id IS NULL
+		LIMIT 1`, filename).Scan(&ownerID)
+	if err == nil && ownerID == userID {
+		return true, true, true
+	}
+
+	// Check direct user privilege
+	var canRead, canWrite bool
+	err = d.db.QueryRow(`
+		SELECT can_read, can_write FROM appliance_privileges
+		WHERE filename = ? AND user_id = ?`, filename, userID).Scan(&canRead, &canWrite)
+	if err == nil {
+		return canRead || canWrite, canWrite, false
+	}
+
+	// Check group privileges
+	rows, err := d.db.Query(`
+		SELECT ap.can_read, ap.can_write
+		FROM appliance_privileges ap
+		INNER JOIN group_members gm ON ap.group_id = gm.group_id
+		WHERE ap.filename = ? AND gm.user_id = ?`, filename, userID)
+	if err != nil {
+		return false, false, false
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var r, w bool
+		if err := rows.Scan(&r, &w); err != nil {
+			continue
+		}
+		if r {
+			canRead = true
+		}
+		if w {
+			canWrite = true
+		}
+	}
+
+	return canRead || canWrite, canWrite, false
+}
+
+// GetUserAccessibleAppliances returns filenames that a user can access
+func (d *DB) GetUserAccessibleAppliances(userID int, userRole string) (map[string]bool, error) {
+	// Admins can access all
+	if userRole == "admin" {
+		return nil, nil // nil means all access
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	accessible := make(map[string]bool)
+
+	// Get appliances owned by user
+	rows, err := d.db.Query(`
+		SELECT filename FROM appliance_privileges
+		WHERE owner_id = ? AND user_id IS NULL AND group_id IS NULL`, userID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var filename string
+		if err := rows.Scan(&filename); err == nil {
+			accessible[filename] = true
+		}
+	}
+	rows.Close()
+
+	// Get appliances with direct user privilege
+	rows, err = d.db.Query(`
+		SELECT filename FROM appliance_privileges
+		WHERE user_id = ? AND can_read = 1`, userID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var filename string
+		if err := rows.Scan(&filename); err == nil {
+			accessible[filename] = true
+		}
+	}
+	rows.Close()
+
+	// Get appliances with group privilege
+	rows, err = d.db.Query(`
+		SELECT DISTINCT ap.filename
+		FROM appliance_privileges ap
+		INNER JOIN group_members gm ON ap.group_id = gm.group_id
+		WHERE gm.user_id = ? AND ap.can_read = 1`, userID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var filename string
+		if err := rows.Scan(&filename); err == nil {
+			accessible[filename] = true
+		}
+	}
+	rows.Close()
+
+	return accessible, nil
+}
+
+// DeleteAppliancePrivileges removes all privileges for an appliance (called when appliance is deleted)
+func (d *DB) DeleteAppliancePrivileges(filename string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM appliance_privileges WHERE filename = ?`, filename)
+	return err
+}
+
+// CleanupOrphanAppliancePrivileges removes privileges for appliances that no longer exist
+// Pass in a list of existing appliance filenames
+func (d *DB) CleanupOrphanAppliancePrivileges(existingFiles []string) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(existingFiles) == 0 {
+		// Delete all privileges if no files exist
+		result, err := d.db.Exec(`DELETE FROM appliance_privileges`)
+		if err != nil {
+			return 0, err
+		}
+		return result.RowsAffected()
+	}
+
+	// Build placeholder string
+	placeholders := make([]string, len(existingFiles))
+	args := make([]interface{}, len(existingFiles))
+	for i, f := range existingFiles {
+		placeholders[i] = "?"
+		args[i] = f
+	}
+
+	query := fmt.Sprintf(`DELETE FROM appliance_privileges WHERE filename NOT IN (%s)`,
+		strings.Join(placeholders, ","))
+	result, err := d.db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
