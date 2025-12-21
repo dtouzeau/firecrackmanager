@@ -17,27 +17,32 @@ type DB struct {
 }
 
 type VM struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Description  string    `json:"description"`
-	VCPU         int       `json:"vcpu"`
-	MemoryMB     int       `json:"memory_mb"`
-	KernelPath   string    `json:"kernel_path"`
-	RootFSPath   string    `json:"rootfs_path"`
-	KernelArgs   string    `json:"kernel_args"`
-	NetworkID    string    `json:"network_id"`
-	MacAddress   string    `json:"mac_address"`
-	IPAddress    string    `json:"ip_address"`
-	DNSServers   string    `json:"dns_servers"`   // comma-separated DNS servers
-	SnapshotType string    `json:"snapshot_type"` // Full, Diff, or empty for disabled
-	TapDevice    string    `json:"tap_device"`
-	SocketPath   string    `json:"socket_path"`
-	Status       string    `json:"status"` // stopped, running, error
-	PID          int       `json:"pid"`
-	Autorun      bool      `json:"autorun"` // Start VM automatically when FireCrackManager starts
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	ErrorMessage string    `json:"error_message"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	VCPU         int    `json:"vcpu"`
+	MemoryMB     int    `json:"memory_mb"`
+	KernelPath   string `json:"kernel_path"`
+	RootFSPath   string `json:"rootfs_path"`
+	KernelArgs   string `json:"kernel_args"`
+	NetworkID    string `json:"network_id"`
+	MacAddress   string `json:"mac_address"`
+	IPAddress    string `json:"ip_address"`
+	DNSServers   string `json:"dns_servers"`   // comma-separated DNS servers
+	SnapshotType string `json:"snapshot_type"` // Full, Diff, or empty for disabled
+	TapDevice    string `json:"tap_device"`
+	SocketPath   string `json:"socket_path"`
+	Status       string `json:"status"` // stopped, running, error
+	PID          int    `json:"pid"`
+	Autorun      bool   `json:"autorun"` // Start VM automatically when FireCrackManager starts
+	// Memory hotplug configuration (virtio-mem)
+	HotplugMemoryEnabled bool      `json:"hotplug_memory_enabled"`  // Enable virtio-mem device
+	HotplugMemoryTotalMB int       `json:"hotplug_memory_total_mb"` // Maximum hotpluggable memory in MiB
+	HotplugMemoryBlockMB int       `json:"hotplug_memory_block_mb"` // Block size (default: 2, power of 2)
+	HotplugMemorySlotMB  int       `json:"hotplug_memory_slot_mb"`  // Slot size (default: 128, power of 2)
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	ErrorMessage         string    `json:"error_message"`
 }
 
 type Network struct {
@@ -77,30 +82,33 @@ type FirewallRule struct {
 }
 
 type KernelImage struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Version      string    `json:"version"`
-	Architecture string    `json:"architecture"`
-	Path         string    `json:"path"`
-	Size         int64     `json:"size"`
-	Checksum     string    `json:"checksum"`
-	IsDefault    bool      `json:"is_default"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Version       string    `json:"version"`
+	Architecture  string    `json:"architecture"`
+	Path          string    `json:"path"`
+	Size          int64     `json:"size"`
+	Checksum      string    `json:"checksum"`
+	IsDefault     bool      `json:"is_default"`
+	VirtioSupport bool      `json:"virtio_support"` // true if kernel has virtio drivers built-in
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type RootFS struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Path       string    `json:"path"`
-	Size       int64     `json:"size"`
-	Format     string    `json:"format"` // ext4, squashfs
-	BaseImage  string    `json:"base_image"`
-	Checksum   string    `json:"checksum"`
-	DiskType   string    `json:"disk_type"`   // system, data, unknown
-	InitSystem string    `json:"init_system"` // systemd, openrc, sysvinit, busybox, minimal
-	OSRelease  string    `json:"os_release"`  // OS name from /etc/os-release
-	ScannedAt  time.Time `json:"scanned_at"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Path         string    `json:"path"`
+	Size         int64     `json:"size"`
+	Format       string    `json:"format"` // ext4, squashfs
+	BaseImage    string    `json:"base_image"`
+	Checksum     string    `json:"checksum"`
+	DiskType     string    `json:"disk_type"`   // system, data, unknown
+	InitSystem   string    `json:"init_system"` // systemd, openrc, sysvinit, busybox, minimal
+	OSRelease    string    `json:"os_release"`  // OS name from /etc/os-release
+	SSHInstalled bool      `json:"ssh_installed"`
+	SSHVersion   string    `json:"ssh_version,omitempty"`
+	ScannedAt    time.Time `json:"scanned_at"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type User struct {
@@ -110,6 +118,8 @@ type User struct {
 	Email        string    `json:"email"`
 	Role         string    `json:"role"` // admin, user
 	Active       bool      `json:"active"`
+	LDAPUser     bool      `json:"ldap_user"`
+	LDAPDN       string    `json:"ldap_dn,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
@@ -328,6 +338,7 @@ func (d *DB) migrate() error {
 			size INTEGER DEFAULT 0,
 			checksum TEXT,
 			is_default BOOLEAN DEFAULT 0,
+			virtio_support BOOLEAN DEFAULT 1,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS rootfs (
@@ -341,6 +352,8 @@ func (d *DB) migrate() error {
 			disk_type TEXT DEFAULT '',
 			init_system TEXT DEFAULT '',
 			os_release TEXT DEFAULT '',
+			ssh_installed BOOLEAN DEFAULT 0,
+			ssh_version TEXT DEFAULT '',
 			scanned_at DATETIME,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -598,6 +611,46 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_appliance_privileges_owner ON appliance_privileges(owner_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_appliance_privileges_user ON appliance_privileges(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_appliance_privileges_group ON appliance_privileges(group_id)`,
+		// Migration: Add virtio_support column to kernel_images table
+		`ALTER TABLE kernel_images ADD COLUMN virtio_support BOOLEAN DEFAULT 1`,
+		// Migration: Add SSH detection columns to rootfs table
+		`ALTER TABLE rootfs ADD COLUMN ssh_installed BOOLEAN DEFAULT 0`,
+		`ALTER TABLE rootfs ADD COLUMN ssh_version TEXT DEFAULT ''`,
+		// Migration: Add memory hotplug columns to vms table
+		`ALTER TABLE vms ADD COLUMN hotplug_memory_enabled BOOLEAN DEFAULT 0`,
+		`ALTER TABLE vms ADD COLUMN hotplug_memory_total_mb INTEGER DEFAULT 0`,
+		`ALTER TABLE vms ADD COLUMN hotplug_memory_block_mb INTEGER DEFAULT 2`,
+		`ALTER TABLE vms ADD COLUMN hotplug_memory_slot_mb INTEGER DEFAULT 128`,
+		// LDAP/Active Directory configuration
+		`CREATE TABLE IF NOT EXISTS ldap_config (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			enabled BOOLEAN DEFAULT 0,
+			server TEXT DEFAULT '',
+			port INTEGER DEFAULT 389,
+			use_ssl BOOLEAN DEFAULT 0,
+			use_starttls BOOLEAN DEFAULT 0,
+			skip_verify BOOLEAN DEFAULT 1,
+			bind_dn TEXT DEFAULT '',
+			bind_password TEXT DEFAULT '',
+			base_dn TEXT DEFAULT '',
+			user_search_base TEXT DEFAULT '',
+			user_filter TEXT DEFAULT '(&(objectClass=user)(sAMAccountName=%s))',
+			group_search_base TEXT DEFAULT '',
+			group_filter TEXT DEFAULT '(objectClass=group)',
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		// LDAP group to privilege mappings
+		`CREATE TABLE IF NOT EXISTS ldap_group_mappings (
+			id TEXT PRIMARY KEY,
+			group_dn TEXT NOT NULL UNIQUE,
+			group_name TEXT NOT NULL,
+			local_role TEXT NOT NULL DEFAULT 'user',
+			local_group_id TEXT DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		// Migration: Add ldap_user column to users table for AD users
+		`ALTER TABLE users ADD COLUMN ldap_user BOOLEAN DEFAULT 0`,
+		`ALTER TABLE users ADD COLUMN ldap_dn TEXT DEFAULT ''`,
 	}
 
 	for _, migration := range migrations {
@@ -619,10 +672,12 @@ func (d *DB) CreateVM(vm *VM) error {
 
 	_, err := d.db.Exec(`
 		INSERT INTO vms (id, name, description, vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
-			network_id, mac_address, ip_address, dns_servers, snapshot_type, tap_device, socket_path, status, pid, autorun, error_message)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			network_id, mac_address, ip_address, dns_servers, snapshot_type, tap_device, socket_path, status, pid, autorun, error_message,
+			hotplug_memory_enabled, hotplug_memory_total_mb, hotplug_memory_block_mb, hotplug_memory_slot_mb)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		vm.ID, vm.Name, vm.Description, vm.VCPU, vm.MemoryMB, vm.KernelPath, vm.RootFSPath, vm.KernelArgs,
-		vm.NetworkID, vm.MacAddress, vm.IPAddress, vm.DNSServers, vm.SnapshotType, vm.TapDevice, vm.SocketPath, vm.Status, vm.PID, vm.Autorun, vm.ErrorMessage)
+		vm.NetworkID, vm.MacAddress, vm.IPAddress, vm.DNSServers, vm.SnapshotType, vm.TapDevice, vm.SocketPath, vm.Status, vm.PID, vm.Autorun, vm.ErrorMessage,
+		vm.HotplugMemoryEnabled, vm.HotplugMemoryTotalMB, vm.HotplugMemoryBlockMB, vm.HotplugMemorySlotMB)
 	return err
 }
 
@@ -635,11 +690,16 @@ func (d *DB) GetVM(id string) (*VM, error) {
 		SELECT id, name, COALESCE(description, ''), vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
 			COALESCE(network_id, ''), COALESCE(mac_address, ''), COALESCE(ip_address, ''),
 			COALESCE(dns_servers, ''), COALESCE(snapshot_type, ''), COALESCE(tap_device, ''), COALESCE(socket_path, ''), status, pid,
-			COALESCE(autorun, 0), COALESCE(error_message, ''), created_at, updated_at
+			COALESCE(autorun, 0), COALESCE(error_message, ''),
+			COALESCE(hotplug_memory_enabled, 0), COALESCE(hotplug_memory_total_mb, 0),
+			COALESCE(hotplug_memory_block_mb, 2), COALESCE(hotplug_memory_slot_mb, 128),
+			created_at, updated_at
 		FROM vms WHERE id = ?`, id).Scan(
 		&vm.ID, &vm.Name, &vm.Description, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
 		&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType, &vm.TapDevice, &vm.SocketPath,
-		&vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage, &vm.CreatedAt, &vm.UpdatedAt)
+		&vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage,
+		&vm.HotplugMemoryEnabled, &vm.HotplugMemoryTotalMB, &vm.HotplugMemoryBlockMB, &vm.HotplugMemorySlotMB,
+		&vm.CreatedAt, &vm.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -655,11 +715,16 @@ func (d *DB) GetVMByName(name string) (*VM, error) {
 		SELECT id, name, COALESCE(description, ''), vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
 			COALESCE(network_id, ''), COALESCE(mac_address, ''), COALESCE(ip_address, ''),
 			COALESCE(dns_servers, ''), COALESCE(snapshot_type, ''), COALESCE(tap_device, ''), COALESCE(socket_path, ''), status, pid,
-			COALESCE(autorun, 0), COALESCE(error_message, ''), created_at, updated_at
+			COALESCE(autorun, 0), COALESCE(error_message, ''),
+			COALESCE(hotplug_memory_enabled, 0), COALESCE(hotplug_memory_total_mb, 0),
+			COALESCE(hotplug_memory_block_mb, 2), COALESCE(hotplug_memory_slot_mb, 128),
+			created_at, updated_at
 		FROM vms WHERE name = ?`, name).Scan(
 		&vm.ID, &vm.Name, &vm.Description, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
 		&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType, &vm.TapDevice, &vm.SocketPath,
-		&vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage, &vm.CreatedAt, &vm.UpdatedAt)
+		&vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage,
+		&vm.HotplugMemoryEnabled, &vm.HotplugMemoryTotalMB, &vm.HotplugMemoryBlockMB, &vm.HotplugMemorySlotMB,
+		&vm.CreatedAt, &vm.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -674,7 +739,10 @@ func (d *DB) ListVMs() ([]*VM, error) {
 		SELECT id, name, COALESCE(description, ''), vcpu, memory_mb, kernel_path, rootfs_path, kernel_args,
 			COALESCE(network_id, ''), COALESCE(mac_address, ''), COALESCE(ip_address, ''),
 			COALESCE(dns_servers, ''), COALESCE(snapshot_type, ''), COALESCE(tap_device, ''), COALESCE(socket_path, ''), status, pid,
-			COALESCE(autorun, 0), COALESCE(error_message, ''), created_at, updated_at
+			COALESCE(autorun, 0), COALESCE(error_message, ''),
+			COALESCE(hotplug_memory_enabled, 0), COALESCE(hotplug_memory_total_mb, 0),
+			COALESCE(hotplug_memory_block_mb, 2), COALESCE(hotplug_memory_slot_mb, 128),
+			created_at, updated_at
 		FROM vms ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -687,7 +755,9 @@ func (d *DB) ListVMs() ([]*VM, error) {
 		if err := rows.Scan(
 			&vm.ID, &vm.Name, &vm.Description, &vm.VCPU, &vm.MemoryMB, &vm.KernelPath, &vm.RootFSPath, &vm.KernelArgs,
 			&vm.NetworkID, &vm.MacAddress, &vm.IPAddress, &vm.DNSServers, &vm.SnapshotType, &vm.TapDevice, &vm.SocketPath,
-			&vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage, &vm.CreatedAt, &vm.UpdatedAt); err != nil {
+			&vm.Status, &vm.PID, &vm.Autorun, &vm.ErrorMessage,
+			&vm.HotplugMemoryEnabled, &vm.HotplugMemoryTotalMB, &vm.HotplugMemoryBlockMB, &vm.HotplugMemorySlotMB,
+			&vm.CreatedAt, &vm.UpdatedAt); err != nil {
 			return nil, err
 		}
 		vms = append(vms, vm)
@@ -702,11 +772,15 @@ func (d *DB) UpdateVM(vm *VM) error {
 	_, err := d.db.Exec(`
 		UPDATE vms SET name=?, description=?, vcpu=?, memory_mb=?, kernel_path=?, rootfs_path=?, kernel_args=?,
 			network_id=?, mac_address=?, ip_address=?, dns_servers=?, snapshot_type=?, tap_device=?, socket_path=?,
-			status=?, pid=?, autorun=?, error_message=?, updated_at=CURRENT_TIMESTAMP
+			status=?, pid=?, autorun=?, error_message=?,
+			hotplug_memory_enabled=?, hotplug_memory_total_mb=?, hotplug_memory_block_mb=?, hotplug_memory_slot_mb=?,
+			updated_at=CURRENT_TIMESTAMP
 		WHERE id=?`,
 		vm.Name, vm.Description, vm.VCPU, vm.MemoryMB, vm.KernelPath, vm.RootFSPath, vm.KernelArgs,
 		vm.NetworkID, vm.MacAddress, vm.IPAddress, vm.DNSServers, vm.SnapshotType, vm.TapDevice, vm.SocketPath,
-		vm.Status, vm.PID, vm.Autorun, vm.ErrorMessage, vm.ID)
+		vm.Status, vm.PID, vm.Autorun, vm.ErrorMessage,
+		vm.HotplugMemoryEnabled, vm.HotplugMemoryTotalMB, vm.HotplugMemoryBlockMB, vm.HotplugMemorySlotMB,
+		vm.ID)
 	return err
 }
 
@@ -881,9 +955,9 @@ func (d *DB) CreateKernelImage(img *KernelImage) error {
 	}
 
 	_, err := d.db.Exec(`
-		INSERT INTO kernel_images (id, name, version, architecture, path, size, checksum, is_default)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		img.ID, img.Name, img.Version, img.Architecture, img.Path, img.Size, img.Checksum, img.IsDefault)
+		INSERT INTO kernel_images (id, name, version, architecture, path, size, checksum, is_default, virtio_support)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		img.ID, img.Name, img.Version, img.Architecture, img.Path, img.Size, img.Checksum, img.IsDefault, img.VirtioSupport)
 	return err
 }
 
@@ -893,9 +967,9 @@ func (d *DB) GetKernelImage(id string) (*KernelImage, error) {
 
 	img := &KernelImage{}
 	err := d.db.QueryRow(`
-		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, created_at
+		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), created_at
 		FROM kernel_images WHERE id = ?`, id).Scan(
-		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.CreatedAt)
+		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -908,9 +982,9 @@ func (d *DB) GetKernelByPath(path string) (*KernelImage, error) {
 
 	img := &KernelImage{}
 	err := d.db.QueryRow(`
-		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, created_at
+		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), created_at
 		FROM kernel_images WHERE path = ?`, path).Scan(
-		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.CreatedAt)
+		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -923,9 +997,9 @@ func (d *DB) GetDefaultKernel() (*KernelImage, error) {
 
 	img := &KernelImage{}
 	err := d.db.QueryRow(`
-		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, created_at
+		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), created_at
 		FROM kernel_images WHERE is_default = 1 LIMIT 1`).Scan(
-		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.CreatedAt)
+		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -937,7 +1011,7 @@ func (d *DB) ListKernelImages() ([]*KernelImage, error) {
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, created_at
+		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), created_at
 		FROM kernel_images ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -947,12 +1021,21 @@ func (d *DB) ListKernelImages() ([]*KernelImage, error) {
 	var imgs []*KernelImage
 	for rows.Next() {
 		img := &KernelImage{}
-		if err := rows.Scan(&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.CreatedAt); err != nil {
+		if err := rows.Scan(&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.CreatedAt); err != nil {
 			return nil, err
 		}
 		imgs = append(imgs, img)
 	}
 	return imgs, nil
+}
+
+// UpdateKernelVirtioSupport updates the virtio_support flag for a kernel
+func (d *DB) UpdateKernelVirtioSupport(id string, hasSupport bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec("UPDATE kernel_images SET virtio_support = ? WHERE id = ?", hasSupport, id)
+	return err
 }
 
 func (d *DB) SetDefaultKernel(id string) error {
@@ -993,10 +1076,12 @@ func (d *DB) GetRootFS(id string) (*RootFS, error) {
 	err := d.db.QueryRow(`
 		SELECT id, name, path, size, format, COALESCE(base_image, ''), COALESCE(checksum, ''),
 		       COALESCE(disk_type, ''), COALESCE(init_system, ''), COALESCE(os_release, ''),
+		       COALESCE(ssh_installed, 0), COALESCE(ssh_version, ''),
 		       scanned_at, created_at
 		FROM rootfs WHERE id = ?`, id).Scan(
 		&fs.ID, &fs.Name, &fs.Path, &fs.Size, &fs.Format, &fs.BaseImage, &fs.Checksum,
-		&fs.DiskType, &fs.InitSystem, &fs.OSRelease, &scannedAt, &fs.CreatedAt)
+		&fs.DiskType, &fs.InitSystem, &fs.OSRelease, &fs.SSHInstalled, &fs.SSHVersion,
+		&scannedAt, &fs.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1015,10 +1100,12 @@ func (d *DB) GetRootFSByPath(path string) (*RootFS, error) {
 	err := d.db.QueryRow(`
 		SELECT id, name, path, size, format, COALESCE(base_image, ''), COALESCE(checksum, ''),
 		       COALESCE(disk_type, ''), COALESCE(init_system, ''), COALESCE(os_release, ''),
+		       COALESCE(ssh_installed, 0), COALESCE(ssh_version, ''),
 		       scanned_at, created_at
 		FROM rootfs WHERE path = ?`, path).Scan(
 		&fs.ID, &fs.Name, &fs.Path, &fs.Size, &fs.Format, &fs.BaseImage, &fs.Checksum,
-		&fs.DiskType, &fs.InitSystem, &fs.OSRelease, &scannedAt, &fs.CreatedAt)
+		&fs.DiskType, &fs.InitSystem, &fs.OSRelease, &fs.SSHInstalled, &fs.SSHVersion,
+		&scannedAt, &fs.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1064,6 +1151,7 @@ func (d *DB) ListRootFS() ([]*RootFS, error) {
 	rows, err := d.db.Query(`
 		SELECT id, name, path, size, format, COALESCE(base_image, ''), COALESCE(checksum, ''),
 		       COALESCE(disk_type, ''), COALESCE(init_system, ''), COALESCE(os_release, ''),
+		       COALESCE(ssh_installed, 0), COALESCE(ssh_version, ''),
 		       scanned_at, created_at
 		FROM rootfs ORDER BY created_at DESC`)
 	if err != nil {
@@ -1076,7 +1164,8 @@ func (d *DB) ListRootFS() ([]*RootFS, error) {
 		fs := &RootFS{}
 		var scannedAt sql.NullTime
 		if err := rows.Scan(&fs.ID, &fs.Name, &fs.Path, &fs.Size, &fs.Format, &fs.BaseImage, &fs.Checksum,
-			&fs.DiskType, &fs.InitSystem, &fs.OSRelease, &scannedAt, &fs.CreatedAt); err != nil {
+			&fs.DiskType, &fs.InitSystem, &fs.OSRelease, &fs.SSHInstalled, &fs.SSHVersion,
+			&scannedAt, &fs.CreatedAt); err != nil {
 			return nil, err
 		}
 		if scannedAt.Valid {
@@ -1093,10 +1182,10 @@ func (d *DB) UpdateRootFS(fs *RootFS) error {
 
 	_, err := d.db.Exec(`
 		UPDATE rootfs SET name=?, path=?, size=?, format=?, base_image=?, checksum=?,
-		       disk_type=?, init_system=?, os_release=?, scanned_at=?
+		       disk_type=?, init_system=?, os_release=?, ssh_installed=?, ssh_version=?, scanned_at=?
 		WHERE id=?`,
 		fs.Name, fs.Path, fs.Size, fs.Format, fs.BaseImage, fs.Checksum,
-		fs.DiskType, fs.InitSystem, fs.OSRelease, fs.ScannedAt, fs.ID)
+		fs.DiskType, fs.InitSystem, fs.OSRelease, fs.SSHInstalled, fs.SSHVersion, fs.ScannedAt, fs.ID)
 	return err
 }
 
@@ -1131,9 +1220,11 @@ func (d *DB) GetUser(id int) (*User, error) {
 
 	user := &User{}
 	err := d.db.QueryRow(`
-		SELECT id, username, password_hash, COALESCE(email, ''), role, active, created_at, updated_at
+		SELECT id, username, password_hash, COALESCE(email, ''), role, active,
+		       COALESCE(ldap_user, 0), COALESCE(ldap_dn, ''), created_at, updated_at
 		FROM users WHERE id = ?`, id).Scan(
-		&user.ID, &user.Username, &user.PasswordHash, &user.Email, &user.Role, &user.Active, &user.CreatedAt, &user.UpdatedAt)
+		&user.ID, &user.Username, &user.PasswordHash, &user.Email, &user.Role, &user.Active,
+		&user.LDAPUser, &user.LDAPDN, &user.CreatedAt, &user.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1146,9 +1237,11 @@ func (d *DB) GetUserByUsername(username string) (*User, error) {
 
 	user := &User{}
 	err := d.db.QueryRow(`
-		SELECT id, username, password_hash, COALESCE(email, ''), role, active, created_at, updated_at
+		SELECT id, username, password_hash, COALESCE(email, ''), role, active,
+		       COALESCE(ldap_user, 0), COALESCE(ldap_dn, ''), created_at, updated_at
 		FROM users WHERE username = ?`, username).Scan(
-		&user.ID, &user.Username, &user.PasswordHash, &user.Email, &user.Role, &user.Active, &user.CreatedAt, &user.UpdatedAt)
+		&user.ID, &user.Username, &user.PasswordHash, &user.Email, &user.Role, &user.Active,
+		&user.LDAPUser, &user.LDAPDN, &user.CreatedAt, &user.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1160,7 +1253,8 @@ func (d *DB) ListUsers() ([]*User, error) {
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT id, username, password_hash, COALESCE(email, ''), role, active, created_at, updated_at
+		SELECT id, username, password_hash, COALESCE(email, ''), role, active,
+		       COALESCE(ldap_user, 0), COALESCE(ldap_dn, ''), created_at, updated_at
 		FROM users ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -1170,7 +1264,8 @@ func (d *DB) ListUsers() ([]*User, error) {
 	var users []*User
 	for rows.Next() {
 		user := &User{}
-		if err := rows.Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Email, &user.Role, &user.Active, &user.CreatedAt, &user.UpdatedAt); err != nil {
+		if err := rows.Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Email, &user.Role, &user.Active,
+			&user.LDAPUser, &user.LDAPDN, &user.CreatedAt, &user.UpdatedAt); err != nil {
 			return nil, err
 		}
 		users = append(users, user)
@@ -3246,4 +3341,232 @@ func (d *DB) CleanupOrphanAppliancePrivileges(existingFiles []string) (int64, er
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// LDAP Configuration types
+type LDAPConfig struct {
+	Enabled         bool   `json:"enabled"`
+	Server          string `json:"server"`
+	Port            int    `json:"port"`
+	UseSSL          bool   `json:"use_ssl"`
+	UseStartTLS     bool   `json:"use_starttls"`
+	SkipVerify      bool   `json:"skip_verify"`
+	BindDN          string `json:"bind_dn"`
+	BindPassword    string `json:"bind_password"`
+	BaseDN          string `json:"base_dn"`
+	UserSearchBase  string `json:"user_search_base"`
+	UserFilter      string `json:"user_filter"`
+	GroupSearchBase string `json:"group_search_base"`
+	GroupFilter     string `json:"group_filter"`
+}
+
+type LDAPGroupMapping struct {
+	ID           string `json:"id"`
+	GroupDN      string `json:"group_dn"`
+	GroupName    string `json:"group_name"`
+	LocalRole    string `json:"local_role"`
+	LocalGroupID string `json:"local_group_id"`
+	CreatedAt    int64  `json:"created_at"`
+}
+
+// GetLDAPConfig retrieves the LDAP configuration
+func (d *DB) GetLDAPConfig() (*LDAPConfig, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	config := &LDAPConfig{}
+	err := d.db.QueryRow(`
+		SELECT enabled, server, port, use_ssl, use_starttls, skip_verify,
+			bind_dn, bind_password, base_dn, user_search_base, user_filter,
+			group_search_base, group_filter
+		FROM ldap_config WHERE id = 1
+	`).Scan(&config.Enabled, &config.Server, &config.Port, &config.UseSSL,
+		&config.UseStartTLS, &config.SkipVerify, &config.BindDN, &config.BindPassword,
+		&config.BaseDN, &config.UserSearchBase, &config.UserFilter,
+		&config.GroupSearchBase, &config.GroupFilter)
+
+	if err != nil {
+		// Return default config if not found
+		return &LDAPConfig{
+			Enabled:     false,
+			Port:        389,
+			UseSSL:      false,
+			UseStartTLS: false,
+			SkipVerify:  true,
+			UserFilter:  "(&(objectClass=user)(sAMAccountName=%s))",
+			GroupFilter: "(objectClass=group)",
+		}, nil
+	}
+
+	return config, nil
+}
+
+// SaveLDAPConfig saves the LDAP configuration
+func (d *DB) SaveLDAPConfig(config *LDAPConfig) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		INSERT OR REPLACE INTO ldap_config (id, enabled, server, port, use_ssl, use_starttls,
+			skip_verify, bind_dn, bind_password, base_dn, user_search_base, user_filter,
+			group_search_base, group_filter, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		config.Enabled, config.Server, config.Port, config.UseSSL, config.UseStartTLS,
+		config.SkipVerify, config.BindDN, config.BindPassword, config.BaseDN,
+		config.UserSearchBase, config.UserFilter, config.GroupSearchBase, config.GroupFilter)
+	return err
+}
+
+// CreateLDAPGroupMapping creates a new LDAP group mapping
+func (d *DB) CreateLDAPGroupMapping(mapping *LDAPGroupMapping) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		INSERT INTO ldap_group_mappings (id, group_dn, group_name, local_role, local_group_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		mapping.ID, mapping.GroupDN, mapping.GroupName, mapping.LocalRole, mapping.LocalGroupID, mapping.CreatedAt)
+	return err
+}
+
+// GetLDAPGroupMapping retrieves a single LDAP group mapping by ID
+func (d *DB) GetLDAPGroupMapping(id string) (*LDAPGroupMapping, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	mapping := &LDAPGroupMapping{}
+	err := d.db.QueryRow(`
+		SELECT id, group_dn, group_name, local_role, COALESCE(local_group_id, ''), created_at
+		FROM ldap_group_mappings WHERE id = ?
+	`, id).Scan(&mapping.ID, &mapping.GroupDN, &mapping.GroupName, &mapping.LocalRole, &mapping.LocalGroupID, &mapping.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return mapping, nil
+}
+
+// GetLDAPGroupMappingByDN retrieves a LDAP group mapping by group DN
+func (d *DB) GetLDAPGroupMappingByDN(groupDN string) (*LDAPGroupMapping, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	mapping := &LDAPGroupMapping{}
+	err := d.db.QueryRow(`
+		SELECT id, group_dn, group_name, local_role, COALESCE(local_group_id, ''), created_at
+		FROM ldap_group_mappings WHERE group_dn = ?
+	`, groupDN).Scan(&mapping.ID, &mapping.GroupDN, &mapping.GroupName, &mapping.LocalRole, &mapping.LocalGroupID, &mapping.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return mapping, nil
+}
+
+// ListLDAPGroupMappings lists all LDAP group mappings
+func (d *DB) ListLDAPGroupMappings() ([]*LDAPGroupMapping, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT id, group_dn, group_name, local_role, COALESCE(local_group_id, ''), created_at
+		FROM ldap_group_mappings ORDER BY group_name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var mappings []*LDAPGroupMapping
+	for rows.Next() {
+		m := &LDAPGroupMapping{}
+		if err := rows.Scan(&m.ID, &m.GroupDN, &m.GroupName, &m.LocalRole, &m.LocalGroupID, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		mappings = append(mappings, m)
+	}
+	return mappings, rows.Err()
+}
+
+// UpdateLDAPGroupMapping updates an LDAP group mapping
+func (d *DB) UpdateLDAPGroupMapping(mapping *LDAPGroupMapping) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`
+		UPDATE ldap_group_mappings SET group_dn = ?, group_name = ?, local_role = ?, local_group_id = ?
+		WHERE id = ?`,
+		mapping.GroupDN, mapping.GroupName, mapping.LocalRole, mapping.LocalGroupID, mapping.ID)
+	return err
+}
+
+// DeleteLDAPGroupMapping deletes an LDAP group mapping
+func (d *DB) DeleteLDAPGroupMapping(id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM ldap_group_mappings WHERE id = ?`, id)
+	return err
+}
+
+// GetUserByLDAPDN gets a user by their LDAP DN
+func (d *DB) GetUserByLDAPDN(ldapDN string) (*User, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	user := &User{}
+	var ldapUser bool
+	var ldapDNVal string
+	err := d.db.QueryRow(`
+		SELECT id, username, password_hash, role, COALESCE(ldap_user, 0), COALESCE(ldap_dn, '')
+		FROM users WHERE ldap_dn = ?
+	`, ldapDN).Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Role, &ldapUser, &ldapDNVal)
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// CreateOrUpdateLDAPUser creates or updates a user authenticated via LDAP
+func (d *DB) CreateOrUpdateLDAPUser(username, role, ldapDN string) (*User, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Check if user exists
+	var existingID int
+	err := d.db.QueryRow(`SELECT id FROM users WHERE username = ?`, username).Scan(&existingID)
+
+	if err != nil {
+		// User doesn't exist, create new
+		result, err := d.db.Exec(`
+			INSERT INTO users (username, password_hash, role, active, ldap_user, ldap_dn)
+			VALUES (?, '', ?, 1, 1, ?)`,
+			username, role, ldapDN)
+		if err != nil {
+			return nil, err
+		}
+		id, _ := result.LastInsertId()
+		return &User{ID: int(id), Username: username, Role: role, Active: true, LDAPUser: true, LDAPDN: ldapDN}, nil
+	}
+
+	// Update existing user
+	_, err = d.db.Exec(`
+		UPDATE users SET role = ?, ldap_user = 1, ldap_dn = ? WHERE id = ?`,
+		role, ldapDN, existingID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &User{ID: existingID, Username: username, Role: role, Active: true, LDAPUser: true, LDAPDN: ldapDN}, nil
+}
+
+// IsLDAPUser checks if a user is an LDAP user
+func (d *DB) IsLDAPUser(username string) (bool, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var ldapUser bool
+	err := d.db.QueryRow(`SELECT COALESCE(ldap_user, 0) FROM users WHERE username = ?`, username).Scan(&ldapUser)
+	if err != nil {
+		return false, err
+	}
+	return ldapUser, nil
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"firecrackmanager/internal/api"
+	"firecrackmanager/internal/appliances"
 	"firecrackmanager/internal/database"
 	"firecrackmanager/internal/hostnet"
 	"firecrackmanager/internal/kernel"
@@ -209,12 +210,32 @@ func main() {
 	rootfsScanner := rootfs.NewScanner(db, config.DataDir, logger)
 	rootfsScanner.Start()
 
+	// Initialize appliances scanner (background exported VMs cache)
+	appliancesScanner := appliances.NewScanner(config.DataDir, logger)
+	appliancesScanner.SetDescriptionGetter(vmMgr.GetApplianceDescription)
+	appliancesScanner.SetOwnerGetter(func(filename string) (int, string) {
+		ownerID, _ := db.GetApplianceOwner(filename)
+		ownerName := ""
+		if ownerID > 0 {
+			if owner, err := db.GetUser(ownerID); err == nil && owner != nil {
+				ownerName = owner.Username
+			}
+		}
+		return ownerID, ownerName
+	})
+	appliancesScanner.Start()
+	logger("Appliances scanner initialized (scans every hour)")
+
 	// Initialize host network manager
 	hostNetMgr := hostnet.NewManager(logger)
 	logger("Host network manager initialized (enabled: %v)", config.EnableHostNetworkManagement)
 
 	// Initialize store (appliance store)
 	applianceStore := store.New(config.DataDir, logger)
+	applianceStore.SetOnDownloadComplete(func() {
+		logger("Store download complete, refreshing appliances cache...")
+		appliancesScanner.TriggerScan()
+	})
 	applianceStore.Start()
 	logger("Appliance store initialized")
 
@@ -226,6 +247,7 @@ func main() {
 	apiServer.SetStore(applianceStore)
 	apiServer.SetRootFSScanner(rootfsScanner)
 	apiServer.SetKernelUpdater(kernelUpd)
+	apiServer.SetAppliancesScanner(appliancesScanner)
 
 	// Initialize default admin user
 	if err := apiServer.InitDefaultAdmin(); err != nil {

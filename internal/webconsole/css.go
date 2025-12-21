@@ -160,7 +160,9 @@ const MainLayoutCSS = `
     --text-muted: #999;
     --border-color: #e0e0e0;
     --border: #e0e0e0;
+    --bg-primary: #ffffff;
     --bg-secondary: #f5f5f5;
+    --bg-tertiary: #eeeeee;
     --card-bg: #ffffff;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -234,6 +236,12 @@ body {
     color: var(--text-primary);
     font-size: 24px;
     font-weight: 500;
+}
+.title-designation {
+    font-size: 12px;
+    font-weight: normal;
+    font-style: italic;
+    padding-left: 36px;
 }
 .user-menu {
     display: flex;

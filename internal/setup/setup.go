@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"firecrackmanager/internal/database"
+	"firecrackmanager/internal/kernel"
 	"firecrackmanager/internal/proxyconfig"
 )
 
@@ -342,6 +343,14 @@ func (s *Setup) extractFirecracker(tarPath, arch string) error {
 		destPath := filepath.Join("/usr/sbin", destName)
 		s.logger("  Installing %s -> %s", baseName, destPath)
 
+		// Remove old binary first to avoid "text file busy" error
+		// On Linux, removing a file that's in use is allowed - running processes keep their reference
+		if _, err := os.Stat(destPath); err == nil {
+			if err := os.Remove(destPath); err != nil {
+				s.logger("  Warning: could not remove old %s: %v", destName, err)
+			}
+		}
+
 		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 		if err != nil {
 			return err
@@ -491,6 +500,130 @@ func (s *Setup) UpgradeFirecracker() error {
 	newVersion := strings.TrimSpace(string(out))
 
 	s.logger("Firecracker upgraded successfully to %s", newVersion)
+	return nil
+}
+
+// ProgressCallback is called during upgrade to report progress
+// step: current step number (1-5)
+// task: short description of current task
+// logMsg: detailed log message
+type ProgressCallback func(step int, task string, logMsg string)
+
+// VersionCallback is called to report version information
+type VersionCallback func(currentVersion, targetVersion string)
+
+// UpgradeFirecrackerWithProgress downloads and installs the latest Firecracker version with progress reporting
+func (s *Setup) UpgradeFirecrackerWithProgress(progress ProgressCallback, versionCb VersionCallback) error {
+	report := func(step int, task, msg string) {
+		if progress != nil {
+			progress(step, task, msg)
+		}
+		s.logger("%s", msg)
+	}
+
+	report(1, "Checking for updates", "Checking for Firecracker updates...")
+
+	// Get latest release info
+	releaseInfo, err := s.getLatestRelease()
+	if err != nil {
+		return fmt.Errorf("failed to get release info: %w", err)
+	}
+
+	report(1, "Checking for updates", fmt.Sprintf("Found latest release: %s", releaseInfo.TagName))
+
+	// Get current version
+	currentVersion := ""
+	if _, err := os.Stat("/usr/sbin/firecracker"); err == nil {
+		out, _ := exec.Command("/usr/sbin/firecracker", "--version").Output()
+		currentVersion = strings.TrimSpace(string(out))
+		if parts := strings.Fields(currentVersion); len(parts) >= 2 {
+			currentVersion = parts[1]
+		}
+	}
+
+	report(1, "Checking for updates", fmt.Sprintf("Current version: %s", currentVersion))
+	report(1, "Checking for updates", fmt.Sprintf("Latest version: %s", releaseInfo.TagName))
+
+	// Report versions
+	if versionCb != nil {
+		versionCb(currentVersion, releaseInfo.TagName)
+	}
+
+	if currentVersion == releaseInfo.TagName {
+		report(5, "Already up to date", "Already running the latest version")
+		return nil
+	}
+
+	// Find the correct asset for this architecture
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "x86_64"
+	}
+
+	var downloadURL string
+	var assetName string
+	for _, asset := range releaseInfo.Assets {
+		if strings.Contains(asset.Name, arch) && strings.HasSuffix(asset.Name, ".tgz") {
+			downloadURL = asset.BrowserDownloadURL
+			assetName = asset.Name
+			break
+		}
+	}
+
+	if downloadURL == "" {
+		return fmt.Errorf("no suitable release found for architecture %s", arch)
+	}
+
+	report(2, "Downloading", fmt.Sprintf("Downloading %s (%s)...", releaseInfo.TagName, assetName))
+
+	// Download to temp file
+	tmpFile, err := os.CreateTemp("", "firecracker-*.tgz")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpFile.Name())
+
+	// Create HTTP client with proxy support
+	client, err := proxyconfig.NewHTTPClient(30 * time.Minute)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+
+	resp, err := client.Get(downloadURL)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	report(2, "Downloading", fmt.Sprintf("Download started from %s", downloadURL))
+
+	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	tmpFile.Close()
+
+	report(2, "Downloading", "Download completed")
+
+	// Extract tarball
+	report(3, "Extracting binaries", "Extracting binaries from archive...")
+	if err := s.extractFirecracker(tmpFile.Name(), arch); err != nil {
+		return fmt.Errorf("extraction failed: %w", err)
+	}
+	report(3, "Extracting binaries", "Binaries extracted successfully")
+
+	// Verify installation
+	report(4, "Verifying installation", "Verifying installation...")
+	if _, err := os.Stat("/usr/sbin/firecracker"); err != nil {
+		return fmt.Errorf("installation verification failed")
+	}
+
+	// Get new version
+	out, _ := exec.Command("/usr/sbin/firecracker", "--version").Output()
+	newVersion := strings.TrimSpace(string(out))
+
+	report(4, "Verifying installation", fmt.Sprintf("Verified: %s", newVersion))
+	report(5, "Upgrade completed", fmt.Sprintf("Firecracker upgraded successfully to %s", newVersion))
+
 	return nil
 }
 
@@ -974,16 +1107,18 @@ func (s *Setup) registerImages(kernelPath, rootfsPath string) error {
 	if !kernelExists {
 		kernelID := generateID()
 		kernelInfo, _ := os.Stat(kernelPath)
-		kernel := &database.KernelImage{
-			ID:           kernelID,
-			Name:         "vmlinux.bin",
-			Version:      "4.14",
-			Architecture: "x86_64",
-			Path:         kernelPath,
-			Size:         kernelInfo.Size(),
-			IsDefault:    true,
+		virtioSupport := kernel.CheckVirtioSupport(kernelPath)
+		kernelImg := &database.KernelImage{
+			ID:            kernelID,
+			Name:          "vmlinux.bin",
+			Version:       "4.14",
+			Architecture:  "x86_64",
+			Path:          kernelPath,
+			Size:          kernelInfo.Size(),
+			IsDefault:     true,
+			VirtioSupport: virtioSupport,
 		}
-		if err := db.CreateKernelImage(kernel); err != nil {
+		if err := db.CreateKernelImage(kernelImg); err != nil {
 			return err
 		}
 	}

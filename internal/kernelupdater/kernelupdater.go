@@ -16,6 +16,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"firecrackmanager/internal/database"
+	"firecrackmanager/internal/kernel"
 	"firecrackmanager/internal/proxyconfig"
 )
 
@@ -430,17 +431,25 @@ func (u *KernelUpdater) performDownload(jobID string, kernelInfo *KernelInfo) {
 	// Register in database
 	fileInfo, _ := os.Stat(destPath)
 	kernelID := generateID()
-	kernel := &database.KernelImage{
-		ID:           kernelID,
-		Name:         kernelName,
-		Version:      kernelInfo.Version,
-		Architecture: "x86_64",
-		Path:         destPath,
-		Size:         fileInfo.Size(),
-		IsDefault:    false,
+
+	// Check for virtio support
+	virtioSupport := kernel.CheckVirtioSupport(destPath)
+	if !virtioSupport {
+		u.logger("Warning: Kernel %s may not have proper virtio support", kernelInfo.Version)
 	}
 
-	if err := u.db.CreateKernelImage(kernel); err != nil {
+	kernelImg := &database.KernelImage{
+		ID:            kernelID,
+		Name:          kernelName,
+		Version:       kernelInfo.Version,
+		Architecture:  "x86_64",
+		Path:          destPath,
+		Size:          fileInfo.Size(),
+		IsDefault:     false,
+		VirtioSupport: virtioSupport,
+	}
+
+	if err := u.db.CreateKernelImage(kernelImg); err != nil {
 		updateProgress("failed", 0, "Failed to register kernel", err.Error())
 		return
 	}

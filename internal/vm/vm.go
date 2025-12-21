@@ -124,6 +124,27 @@ type VMConfig struct {
 	NetworkInterfaces []NetworkInterface `json:"network-interfaces,omitempty"`
 }
 
+// MemoryHotplugConfig is the configuration for virtio-mem device (PUT /hotplug/memory before boot)
+type MemoryHotplugConfig struct {
+	TotalSizeMib int `json:"total_size_mib"`           // Maximum hotpluggable memory in MiB
+	BlockSizeMib int `json:"block_size_mib,omitempty"` // Individual block size (default: 2, min: 2, power of 2)
+	SlotSizeMib  int `json:"slot_size_mib,omitempty"`  // KVM slot size (default: 128, min: block_size_mib, power of 2)
+}
+
+// MemoryHotplugStatus is the response from GET /hotplug/memory
+type MemoryHotplugStatus struct {
+	TotalSizeMib     int `json:"total_size_mib"`
+	BlockSizeMib     int `json:"block_size_mib"`
+	SlotSizeMib      int `json:"slot_size_mib"`
+	PluggedSizeMib   int `json:"plugged_size_mib"`
+	RequestedSizeMib int `json:"requested_size_mib"`
+}
+
+// MemoryHotplugRequest is used to adjust memory at runtime (PATCH /hotplug/memory)
+type MemoryHotplugRequest struct {
+	RequestedSizeMib int `json:"requested_size_mib"` // Target memory size for guest
+}
+
 // Manager handles VM lifecycle
 // OperationProgress tracks progress of long-running operations like VM duplication
 type OperationProgress struct {
@@ -872,6 +893,18 @@ func (m *Manager) startVMInternal(vmID string) error {
 	m.db.AddVMLog(vmID, "info", "Seeding entropy via Firecracker API")
 	m.seedEntropy(actualSocketPath)
 
+	// Configure memory hotplug if enabled (must be done before InstanceStart)
+	if vm.HotplugMemoryEnabled && vm.HotplugMemoryTotalMB > 0 {
+		m.db.AddVMLog(vmID, "info", fmt.Sprintf("Configuring memory hotplug: total=%dMB, block=%dMB, slot=%dMB",
+			vm.HotplugMemoryTotalMB, vm.HotplugMemoryBlockMB, vm.HotplugMemorySlotMB))
+		if err := m.configureMemoryHotplugInternal(actualSocketPath, vm); err != nil {
+			m.db.AddVMLog(vmID, "warning", fmt.Sprintf("Failed to configure memory hotplug: %v", err))
+			// Don't fail VM start, just log warning - feature may not be available in older Firecracker
+		} else {
+			m.db.AddVMLog(vmID, "info", "Memory hotplug configured successfully")
+		}
+	}
+
 	// Start the instance
 	m.db.AddVMLog(vmID, "info", "Starting VM instance...")
 	if err := m.startInstance(actualSocketPath); err != nil {
@@ -1349,6 +1382,32 @@ func (m *Manager) startInstance(socketPath string) error {
 	return m.apiPut(client, "/actions", action)
 }
 
+// configureMemoryHotplugInternal configures the virtio-mem device before VM boot
+func (m *Manager) configureMemoryHotplugInternal(socketPath string, vm *database.VM) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", socketPath)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	config := MemoryHotplugConfig{
+		TotalSizeMib: vm.HotplugMemoryTotalMB,
+	}
+
+	// Only set non-default values
+	if vm.HotplugMemoryBlockMB > 0 && vm.HotplugMemoryBlockMB != 2 {
+		config.BlockSizeMib = vm.HotplugMemoryBlockMB
+	}
+	if vm.HotplugMemorySlotMB > 0 && vm.HotplugMemorySlotMB != 128 {
+		config.SlotSizeMib = vm.HotplugMemorySlotMB
+	}
+
+	return m.apiPut(client, "/hotplug/memory", config)
+}
+
 // seedEntropy injects random entropy into the VM before boot.
 // First tries Firecracker's entropy API, then falls back to seeding the rootfs directly.
 func (m *Manager) seedEntropy(socketPath string) error {
@@ -1620,7 +1679,7 @@ func (m *Manager) fixMissingOpenRC(mountPoint string) (bool, error) {
 ::sysinit:/bin/mount -t proc proc /proc
 ::sysinit:/bin/mount -t sysfs sysfs /sys
 ::sysinit:/bin/mount -o remount,rw /
-::sysinit:/bin/mkdir -p /dev/pts /dev/shm /run
+::sysinit:/bin/mkdir -p /dev/pts /dev/shm /run /var/run/sshd
 ::sysinit:/bin/mount -t devpts devpts /dev/pts
 ::sysinit:/bin/mount -t tmpfs tmpfs /dev/shm
 ::sysinit:/bin/mount -t tmpfs tmpfs /run
@@ -1636,6 +1695,12 @@ func (m *Manager) fixMissingOpenRC(mountPoint string) (bool, error) {
 
 # Network is configured via kernel command line
 ::sysinit:/sbin/ifconfig eth0 up 2>/dev/null
+
+# Start haveged for entropy (required for SSH in minimal VMs)
+::sysinit:/bin/sh -c '[ -x /usr/sbin/haveged ] && /usr/sbin/haveged -w 1024'
+
+# Start SSH daemon (after haveged provides entropy)
+::sysinit:/bin/sh -c '[ -x /usr/sbin/sshd ] && /usr/sbin/sshd'
 
 # Start services in /etc/init.d/
 ::wait:/bin/sh -c 'for s in /etc/init.d/S* /etc/init.d/*; do [ -x "$s" ] && "$s" start 2>/dev/null; done'
@@ -1744,6 +1809,141 @@ func (m *Manager) apiPut(client *http.Client, path string, body interface{}) err
 		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
 
+	return nil
+}
+
+func (m *Manager) apiGet(client *http.Client, path string, result interface{}) error {
+	req, err := http.NewRequest(http.MethodGet, "http://localhost"+path, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	if result != nil {
+		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) apiPatch(client *http.Client, path string, body interface{}) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, "http://localhost"+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// ConfigureMemoryHotplug configures the virtio-mem device before VM boot
+// This must be called before starting the VM
+func (m *Manager) ConfigureMemoryHotplug(vmID string, config *MemoryHotplugConfig) error {
+	m.mu.RLock()
+	rv, exists := m.runningVMs[vmID]
+	m.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("VM not running or not found")
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", rv.socketPath)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	if err := m.apiPut(client, "/hotplug/memory", config); err != nil {
+		return fmt.Errorf("failed to configure memory hotplug: %w", err)
+	}
+
+	m.logger("Configured memory hotplug for VM %s: total=%dMiB", vmID, config.TotalSizeMib)
+	return nil
+}
+
+// GetMemoryHotplugStatus returns the current memory hotplug status
+func (m *Manager) GetMemoryHotplugStatus(vmID string) (*MemoryHotplugStatus, error) {
+	m.mu.RLock()
+	rv, exists := m.runningVMs[vmID]
+	m.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("VM not running or not found")
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", rv.socketPath)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	var status MemoryHotplugStatus
+	if err := m.apiGet(client, "/hotplug/memory", &status); err != nil {
+		return nil, fmt.Errorf("failed to get memory hotplug status: %w", err)
+	}
+
+	return &status, nil
+}
+
+// AdjustHotplugMemory adjusts the hotplugged memory at runtime
+func (m *Manager) AdjustHotplugMemory(vmID string, requestedSizeMib int) error {
+	m.mu.RLock()
+	rv, exists := m.runningVMs[vmID]
+	m.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("VM not running or not found")
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", rv.socketPath)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	req := MemoryHotplugRequest{RequestedSizeMib: requestedSizeMib}
+	if err := m.apiPatch(client, "/hotplug/memory", req); err != nil {
+		return fmt.Errorf("failed to adjust hotplug memory: %w", err)
+	}
+
+	m.logger("Requested memory adjustment for VM %s: %dMiB", vmID, requestedSizeMib)
 	return nil
 }
 
@@ -1922,6 +2122,14 @@ func (m *Manager) GetVMInfo(vmID string) (map[string]interface{}, error) {
 		info["attached_disks"] = disksInfo
 	}
 
+	// Add kernel info
+	if vm.KernelPath != "" {
+		if kernel, err := m.db.GetKernelByPath(vm.KernelPath); err == nil && kernel != nil {
+			info["kernel_id"] = kernel.ID
+			info["kernel_name"] = kernel.Name
+		}
+	}
+
 	return info, nil
 }
 
@@ -1946,6 +2154,11 @@ func (m *Manager) getDiskInfo(rootfsPath string) map[string]interface{} {
 		}
 		if rootfs.DiskType != "" {
 			diskInfo["disk_type"] = rootfs.DiskType
+		}
+		// SSH server info
+		diskInfo["ssh_installed"] = rootfs.SSHInstalled
+		if rootfs.SSHVersion != "" {
+			diskInfo["ssh_version"] = rootfs.SSHVersion
 		}
 	}
 

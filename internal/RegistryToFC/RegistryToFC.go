@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
 /* ----- Public API ----- */
@@ -31,6 +33,7 @@ type ImageToFCOptions struct {
 	SizeGiB       int64  // 0 = auto (from tar, + ~35% headroom, min 2GiB)
 	Label         string // ext4 label (default "rootfs")
 	InjectMinInit bool   // add /sbin/init that execs /bin/sh if none present
+	InstallSSH    bool   // install OpenSSH server and haveged for entropy
 	TempDir       string // working dir for the tar; if empty uses a temp dir
 	ProxyURL      string // optional http(s) proxy for registry pulls (overrides global config)
 }
@@ -126,6 +129,12 @@ func ImageToFirecrackerWithProgress(ctx context.Context, imageRef string, opt Im
 		return nil, fmt.Errorf("pull %q: %w", imgRef, err)
 	}
 
+	// Extract container config for entrypoint/cmd
+	var imgConfig *v1.Config
+	if cfgFile, err := img.ConfigFile(); err == nil && cfgFile != nil {
+		imgConfig = &cfgFile.Config
+	}
+
 	reportProgress(50, "Exporting filesystem")
 
 	if err := func() error {
@@ -181,13 +190,33 @@ func ImageToFirecrackerWithProgress(ctx context.Context, imageRef string, opt Im
 		return nil, err
 	}
 
-	reportProgress(85, "Finalizing")
+	reportProgress(80, "Finalizing")
 
 	if opt.InjectMinInit {
 		if err := installMinInit(mnt); err != nil {
 			return nil, err
 		}
 	}
+
+	// Install SSH and entropy tools if requested
+	if opt.InstallSSH {
+		reportProgress(85, "Installing SSH and entropy tools")
+		if err := installSSHAndEntropy(mnt, reportProgress); err != nil {
+			// Log warning but don't fail the conversion
+			reportProgress(88, "Warning: SSH installation incomplete: "+err.Error())
+		}
+	}
+
+	// Install container entrypoint as systemd service
+	if imgConfig != nil {
+		reportProgress(90, "Creating container entrypoint service")
+		if err := installContainerEntrypoint(mnt, imgConfig, reportProgress); err != nil {
+			reportProgress(92, "Warning: Entrypoint service creation incomplete: "+err.Error())
+		}
+	}
+
+	// Configure DNS fallback (add public DNS servers)
+	configureDNSFallback(mnt)
 
 	_ = runCmd(syncCmd)
 
@@ -438,6 +467,155 @@ exec /bin/sh
 	return os.WriteFile(initPath, []byte(script), 0o755)
 }
 
+// installContainerEntrypoint creates a systemd service to run the container's entrypoint/cmd on boot
+func installContainerEntrypoint(root string, config *v1.Config, reportProgress func(int, string)) error {
+	if config == nil {
+		return nil
+	}
+
+	// Combine entrypoint and cmd to form the full command
+	var cmdParts []string
+	cmdParts = append(cmdParts, config.Entrypoint...)
+	cmdParts = append(cmdParts, config.Cmd...)
+
+	if len(cmdParts) == 0 {
+		return nil // No entrypoint or cmd defined
+	}
+
+	// Check if systemd exists
+	systemdDir := filepath.Join(root, "etc/systemd/system")
+	if !futils.FileExists(filepath.Join(root, "usr/lib/systemd/systemd")) &&
+		!futils.FileExists(filepath.Join(root, "lib/systemd/systemd")) {
+		// No systemd, skip
+		return nil
+	}
+
+	if err := os.MkdirAll(systemdDir, 0755); err != nil {
+		return err
+	}
+
+	// Build environment variables
+	var envLines []string
+	for _, env := range config.Env {
+		// Escape special characters for systemd
+		envLines = append(envLines, fmt.Sprintf("Environment=%s", env))
+	}
+	envSection := strings.Join(envLines, "\n")
+
+	// Determine working directory
+	workDir := config.WorkingDir
+	if workDir == "" {
+		workDir = "/"
+	}
+
+	// Determine user
+	user := config.User
+	if user == "" {
+		user = "root"
+	}
+
+	// Build the ExecStart command
+	// For complex commands, we create a wrapper script
+	wrapperScript := filepath.Join(root, "usr/local/bin/container-entrypoint.sh")
+	if err := os.MkdirAll(filepath.Dir(wrapperScript), 0755); err != nil {
+		return err
+	}
+
+	// Create wrapper script that handles the command properly
+	scriptContent := "#!/bin/sh\n"
+	scriptContent += fmt.Sprintf("cd %s\n", workDir)
+	scriptContent += "exec " + shellQuoteCommand(cmdParts) + "\n"
+
+	if err := os.WriteFile(wrapperScript, []byte(scriptContent), 0755); err != nil {
+		return err
+	}
+
+	// Create systemd service
+	serviceName := "container-app.service"
+	servicePath := filepath.Join(systemdDir, serviceName)
+
+	serviceContent := fmt.Sprintf(`[Unit]
+Description=Container Application
+After=network.target
+
+[Service]
+Type=simple
+User=%s
+WorkingDirectory=%s
+%s
+ExecStart=/usr/local/bin/container-entrypoint.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, user, workDir, envSection)
+
+	if err := os.WriteFile(servicePath, []byte(serviceContent), 0644); err != nil {
+		return err
+	}
+
+	// Enable the service by creating symlink
+	wantsDir := filepath.Join(systemdDir, "multi-user.target.wants")
+	if err := os.MkdirAll(wantsDir, 0755); err != nil {
+		return err
+	}
+
+	symlinkPath := filepath.Join(wantsDir, serviceName)
+	// Remove existing symlink if present
+	os.Remove(symlinkPath)
+	if err := os.Symlink(servicePath, symlinkPath); err != nil {
+		// Try relative symlink
+		os.Symlink("../"+serviceName, symlinkPath)
+	}
+
+	reportProgress(91, "Container entrypoint service created and enabled")
+	return nil
+}
+
+// shellQuoteCommand properly quotes a command for shell execution
+func shellQuoteCommand(parts []string) string {
+	var quoted []string
+	for _, p := range parts {
+		// If part contains special chars, quote it
+		if strings.ContainsAny(p, " \t\n\"'\\$`!") {
+			p = "\"" + strings.ReplaceAll(strings.ReplaceAll(p, "\\", "\\\\"), "\"", "\\\"") + "\""
+		}
+		quoted = append(quoted, p)
+	}
+	return strings.Join(quoted, " ")
+}
+
+// configureDNSFallback adds public DNS servers to resolv.conf as fallback
+func configureDNSFallback(root string) {
+	resolvConf := filepath.Join(root, "etc/resolv.conf")
+
+	// Read existing content if any
+	existingContent := ""
+	if data, err := os.ReadFile(resolvConf); err == nil {
+		existingContent = string(data)
+	}
+
+	// Check if public DNS already configured
+	if strings.Contains(existingContent, "8.8.8.8") || strings.Contains(existingContent, "1.1.1.1") {
+		return
+	}
+
+	// Ensure /etc directory exists
+	os.MkdirAll(filepath.Join(root, "etc"), 0755)
+
+	// Add fallback DNS servers
+	fallbackDNS := "\n# Fallback DNS servers added by FireCrackManager\nnameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\n"
+
+	if existingContent != "" {
+		// Append to existing
+		os.WriteFile(resolvConf, []byte(existingContent+fallbackDNS), 0644)
+	} else {
+		// Create new with fallback
+		os.WriteFile(resolvConf, []byte("# DNS configuration\n"+fallbackDNS), 0644)
+	}
+}
+
 func ensureCmd(name string) error {
 	if !futils.FileExists(name) {
 		return fmt.Errorf("required command %q not found", name)
@@ -487,4 +665,208 @@ func ConvertFromRepoToFCWithProgress(fullname string, imageDirectory string, pro
 		OutputImage:   outputPath,
 		InjectMinInit: true,
 	}, progress)
+}
+
+// ConvertFromRepoToFCWithSSH converts a container image with SSH and entropy tools installed
+func ConvertFromRepoToFCWithSSH(fullname string, imageDirectory string, progress ProgressCallback) (*ImageToFCResult, error) {
+	imageName := strings.ReplaceAll(fullname, " ", "")
+	imageName = strings.ReplaceAll(imageName, "/", "-")
+	imageName = strings.ReplaceAll(imageName, ":", "-")
+
+	futils.CreateDir(imageDirectory)
+	outputPath := fmt.Sprintf("%s/%s.ext4", imageDirectory, imageName)
+
+	return ImageToFirecrackerWithProgress(context.Background(), fullname, ImageToFCOptions{
+		OutputImage:   outputPath,
+		InjectMinInit: true,
+		InstallSSH:    true,
+	}, progress)
+}
+
+// installSSHAndEntropy installs OpenSSH server, haveged, and pre-seeds random for a mounted rootfs
+func installSSHAndEntropy(mountPoint string, reportProgress func(int, string)) error {
+	// Detect distribution and package manager
+	osRelease := ""
+	if data, err := os.ReadFile(filepath.Join(mountPoint, "etc/os-release")); err == nil {
+		osRelease = string(data)
+	}
+
+	// Bind mount required filesystems for chroot
+	for _, mount := range []struct {
+		src, dst, fstype, opts string
+	}{
+		{"/proc", filepath.Join(mountPoint, "proc"), "proc", ""},
+		{"/sys", filepath.Join(mountPoint, "sys"), "sysfs", ""},
+		{"/dev", filepath.Join(mountPoint, "dev"), "", "bind"},
+	} {
+		os.MkdirAll(mount.dst, 0755)
+		var mountCmd *exec.Cmd
+		if mount.opts == "bind" {
+			mountCmd = exec.Command("mount", "--bind", mount.src, mount.dst)
+		} else {
+			mountCmd = exec.Command("mount", "-t", mount.fstype, mount.fstype, mount.dst)
+		}
+		mountCmd.Run()
+		defer exec.Command("umount", "-l", mount.dst).Run()
+	}
+
+	// Copy resolv.conf for network access
+	if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+		os.WriteFile(filepath.Join(mountPoint, "etc/resolv.conf"), data, 0644)
+	}
+
+	var pkgManager string
+	var installSSHCmd, installHavegedCmd *exec.Cmd
+
+	// Determine package manager and install commands
+	if strings.Contains(osRelease, "Debian") || strings.Contains(osRelease, "Ubuntu") ||
+		futils.FileExists(filepath.Join(mountPoint, "usr/bin/apt-get")) {
+		pkgManager = "apt"
+		reportProgress(86, "Detected Debian/Ubuntu, updating package lists...")
+
+		// Update package lists first
+		updateCmd := exec.Command("chroot", mountPoint, "apt-get", "update", "-qq")
+		updateCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		updateCmd.Run()
+
+		installSSHCmd = exec.Command("chroot", mountPoint, "apt-get", "install", "-y", "-qq", "openssh-server")
+		installSSHCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+
+		installHavegedCmd = exec.Command("chroot", mountPoint, "apt-get", "install", "-y", "-qq", "haveged")
+		installHavegedCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+
+	} else if strings.Contains(osRelease, "Alpine") ||
+		futils.FileExists(filepath.Join(mountPoint, "sbin/apk")) {
+		pkgManager = "apk"
+		reportProgress(86, "Detected Alpine, installing packages...")
+
+		installSSHCmd = exec.Command("chroot", mountPoint, "apk", "add", "--no-cache", "openssh-server")
+		installHavegedCmd = exec.Command("chroot", mountPoint, "apk", "add", "--no-cache", "haveged")
+
+	} else if strings.Contains(osRelease, "CentOS") || strings.Contains(osRelease, "Red Hat") ||
+		strings.Contains(osRelease, "Fedora") ||
+		futils.FileExists(filepath.Join(mountPoint, "usr/bin/dnf")) {
+		pkgManager = "dnf"
+		reportProgress(86, "Detected RHEL/CentOS/Fedora, installing packages...")
+
+		installSSHCmd = exec.Command("chroot", mountPoint, "dnf", "install", "-y", "openssh-server")
+		installHavegedCmd = exec.Command("chroot", mountPoint, "dnf", "install", "-y", "haveged")
+
+	} else if futils.FileExists(filepath.Join(mountPoint, "usr/bin/yum")) {
+		pkgManager = "yum"
+		reportProgress(86, "Detected RHEL/CentOS, installing packages...")
+
+		installSSHCmd = exec.Command("chroot", mountPoint, "yum", "install", "-y", "openssh-server")
+		installHavegedCmd = exec.Command("chroot", mountPoint, "yum", "install", "-y", "haveged")
+
+	} else {
+		return fmt.Errorf("unsupported distribution: could not detect package manager")
+	}
+
+	// Install OpenSSH server
+	reportProgress(87, "Installing OpenSSH server...")
+	if installSSHCmd != nil {
+		if output, err := installSSHCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to install openssh-server: %v - %s", err, string(output))
+		}
+	}
+
+	// Install haveged for entropy
+	reportProgress(88, "Installing haveged for entropy...")
+	if installHavegedCmd != nil {
+		installHavegedCmd.Run() // Don't fail if haveged is not available
+	}
+
+	// Pre-seed the random seed file
+	randomSeedDir := filepath.Join(mountPoint, "var/lib/systemd")
+	os.MkdirAll(randomSeedDir, 0755)
+	randomSeedFile := filepath.Join(randomSeedDir, "random-seed")
+	randomData := make([]byte, 512)
+	if _, err := rand.Read(randomData); err == nil {
+		os.WriteFile(randomSeedFile, randomData, 0600)
+	}
+
+	// Enable services based on init system
+	if futils.FileExists(filepath.Join(mountPoint, "usr/lib/systemd/systemd")) ||
+		futils.FileExists(filepath.Join(mountPoint, "lib/systemd/systemd")) {
+		reportProgress(89, "Enabling SSH and haveged in systemd...")
+		exec.Command("chroot", mountPoint, "systemctl", "enable", "ssh").Run()
+		exec.Command("chroot", mountPoint, "systemctl", "enable", "sshd").Run()
+		exec.Command("chroot", mountPoint, "systemctl", "enable", "haveged").Run()
+	}
+
+	// For Alpine, enable OpenRC services or create BusyBox init.d scripts
+	if pkgManager == "apk" {
+		// Check if OpenRC is installed
+		if futils.FileExists(filepath.Join(mountPoint, "sbin/openrc")) {
+			reportProgress(89, "Enabling SSH and haveged in OpenRC...")
+			exec.Command("chroot", mountPoint, "rc-update", "add", "sshd", "default").Run()
+			exec.Command("chroot", mountPoint, "rc-update", "add", "haveged", "default").Run()
+		} else {
+			// No OpenRC - create init.d scripts for BusyBox init
+			// These will be executed by the BusyBox inittab: ::wait:/bin/sh -c 'for s in /etc/init.d/S* ...'
+			reportProgress(89, "Creating init.d scripts for BusyBox init (no OpenRC)...")
+			initdDir := filepath.Join(mountPoint, "etc/init.d")
+			os.MkdirAll(initdDir, 0755)
+
+			// S10haveged - start haveged early for entropy
+			havegedScript := `#!/bin/sh
+case "$1" in
+    start)
+        [ -x /usr/sbin/haveged ] && /usr/sbin/haveged -w 1024
+        ;;
+    stop)
+        killall haveged 2>/dev/null
+        ;;
+esac
+`
+			os.WriteFile(filepath.Join(initdDir, "S10haveged"), []byte(havegedScript), 0755)
+
+			// S50sshd - start sshd after haveged
+			sshdScript := `#!/bin/sh
+case "$1" in
+    start)
+        [ -x /usr/sbin/sshd ] && /usr/sbin/sshd
+        ;;
+    stop)
+        killall sshd 2>/dev/null
+        ;;
+esac
+`
+			os.WriteFile(filepath.Join(initdDir, "S50sshd"), []byte(sshdScript), 0755)
+		}
+	}
+
+	// Generate host keys if they don't exist
+	sshKeyDir := filepath.Join(mountPoint, "etc/ssh")
+	if _, err := os.Stat(filepath.Join(sshKeyDir, "ssh_host_rsa_key")); os.IsNotExist(err) {
+		reportProgress(90, "Generating SSH host keys...")
+		exec.Command("chroot", mountPoint, "ssh-keygen", "-A").Run()
+	}
+
+	// Configure sshd_config
+	sshdConfig := filepath.Join(sshKeyDir, "sshd_config")
+	if data, err := os.ReadFile(sshdConfig); err == nil {
+		config := string(data)
+		modified := false
+
+		if strings.Contains(config, "#PasswordAuthentication") {
+			config = strings.ReplaceAll(config, "#PasswordAuthentication no", "PasswordAuthentication yes")
+			config = strings.ReplaceAll(config, "#PasswordAuthentication yes", "PasswordAuthentication yes")
+			modified = true
+		}
+
+		if strings.Contains(config, "#PermitRootLogin") {
+			config = strings.ReplaceAll(config, "#PermitRootLogin prohibit-password", "PermitRootLogin yes")
+			config = strings.ReplaceAll(config, "#PermitRootLogin yes", "PermitRootLogin yes")
+			modified = true
+		}
+
+		if modified {
+			os.WriteFile(sshdConfig, []byte(config), 0644)
+		}
+	}
+
+	reportProgress(91, "SSH and entropy tools installed successfully")
+	return nil
 }

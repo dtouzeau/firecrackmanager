@@ -26,6 +26,7 @@ import (
 	"firecrackmanager/internal/hostnet"
 	"firecrackmanager/internal/kernel"
 	"firecrackmanager/internal/kernelupdater"
+	"firecrackmanager/internal/ldap"
 	"firecrackmanager/internal/network"
 	"firecrackmanager/internal/proxyconfig"
 	"firecrackmanager/internal/setup"
@@ -38,6 +39,20 @@ import (
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 )
+
+// UpgradeProgress tracks the progress of a Firecracker upgrade
+type UpgradeProgress struct {
+	Status         string   `json:"status"`          // idle, running, completed, error
+	Step           int      `json:"step"`            // Current step number
+	TotalSteps     int      `json:"total_steps"`     // Total number of steps
+	CurrentTask    string   `json:"current_task"`    // Description of current task
+	Logs           []string `json:"logs"`            // Log messages
+	Error          string   `json:"error,omitempty"` // Error message if failed
+	StartedAt      string   `json:"started_at,omitempty"`
+	CompletedAt    string   `json:"completed_at,omitempty"`
+	CurrentVersion string   `json:"current_version,omitempty"`
+	TargetVersion  string   `json:"target_version,omitempty"`
+}
 
 type Server struct {
 	db                          *database.DB
@@ -57,11 +72,23 @@ type Server struct {
 	builderDir                  string
 	store                       *store.Store
 	rootfsScanner               RootFSScanner
+	appliancesScanner           AppliancesScanner
+	upgradeProgress             *UpgradeProgress
+	upgradeProgressMu           sync.RWMutex
+	ldapClient                  *ldap.Client
+	ldapClientMu                sync.RWMutex
 }
 
 // RootFSScanner interface for triggering rootfs scans
 type RootFSScanner interface {
 	TriggerScan()
+}
+
+// AppliancesScanner interface for scanning exported VMs
+type AppliancesScanner interface {
+	TriggerScan()
+	ScanSync()
+	GetCached() interface{}
 }
 
 func NewServer(db *database.DB, vmMgr *vm.Manager, netMgr *network.Manager, kernelMgr *kernel.Manager, upd *updater.Updater, logger func(string, ...interface{})) *Server {
@@ -93,6 +120,11 @@ func (s *Server) SetRootFSScanner(scanner RootFSScanner) {
 // SetKernelUpdater sets the kernel updater for kernel version management
 func (s *Server) SetKernelUpdater(ku *kernelupdater.KernelUpdater) {
 	s.kernelUpdater = ku
+}
+
+// SetAppliancesScanner sets the appliances scanner for exported VMs cache
+func (s *Server) SetAppliancesScanner(scanner AppliancesScanner) {
+	s.appliancesScanner = scanner
 }
 
 // GetBuilderDir returns the current builder directory
@@ -146,6 +178,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/kernels", s.requirePermission("images", s.handleKernels))
 	s.mux.HandleFunc("/api/kernels/", s.requirePermission("images", s.handleKernel))
 	s.mux.HandleFunc("/api/kernels/download", s.requirePermission("images", s.handleKernelDownload))
+	s.mux.HandleFunc("/api/kernels/rescan-virtio", s.requireAdmin(s.handleKernelRescanVirtio))
 
 	// RootFS routes (requires images permission)
 	s.mux.HandleFunc("/api/rootfs", s.requirePermission("images", s.handleRootFSList))
@@ -182,6 +215,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/system/status", s.requireAuth(s.handleSystemStatus))
 	s.mux.HandleFunc("/api/system/firecracker/check", s.requireAuth(s.handleFirecrackerCheck))
 	s.mux.HandleFunc("/api/system/firecracker/upgrade", s.requireAdmin(s.handleFirecrackerUpgrade))
+	s.mux.HandleFunc("/api/system/firecracker/upgrade/progress", s.requireAuth(s.handleFirecrackerUpgradeProgress))
 	s.mux.HandleFunc("/api/system/jailer", s.requireAdmin(s.handleJailerConfig))
 
 	// Kernel update management
@@ -191,6 +225,9 @@ func (s *Server) registerRoutes() {
 
 	// Ping endpoint for checking VM reachability
 	s.mux.HandleFunc("/api/ping/", s.requireAuth(s.handlePing))
+
+	// Port scan endpoint
+	s.mux.HandleFunc("/api/scan-ports/", s.requireAuth(s.handleScanPorts))
 
 	// WebSocket console endpoint
 	s.mux.HandleFunc("/api/vms/console/", s.handleVMConsole)
@@ -243,6 +280,14 @@ func (s *Server) registerRoutes() {
 
 	// Host network management routes (admin only)
 	s.registerHostNetRoutes()
+
+	// LDAP/Active Directory routes (admin only)
+	s.mux.HandleFunc("/api/system/ldap", s.requireAdmin(s.handleLDAPConfig))
+	s.mux.HandleFunc("/api/system/ldap/test", s.requireAdmin(s.handleLDAPTest))
+	s.mux.HandleFunc("/api/system/ldap/groups", s.requireAdmin(s.handleLDAPGroups))
+	s.mux.HandleFunc("/api/system/ldap/group-members", s.requireAdmin(s.handleLDAPGroupMemberCount))
+	s.mux.HandleFunc("/api/ldap/group-mappings", s.requireAdmin(s.handleLDAPGroupMappings))
+	s.mux.HandleFunc("/api/ldap/group-mappings/", s.requireAdmin(s.handleLDAPGroupMapping))
 }
 
 // Authentication middleware
@@ -347,17 +392,60 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.db.GetUserByUsername(req.Username)
-	if err != nil || user == nil {
-		s.jsonError(w, "Invalid credentials", http.StatusUnauthorized)
-		return
-	}
+	var user *database.User
+	var err error
 
-	// Verify password
-	hash := sha256.Sum256([]byte(req.Password))
-	if user.PasswordHash != hex.EncodeToString(hash[:]) {
-		s.jsonError(w, "Invalid credentials", http.StatusUnauthorized)
-		return
+	// First try to find local user
+	user, err = s.db.GetUserByUsername(req.Username)
+
+	if user != nil {
+		// User exists locally
+		if user.LDAPUser {
+			// LDAP user - authenticate via LDAP
+			ldapUser, ldapErr := s.authenticateLDAP(req.Username, req.Password)
+			if ldapErr != nil {
+				s.logger("LDAP authentication failed for user %s: %v", req.Username, ldapErr)
+				s.jsonError(w, "Invalid credentials", http.StatusUnauthorized)
+				return
+			}
+			// Check if AD user has privileges
+			if !s.hasADUserPrivileges(ldapUser) {
+				s.logger("AD user %s has no privileges - login denied", req.Username)
+				s.jsonError(w, "Access denied: your account is not a member of any privileged group", http.StatusForbidden)
+				return
+			}
+			// Update user info from LDAP
+			s.updateUserFromLDAP(user, ldapUser)
+		} else {
+			// Local user - verify password hash
+			hash := sha256.Sum256([]byte(req.Password))
+			if user.PasswordHash != hex.EncodeToString(hash[:]) {
+				s.jsonError(w, "Invalid credentials", http.StatusUnauthorized)
+				return
+			}
+		}
+	} else {
+		// User doesn't exist locally - try LDAP authentication
+		ldapUser, ldapErr := s.authenticateLDAP(req.Username, req.Password)
+		if ldapErr != nil {
+			s.jsonError(w, "Invalid credentials", http.StatusUnauthorized)
+			return
+		}
+
+		// Check if AD user has privileges before creating account
+		if !s.hasADUserPrivileges(ldapUser) {
+			s.logger("AD user %s has no privileges - login denied", req.Username)
+			s.jsonError(w, "Access denied: your account is not a member of any privileged group", http.StatusForbidden)
+			return
+		}
+
+		// Create local user from LDAP
+		user, err = s.createUserFromLDAP(ldapUser)
+		if err != nil {
+			s.logger("Failed to create local user from LDAP: %v", err)
+			s.jsonError(w, "Failed to create user", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	if !user.Active {
@@ -396,6 +484,161 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"username": user.Username,
 		"role":     user.Role,
 	})
+}
+
+// authenticateLDAP attempts to authenticate a user via LDAP
+func (s *Server) authenticateLDAP(username, password string) (*ldap.ADUser, error) {
+	// Check if LDAP is enabled
+	ldapConfig, err := s.db.GetLDAPConfig()
+	if err != nil || ldapConfig == nil || !ldapConfig.Enabled {
+		return nil, fmt.Errorf("LDAP not enabled")
+	}
+
+	client, err := s.getLDAPClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get LDAP client: %w", err)
+	}
+
+	return client.AuthenticateUser(username, password)
+}
+
+// createUserFromLDAP creates a local user based on LDAP authentication
+func (s *Server) createUserFromLDAP(ldapUser *ldap.ADUser) (*database.User, error) {
+	// Determine role based on group mappings
+	role := "user"
+	var groupID string
+
+	mappings, err := s.db.ListLDAPGroupMappings()
+	if err == nil {
+		for _, mapping := range mappings {
+			for _, userGroup := range ldapUser.Groups {
+				if strings.EqualFold(userGroup, mapping.GroupDN) {
+					if mapping.LocalRole == "admin" {
+						role = "admin"
+						break
+					} else if mapping.LocalRole == "group" {
+						role = "user"
+						groupID = mapping.LocalGroupID
+					}
+				}
+			}
+			if role == "admin" {
+				break
+			}
+		}
+	}
+
+	user, err := s.db.CreateOrUpdateLDAPUser(ldapUser.SAMAccountName, role, ldapUser.DN)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add to group if specified by LDAP group mapping
+	if groupID != "" && user.ID > 0 {
+		s.db.AddGroupMember(groupID, user.ID)
+	}
+
+	// Add user to any imported AD groups they belong to
+	s.syncUserADGroupMembership(user.ID, ldapUser.Groups)
+
+	s.logger("Created/updated LDAP user: %s (role: %s)", user.Username, role)
+	return user, nil
+}
+
+// updateUserFromLDAP updates an existing user's role based on LDAP groups
+func (s *Server) updateUserFromLDAP(user *database.User, ldapUser *ldap.ADUser) {
+	// Update role based on group mappings
+	mappings, err := s.db.ListLDAPGroupMappings()
+	if err != nil {
+		return
+	}
+
+	newRole := "user"
+	var groupID string
+
+	for _, mapping := range mappings {
+		for _, userGroup := range ldapUser.Groups {
+			if strings.EqualFold(userGroup, mapping.GroupDN) {
+				if mapping.LocalRole == "admin" {
+					newRole = "admin"
+					break
+				} else if mapping.LocalRole == "group" {
+					groupID = mapping.LocalGroupID
+				}
+			}
+		}
+		if newRole == "admin" {
+			break
+		}
+	}
+
+	// Update role if changed
+	if user.Role != newRole {
+		user.Role = newRole
+		s.db.UpdateUser(user)
+		s.logger("Updated LDAP user role: %s -> %s", user.Username, newRole)
+	}
+
+	// Update group membership from mapping
+	if groupID != "" && user.ID > 0 {
+		s.db.AddGroupMember(groupID, user.ID)
+	}
+
+	// Sync user with imported AD groups they belong to
+	s.syncUserADGroupMembership(user.ID, ldapUser.Groups)
+}
+
+// syncUserADGroupMembership adds a user to any imported AD groups they belong to
+func (s *Server) syncUserADGroupMembership(userID int, adGroups []string) {
+	if userID <= 0 || len(adGroups) == 0 {
+		return
+	}
+
+	// Check each AD group the user belongs to
+	for _, adGroupDN := range adGroups {
+		// Check if this AD group DN exists as a local group (imported AD group)
+		group, err := s.db.GetGroupByName(adGroupDN)
+		if err != nil || group == nil {
+			continue
+		}
+
+		// Add user to this group
+		if err := s.db.AddGroupMember(group.ID, userID); err != nil {
+			s.logger("Failed to add user %d to AD group %s: %v", userID, group.ID, err)
+		} else {
+			s.logger("Added user %d to imported AD group: %s", userID, adGroupDN)
+		}
+	}
+}
+
+// hasADUserPrivileges checks if an AD user belongs to any privileged group
+// (either via LDAP group mappings or imported AD groups)
+func (s *Server) hasADUserPrivileges(ldapUser *ldap.ADUser) bool {
+	if ldapUser == nil || len(ldapUser.Groups) == 0 {
+		return false
+	}
+
+	// Check LDAP group mappings
+	mappings, err := s.db.ListLDAPGroupMappings()
+	if err == nil && len(mappings) > 0 {
+		for _, mapping := range mappings {
+			for _, userGroup := range ldapUser.Groups {
+				if strings.EqualFold(userGroup, mapping.GroupDN) {
+					return true
+				}
+			}
+		}
+	}
+
+	// Check imported AD groups (groups with DN as name)
+	for _, adGroupDN := range ldapUser.Groups {
+		group, err := s.db.GetGroupByName(adGroupDN)
+		if err == nil && group != nil {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -455,18 +698,22 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		var req struct {
-			Name         string `json:"name"`
-			Description  string `json:"description"`
-			VCPU         int    `json:"vcpu"`
-			MemoryMB     int    `json:"memory_mb"`
-			KernelID     string `json:"kernel_id"`
-			RootFSID     string `json:"rootfs_id"`
-			KernelArgs   string `json:"kernel_args"`
-			NetworkID    string `json:"network_id"`
-			DNSServers   string `json:"dns_servers"`
-			SnapshotType string `json:"snapshot_type"`
-			DataDiskID   string `json:"data_disk_id"`
-			RootPassword string `json:"root_password"`
+			Name                 string `json:"name"`
+			Description          string `json:"description"`
+			VCPU                 int    `json:"vcpu"`
+			MemoryMB             int    `json:"memory_mb"`
+			KernelID             string `json:"kernel_id"`
+			RootFSID             string `json:"rootfs_id"`
+			KernelArgs           string `json:"kernel_args"`
+			NetworkID            string `json:"network_id"`
+			DNSServers           string `json:"dns_servers"`
+			SnapshotType         string `json:"snapshot_type"`
+			DataDiskID           string `json:"data_disk_id"`
+			RootPassword         string `json:"root_password"`
+			HotplugMemoryEnabled bool   `json:"hotplug_memory_enabled"`
+			HotplugMemoryTotalMB int    `json:"hotplug_memory_total_mb"`
+			HotplugMemoryBlockMB int    `json:"hotplug_memory_block_mb"`
+			HotplugMemorySlotMB  int    `json:"hotplug_memory_slot_mb"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -502,18 +749,33 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 		}
 
 		vmID := generateID()
+
+		// Set hotplug defaults
+		hotplugBlockMB := req.HotplugMemoryBlockMB
+		if hotplugBlockMB <= 0 {
+			hotplugBlockMB = 2
+		}
+		hotplugSlotMB := req.HotplugMemorySlotMB
+		if hotplugSlotMB <= 0 {
+			hotplugSlotMB = 128
+		}
+
 		vmObj := &database.VM{
-			ID:           vmID,
-			Name:         req.Name,
-			Description:  req.Description,
-			VCPU:         req.VCPU,
-			MemoryMB:     req.MemoryMB,
-			KernelPath:   kernelImg.Path,
-			RootFSPath:   rootfs.Path,
-			KernelArgs:   req.KernelArgs,
-			DNSServers:   req.DNSServers,
-			SnapshotType: req.SnapshotType,
-			Status:       "stopped",
+			ID:                   vmID,
+			Name:                 req.Name,
+			Description:          req.Description,
+			VCPU:                 req.VCPU,
+			MemoryMB:             req.MemoryMB,
+			KernelPath:           kernelImg.Path,
+			RootFSPath:           rootfs.Path,
+			KernelArgs:           req.KernelArgs,
+			DNSServers:           req.DNSServers,
+			SnapshotType:         req.SnapshotType,
+			Status:               "stopped",
+			HotplugMemoryEnabled: req.HotplugMemoryEnabled,
+			HotplugMemoryTotalMB: req.HotplugMemoryTotalMB,
+			HotplugMemoryBlockMB: hotplugBlockMB,
+			HotplugMemorySlotMB:  hotplugSlotMB,
 		}
 
 		// Configure network if specified
@@ -1005,6 +1267,11 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 				s.logger("Warning: failed to set appliance owner: %v", err)
 			}
 
+			// Trigger appliances cache refresh
+			if s.appliancesScanner != nil {
+				s.appliancesScanner.TriggerScan()
+			}
+
 			s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
 				Status:     "completed",
 				Stage:      "Export completed",
@@ -1035,6 +1302,54 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		s.jsonResponse(w, map[string]interface{}{
 			"status":  "success",
 			"message": "RootFS shrunk successfully",
+		})
+
+	case "install-ssh":
+		// POST /api/vms/{id}/install-ssh - install OpenSSH server in VM rootfs
+		if r.Method != http.MethodPost {
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Get VM to check status and get rootfs path
+		vm, err := s.db.GetVM(vmID)
+		if err != nil || vm == nil {
+			s.jsonError(w, "VM not found", http.StatusNotFound)
+			return
+		}
+
+		// Check if VM is running and stop it
+		wasRunning := vm.Status == "running"
+		if wasRunning {
+			s.db.AddVMLog(vmID, "info", "Stopping VM to install SSH server")
+			if err := s.vmMgr.StopVM(vmID); err != nil {
+				s.jsonError(w, "Failed to stop VM: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			s.db.AddVMLog(vmID, "info", "VM stopped for SSH installation")
+		}
+
+		s.db.AddVMLog(vmID, "info", "Starting OpenSSH server installation")
+
+		// Install SSH in rootfs
+		if err := s.installSSHInRootFS(vm.RootFSPath, vmID); err != nil {
+			s.db.AddVMLog(vmID, "error", "SSH installation failed: "+err.Error())
+			s.jsonError(w, "Failed to install SSH: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.db.AddVMLog(vmID, "info", "OpenSSH server installed successfully")
+
+		// Trigger rootfs rescan to update SSH status
+		if s.rootfsScanner != nil {
+			s.rootfsScanner.TriggerScan()
+			s.db.AddVMLog(vmID, "info", "RootFS rescan triggered after SSH installation")
+		}
+
+		s.jsonResponse(w, map[string]interface{}{
+			"status":      "success",
+			"message":     "OpenSSH server installed successfully",
+			"was_running": wasRunning,
 		})
 
 	case "disks":
@@ -1468,7 +1783,21 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 				s.jsonError(w, "VM not found", http.StatusNotFound)
 				return
 			}
-			s.jsonResponse(w, vmObj)
+
+			// Enrich with kernel info
+			type enrichedVM struct {
+				*database.VM
+				KernelID   string `json:"kernel_id,omitempty"`
+				KernelName string `json:"kernel_name,omitempty"`
+			}
+			enriched := enrichedVM{VM: vmObj}
+			if vmObj.KernelPath != "" {
+				if kernel, err := s.db.GetKernelByPath(vmObj.KernelPath); err == nil && kernel != nil {
+					enriched.KernelID = kernel.ID
+					enriched.KernelName = kernel.Name
+				}
+			}
+			s.jsonResponse(w, enriched)
 
 		case http.MethodPut:
 			// Edit permission required for modification
@@ -1481,6 +1810,7 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 				Description  *string `json:"description"` // Pointer to allow clearing
 				VCPU         int     `json:"vcpu"`
 				MemoryMB     int     `json:"memory_mb"`
+				KernelID     string  `json:"kernel_id"` // Kernel image ID to switch kernel
 				KernelArgs   string  `json:"kernel_args"`
 				NetworkID    *string `json:"network_id"`    // Pointer to distinguish between "not provided" and "set to empty"
 				DNSServers   *string `json:"dns_servers"`   // Pointer to allow clearing
@@ -1514,6 +1844,15 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			}
 			if req.MemoryMB > 0 {
 				vmObj.MemoryMB = req.MemoryMB
+			}
+			// Handle kernel change
+			if req.KernelID != "" {
+				kernel, err := s.db.GetKernelImage(req.KernelID)
+				if err != nil || kernel == nil {
+					s.jsonError(w, "Kernel not found", http.StatusBadRequest)
+					return
+				}
+				vmObj.KernelPath = kernel.Path
 			}
 			if req.KernelArgs != "" {
 				vmObj.KernelArgs = req.KernelArgs
@@ -1729,6 +2068,174 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			"ip_address": req.IPAddress,
 			"restarted":  wasRunning,
 		})
+
+	case "memory-hotplug":
+		// Memory hotplug status and control
+		// GET /api/vms/{id}/memory-hotplug - Get memory hotplug status
+		// PATCH /api/vms/{id}/memory-hotplug - Adjust hotplugged memory (runtime)
+		// PUT /api/vms/{id}/memory-hotplug - Configure memory hotplug (pre-boot)
+
+		// Any permission grants read access
+		if !checkAccess("start") && !checkAccess("stop") && !checkAccess("console") && !checkAccess("edit") {
+			s.jsonError(w, "Access denied: no permission to access this VM", http.StatusForbidden)
+			return
+		}
+
+		vmObj, err := s.db.GetVM(vmID)
+		if err != nil || vmObj == nil {
+			s.jsonError(w, "VM not found", http.StatusNotFound)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			// Get memory hotplug status from running VM
+			if vmObj.Status != "running" {
+				// Return config from database if not running
+				s.jsonResponse(w, map[string]interface{}{
+					"enabled":       vmObj.HotplugMemoryEnabled,
+					"total_size_mb": vmObj.HotplugMemoryTotalMB,
+					"block_size_mb": vmObj.HotplugMemoryBlockMB,
+					"slot_size_mb":  vmObj.HotplugMemorySlotMB,
+					"running":       false,
+				})
+				return
+			}
+
+			status, err := s.vmMgr.GetMemoryHotplugStatus(vmID)
+			if err != nil {
+				s.jsonError(w, "Failed to get memory hotplug status: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			s.jsonResponse(w, map[string]interface{}{
+				"enabled":            vmObj.HotplugMemoryEnabled,
+				"total_size_mib":     status.TotalSizeMib,
+				"block_size_mib":     status.BlockSizeMib,
+				"slot_size_mib":      status.SlotSizeMib,
+				"plugged_size_mib":   status.PluggedSizeMib,
+				"requested_size_mib": status.RequestedSizeMib,
+				"running":            true,
+			})
+
+		case http.MethodPatch:
+			// Adjust memory at runtime (VM must be running with hotplug enabled)
+			if !checkAccess("edit") {
+				s.jsonError(w, "Access denied: no permission to modify this VM", http.StatusForbidden)
+				return
+			}
+
+			if vmObj.Status != "running" {
+				s.jsonError(w, "VM must be running to adjust memory at runtime", http.StatusBadRequest)
+				return
+			}
+
+			if !vmObj.HotplugMemoryEnabled {
+				s.jsonError(w, "Memory hotplug is not enabled for this VM", http.StatusBadRequest)
+				return
+			}
+
+			var req struct {
+				RequestedSizeMib int `json:"requested_size_mib"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+
+			if req.RequestedSizeMib <= 0 {
+				s.jsonError(w, "requested_size_mib must be positive", http.StatusBadRequest)
+				return
+			}
+
+			if err := s.vmMgr.AdjustHotplugMemory(vmID, req.RequestedSizeMib); err != nil {
+				s.jsonError(w, "Failed to adjust memory: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			s.db.AddVMLog(vmID, "info", fmt.Sprintf("Memory hotplug adjusted to %d MiB", req.RequestedSizeMib))
+			s.jsonResponse(w, map[string]interface{}{
+				"status":             "success",
+				"message":            "Memory adjusted",
+				"requested_size_mib": req.RequestedSizeMib,
+			})
+
+		case http.MethodPut:
+			// Configure memory hotplug (VM must be stopped)
+			if !checkAccess("edit") {
+				s.jsonError(w, "Access denied: no permission to modify this VM", http.StatusForbidden)
+				return
+			}
+
+			if vmObj.Status == "running" {
+				s.jsonError(w, "Cannot configure memory hotplug while VM is running", http.StatusBadRequest)
+				return
+			}
+
+			var req struct {
+				Enabled     bool `json:"enabled"`
+				TotalSizeMB int  `json:"total_size_mb"`
+				BlockSizeMB int  `json:"block_size_mb"`
+				SlotSizeMB  int  `json:"slot_size_mb"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+
+			// Validate configuration
+			if req.Enabled {
+				if req.TotalSizeMB <= 0 {
+					s.jsonError(w, "total_size_mb must be positive when enabling hotplug", http.StatusBadRequest)
+					return
+				}
+				if req.TotalSizeMB <= vmObj.MemoryMB {
+					s.jsonError(w, "total_size_mb must be greater than base memory", http.StatusBadRequest)
+					return
+				}
+				// Set defaults if not provided
+				if req.BlockSizeMB <= 0 {
+					req.BlockSizeMB = 2 // Default 2 MiB block size
+				}
+				if req.SlotSizeMB <= 0 {
+					req.SlotSizeMB = 128 // Default 128 MiB slot size
+				}
+				// Validate block size is power of 2 and >= 2
+				if req.BlockSizeMB < 2 || (req.BlockSizeMB&(req.BlockSizeMB-1)) != 0 {
+					s.jsonError(w, "block_size_mb must be a power of 2 and >= 2", http.StatusBadRequest)
+					return
+				}
+			}
+
+			// Update VM configuration
+			vmObj.HotplugMemoryEnabled = req.Enabled
+			vmObj.HotplugMemoryTotalMB = req.TotalSizeMB
+			vmObj.HotplugMemoryBlockMB = req.BlockSizeMB
+			vmObj.HotplugMemorySlotMB = req.SlotSizeMB
+
+			if err := s.db.UpdateVM(vmObj); err != nil {
+				s.jsonError(w, "Failed to update VM", http.StatusInternalServerError)
+				return
+			}
+
+			action := "disabled"
+			if req.Enabled {
+				action = fmt.Sprintf("enabled (total: %d MiB, block: %d MiB, slot: %d MiB)",
+					req.TotalSizeMB, req.BlockSizeMB, req.SlotSizeMB)
+			}
+			s.db.AddVMLog(vmID, "info", "Memory hotplug "+action)
+
+			s.jsonResponse(w, map[string]interface{}{
+				"status":        "success",
+				"enabled":       vmObj.HotplugMemoryEnabled,
+				"total_size_mb": vmObj.HotplugMemoryTotalMB,
+				"block_size_mb": vmObj.HotplugMemoryBlockMB,
+				"slot_size_mb":  vmObj.HotplugMemorySlotMB,
+			})
+
+		default:
+			s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 
 	default:
 		s.jsonError(w, "Unknown action", http.StatusBadRequest)
@@ -2805,15 +3312,22 @@ func (s *Server) handleKernelDownload(w http.ResponseWriter, r *http.Request) {
 		size, _ := s.kernelMgr.GetFileSize(path)
 		checksum, _ := s.kernelMgr.CalculateChecksum(path)
 
+		// Check for virtio support
+		virtioSupport := kernel.CheckVirtioSupport(path)
+		if !virtioSupport {
+			s.logger("Warning: Kernel %s may not have proper virtio support", req.Name)
+		}
+
 		kernelID := generateID()
 		kernelImg := &database.KernelImage{
-			ID:           kernelID,
-			Name:         req.Name,
-			Version:      req.Version,
-			Architecture: req.Architecture,
-			Path:         path,
-			Size:         size,
-			Checksum:     checksum,
+			ID:            kernelID,
+			Name:          req.Name,
+			Version:       req.Version,
+			Architecture:  req.Architecture,
+			Path:          path,
+			Size:          size,
+			Checksum:      checksum,
+			VirtioSupport: virtioSupport,
 		}
 
 		if err := s.db.CreateKernelImage(kernelImg); err != nil {
@@ -2825,6 +3339,46 @@ func (s *Server) handleKernelDownload(w http.ResponseWriter, r *http.Request) {
 		"status":       "success",
 		"message":      "Download started",
 		"progress_key": "kernel-" + req.Name,
+	})
+}
+
+// handleKernelRescanVirtio re-checks virtio support for all existing kernels
+func (s *Server) handleKernelRescanVirtio(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	kernels, err := s.db.ListKernelImages()
+	if err != nil {
+		s.jsonError(w, "Failed to list kernels", http.StatusInternalServerError)
+		return
+	}
+
+	updated := 0
+	results := make([]map[string]interface{}, 0, len(kernels))
+
+	for _, k := range kernels {
+		hasVirtio := kernel.CheckVirtioSupport(k.Path)
+		if hasVirtio != k.VirtioSupport {
+			if err := s.db.UpdateKernelVirtioSupport(k.ID, hasVirtio); err != nil {
+				s.logger("Failed to update virtio support for kernel %s: %v", k.Name, err)
+			} else {
+				updated++
+			}
+		}
+		results = append(results, map[string]interface{}{
+			"id":             k.ID,
+			"name":           k.Name,
+			"virtio_support": hasVirtio,
+			"changed":        hasVirtio != k.VirtioSupport,
+		})
+	}
+
+	s.jsonResponse(w, map[string]interface{}{
+		"status":  "success",
+		"message": fmt.Sprintf("Rescanned %d kernels, %d updated", len(kernels), updated),
+		"results": results,
 	})
 }
 
@@ -3532,6 +4086,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 			"email":      user.Email,
 			"role":       user.Role,
 			"active":     user.Active,
+			"ldap_user":  user.LDAPUser,
 			"created_at": user.CreatedAt,
 		},
 		"groups":         groupsWithVMs,
@@ -4183,6 +4738,15 @@ func (s *Server) handleFirecrackerUpgrade(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Check if upgrade is already in progress
+	s.upgradeProgressMu.RLock()
+	if s.upgradeProgress != nil && s.upgradeProgress.Status == "running" {
+		s.upgradeProgressMu.RUnlock()
+		s.jsonError(w, "Upgrade already in progress", http.StatusConflict)
+		return
+	}
+	s.upgradeProgressMu.RUnlock()
+
 	// Check if any VMs are running
 	vms, err := s.db.ListVMs()
 	if err != nil {
@@ -4197,15 +4761,68 @@ func (s *Server) handleFirecrackerUpgrade(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Initialize progress tracking
+	s.upgradeProgressMu.Lock()
+	s.upgradeProgress = &UpgradeProgress{
+		Status:     "running",
+		Step:       0,
+		TotalSteps: 5,
+		Logs:       make([]string, 0),
+		StartedAt:  time.Now().Format(time.RFC3339),
+	}
+	s.upgradeProgressMu.Unlock()
+
+	// Progress callback function
+	progressCallback := func(step int, task string, logMsg string) {
+		s.upgradeProgressMu.Lock()
+		if s.upgradeProgress != nil {
+			s.upgradeProgress.Step = step
+			s.upgradeProgress.CurrentTask = task
+			if logMsg != "" {
+				s.upgradeProgress.Logs = append(s.upgradeProgress.Logs, logMsg)
+			}
+		}
+		s.upgradeProgressMu.Unlock()
+		s.logger("%s", logMsg)
+	}
+
+	// Version callback for tracking versions
+	versionCallback := func(current, target string) {
+		s.upgradeProgressMu.Lock()
+		if s.upgradeProgress != nil {
+			s.upgradeProgress.CurrentVersion = current
+			s.upgradeProgress.TargetVersion = target
+		}
+		s.upgradeProgressMu.Unlock()
+	}
+
 	// Perform upgrade in background
 	go func() {
-		s.logger("Starting Firecracker upgrade...")
+		progressCallback(1, "Checking for updates", "Starting Firecracker upgrade...")
 
 		setupInst := setup.NewSetup(s.logger)
-		if err := setupInst.UpgradeFirecracker(); err != nil {
+		if err := setupInst.UpgradeFirecrackerWithProgress(progressCallback, versionCallback); err != nil {
+			s.upgradeProgressMu.Lock()
+			if s.upgradeProgress != nil {
+				s.upgradeProgress.Status = "error"
+				s.upgradeProgress.Error = err.Error()
+				s.upgradeProgress.CompletedAt = time.Now().Format(time.RFC3339)
+				s.upgradeProgress.Logs = append(s.upgradeProgress.Logs, fmt.Sprintf("Error: %v", err))
+			}
+			s.upgradeProgressMu.Unlock()
 			s.logger("Firecracker upgrade failed: %v", err)
 			return
 		}
+
+		s.upgradeProgressMu.Lock()
+		if s.upgradeProgress != nil {
+			s.upgradeProgress.Status = "completed"
+			s.upgradeProgress.Step = s.upgradeProgress.TotalSteps
+			s.upgradeProgress.CurrentTask = "Upgrade completed"
+			s.upgradeProgress.CompletedAt = time.Now().Format(time.RFC3339)
+			s.upgradeProgress.Logs = append(s.upgradeProgress.Logs, "Firecracker upgrade completed successfully")
+		}
+		s.upgradeProgressMu.Unlock()
 
 		s.logger("Firecracker upgrade completed successfully")
 
@@ -4217,6 +4834,30 @@ func (s *Server) handleFirecrackerUpgrade(w http.ResponseWriter, r *http.Request
 		"status":  "success",
 		"message": "Firecracker upgrade started",
 	})
+}
+
+// handleFirecrackerUpgradeProgress returns the current upgrade progress
+func (s *Server) handleFirecrackerUpgradeProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.upgradeProgressMu.RLock()
+	progress := s.upgradeProgress
+	s.upgradeProgressMu.RUnlock()
+
+	if progress == nil {
+		s.jsonResponse(w, &UpgradeProgress{
+			Status:     "idle",
+			Step:       0,
+			TotalSteps: 5,
+			Logs:       []string{},
+		})
+		return
+	}
+
+	s.jsonResponse(w, progress)
 }
 
 // handleJailerConfig handles GET/PUT for jailer configuration
@@ -4384,6 +5025,79 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.jsonResponse(w, response)
+}
+
+// handleScanPorts performs a quick TCP port scan on an IP address
+func (s *Server) handleScanPorts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract IP from URL: /api/scan-ports/{ip}
+	path := strings.TrimPrefix(r.URL.Path, "/api/scan-ports/")
+	ipStr := strings.TrimSuffix(path, "/")
+
+	if ipStr == "" {
+		s.jsonError(w, "IP address required", http.StatusBadRequest)
+		return
+	}
+
+	// Parse and validate IP address
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		s.jsonError(w, "Invalid IP address format", http.StatusBadRequest)
+		return
+	}
+
+	// Common ports to scan
+	commonPorts := []int{
+		21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995,
+		1433, 1521, 2375, 2376, 3000, 3306, 3389, 5432, 5900, 6379, 8000,
+		8080, 8443, 8888, 9000, 9090, 9200, 27017,
+	}
+
+	// Scan ports concurrently with timeout
+	openPorts := scanPortsConcurrent(ipStr, commonPorts, 500*time.Millisecond)
+
+	s.jsonResponse(w, map[string]interface{}{
+		"ip":    ipStr,
+		"ports": openPorts,
+	})
+}
+
+// scanPortsConcurrent scans multiple ports concurrently and returns open ports
+func scanPortsConcurrent(ip string, ports []int, timeout time.Duration) []int {
+	var openPorts []int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Limit concurrency to avoid overwhelming the target
+	semaphore := make(chan struct{}, 20)
+
+	for _, port := range ports {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			addr := fmt.Sprintf("%s:%d", ip, p)
+			conn, err := net.DialTimeout("tcp", addr, timeout)
+			if err == nil {
+				conn.Close()
+				mu.Lock()
+				openPorts = append(openPorts, p)
+				mu.Unlock()
+			}
+		}(port)
+	}
+
+	wg.Wait()
+
+	// Sort the open ports
+	sort.Ints(openPorts)
+	return openPorts
 }
 
 // ping sends an ICMP echo request to the specified IP and returns true if reachable
@@ -5480,7 +6194,73 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// List all .fcrack files in the data directory
+	var appliances []ApplianceInfo
+	var existingFiles []string
+
+	// Try to use cached data if available
+	if s.appliancesScanner != nil {
+		cached := s.appliancesScanner.GetCached()
+		if cached != nil {
+			// Type assert to access the cache data
+			if cacheMap, ok := cached.(interface{ GetAppliances() []interface{} }); ok {
+				_ = cacheMap // Handle interface
+			}
+			// Use reflection-free approach: marshal and unmarshal
+			cacheJSON, _ := json.Marshal(cached)
+			var cacheData struct {
+				Appliances []struct {
+					Filename     string `json:"filename"`
+					Size         int64  `json:"size"`
+					ExportedDate string `json:"exported_date"`
+					VMName       string `json:"vm_name"`
+					Description  string `json:"description"`
+					OwnerID      int    `json:"owner_id"`
+					OwnerName    string `json:"owner_name"`
+				} `json:"appliances"`
+				ScannedAt string `json:"scanned_at"`
+			}
+			if err := json.Unmarshal(cacheJSON, &cacheData); err == nil && len(cacheData.Appliances) > 0 {
+				// Filter based on user access and add access control info
+				for _, app := range cacheData.Appliances {
+					existingFiles = append(existingFiles, app.Filename)
+
+					canAccess, canWrite, isOwner := s.db.CanUserAccessAppliance(app.Filename, sess.UserID, sess.Role)
+					if !canAccess {
+						continue
+					}
+
+					appliances = append(appliances, ApplianceInfo{
+						Filename:     app.Filename,
+						Size:         app.Size,
+						ExportedDate: app.ExportedDate,
+						VMName:       app.VMName,
+						Description:  app.Description,
+						OwnerID:      app.OwnerID,
+						OwnerName:    app.OwnerName,
+						CanWrite:     canWrite,
+						IsOwner:      isOwner,
+					})
+				}
+
+				// Cleanup orphan privileges (async)
+				go func() {
+					if deleted, err := s.db.CleanupOrphanAppliancePrivileges(existingFiles); err == nil && deleted > 0 {
+						s.logger("Cleaned up %d orphan appliance privileges", deleted)
+					}
+				}()
+
+				s.jsonResponse(w, map[string]interface{}{
+					"appliances": appliances,
+					"count":      len(appliances),
+					"cached":     true,
+					"scanned_at": cacheData.ScannedAt,
+				})
+				return
+			}
+		}
+	}
+
+	// Fallback: scan directly if cache is not available
 	dataDir := s.vmMgr.GetDataDir()
 	files, err := os.ReadDir(dataDir)
 	if err != nil {
@@ -5488,10 +6268,6 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Collect existing filenames for orphan cleanup
-	var existingFiles []string
-
-	var appliances []ApplianceInfo
 	for _, file := range files {
 		if file.IsDir() || !strings.HasSuffix(file.Name(), ".fcrack") {
 			continue
@@ -5500,12 +6276,7 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 		filename := file.Name()
 		existingFiles = append(existingFiles, filename)
 
-		// Check access using CanUserAccessAppliance which handles:
-		// - Admins have full access
-		// - No privileges defined = available to everyone (read-only)
-		// - Owner has full access
-		// - Users/groups with explicit privileges
-		canAccess, _, _ := s.db.CanUserAccessAppliance(filename, sess.UserID, sess.Role)
+		canAccess, canWrite, isOwner := s.db.CanUserAccessAppliance(filename, sess.UserID, sess.Role)
 		if !canAccess {
 			continue
 		}
@@ -5515,32 +6286,22 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Parse filename to extract VM name and date
-		// Format: <vm-name>-<YYYYMMDD-HHMMSS>.fcrack
 		baseName := strings.TrimSuffix(filename, ".fcrack")
-
 		vmName := baseName
 		exportedDate := info.ModTime().Format("2006-01-02 15:04:05")
 
-		// Try to extract date from filename
 		if len(baseName) > 16 {
-			// Check if the last 15 chars match date format YYYYMMDD-HHMMSS
 			datePart := baseName[len(baseName)-15:]
 			if len(datePart) == 15 && datePart[8] == '-' {
 				if t, err := time.Parse("20060102-150405", datePart); err == nil {
 					exportedDate = t.Format("2006-01-02 15:04:05")
-					vmName = baseName[:len(baseName)-16] // Remove the date part and preceding dash
+					vmName = baseName[:len(baseName)-16]
 				}
 			}
 		}
 
-		// Replace underscores back to spaces for display
 		vmName = strings.ReplaceAll(vmName, "_", " ")
 
-		// Get write/owner info (we already checked canAccess above)
-		_, canWrite, isOwner := s.db.CanUserAccessAppliance(filename, sess.UserID, sess.Role)
-
-		// Get owner info
 		ownerID, _ := s.db.GetApplianceOwner(filename)
 		ownerName := ""
 		if ownerID > 0 {
@@ -5549,7 +6310,6 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Read description (checks metadata file first, then archive manifest)
 		description := s.vmMgr.GetApplianceDescription(filename)
 
 		appliances = append(appliances, ApplianceInfo{
@@ -5580,6 +6340,7 @@ func (s *Server) handleAppliances(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, map[string]interface{}{
 		"appliances": appliances,
 		"count":      len(appliances),
+		"cached":     false,
 	})
 }
 
@@ -5636,10 +6397,11 @@ func (s *Server) handleApplianceRestore(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Parse request body for VM name and kernel
+	// Parse request body for VM name, kernel, and optional disk expansion
 	var req struct {
-		Name     string `json:"name"`
-		KernelID string `json:"kernel_id"`
+		Name         string `json:"name"`
+		KernelID     string `json:"kernel_id"`
+		ExpandDiskGB int    `json:"expand_disk_gb"` // Optional: expand disk to this size in GB after restore
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -5674,6 +6436,9 @@ func (s *Server) handleApplianceRestore(w http.ResponseWriter, r *http.Request) 
 		Percent: 0,
 	})
 
+	// Capture expand disk size for use in goroutine
+	expandDiskGB := req.ExpandDiskGB
+
 	// Run import in background
 	go func() {
 		newVM, err := s.vmMgr.ImportVMWithProgress(filePath, req.Name, req.KernelID, opKey)
@@ -5688,6 +6453,25 @@ func (s *Server) handleApplianceRestore(w http.ResponseWriter, r *http.Request) 
 
 		s.db.AddVMLog(newVM.ID, "info", "VM restored from appliance "+filename)
 		s.logger("Restored appliance %s as VM %s (%s)", filename, req.Name, newVM.ID)
+
+		// Expand disk if requested
+		if expandDiskGB > 0 {
+			s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
+				Status:  "expanding",
+				Stage:   fmt.Sprintf("Expanding disk to %d GB...", expandDiskGB),
+				Percent: 90,
+			})
+
+			expandSizeMB := int64(expandDiskGB) * 1024
+			if err := s.vmMgr.ExpandRootFS(newVM.ID, expandSizeMB); err != nil {
+				s.logger("Warning: failed to expand disk for VM %s: %v", newVM.ID, err)
+				s.db.AddVMLog(newVM.ID, "warning", fmt.Sprintf("Failed to expand disk to %d GB: %v", expandDiskGB, err))
+				// Continue anyway - VM was created successfully
+			} else {
+				s.db.AddVMLog(newVM.ID, "info", fmt.Sprintf("Disk expanded to %d GB", expandDiskGB))
+				s.logger("Expanded disk for VM %s to %d GB", newVM.ID, expandDiskGB)
+			}
+		}
 
 		s.vmMgr.SetOperationProgress(opKey, &vm.OperationProgress{
 			Status:     "completed",
@@ -5790,6 +6574,11 @@ func (s *Server) handleAppliance(w http.ResponseWriter, r *http.Request) {
 		// Delete associated privileges
 		if err := s.db.DeleteAppliancePrivileges(filename); err != nil {
 			s.logger("Warning: failed to delete appliance privileges: %v", err)
+		}
+
+		// Refresh appliances cache synchronously so the response includes fresh data
+		if s.appliancesScanner != nil {
+			s.appliancesScanner.ScanSync()
 		}
 
 		s.logger("Deleted appliance: %s", filename)
@@ -6162,4 +6951,696 @@ func (s *Server) handleKernelDownloadProgress(w http.ResponseWriter, r *http.Req
 	}
 
 	s.jsonResponse(w, progress)
+}
+
+// installSSHInRootFS installs OpenSSH server into a rootfs image
+func (s *Server) installSSHInRootFS(rootfsPath, vmID string) error {
+	// Create temporary mount point
+	mountPoint, err := os.MkdirTemp("", "ssh-install-*")
+	if err != nil {
+		return fmt.Errorf("failed to create mount point: %w", err)
+	}
+	defer os.RemoveAll(mountPoint)
+
+	// Mount the rootfs
+	s.db.AddVMLog(vmID, "info", "Mounting rootfs for SSH installation")
+	cmd := exec.Command("mount", "-o", "loop", rootfsPath, mountPoint)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to mount rootfs: %v - %s", err, string(output))
+	}
+	defer func() {
+		exec.Command("umount", "-l", mountPoint).Run()
+	}()
+
+	// Detect distribution and package manager
+	osRelease := ""
+	if data, err := os.ReadFile(filepath.Join(mountPoint, "etc/os-release")); err == nil {
+		osRelease = string(data)
+	}
+
+	// Bind mount required filesystems for chroot
+	for _, mount := range []struct {
+		src, dst, fstype, opts string
+	}{
+		{"/proc", filepath.Join(mountPoint, "proc"), "proc", ""},
+		{"/sys", filepath.Join(mountPoint, "sys"), "sysfs", ""},
+		{"/dev", filepath.Join(mountPoint, "dev"), "", "bind"},
+	} {
+		os.MkdirAll(mount.dst, 0755)
+		var mountCmd *exec.Cmd
+		if mount.opts == "bind" {
+			mountCmd = exec.Command("mount", "--bind", mount.src, mount.dst)
+		} else {
+			mountCmd = exec.Command("mount", "-t", mount.fstype, mount.fstype, mount.dst)
+		}
+		mountCmd.Run()
+		defer exec.Command("umount", "-l", mount.dst).Run()
+	}
+
+	// Copy resolv.conf for network access
+	if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+		os.WriteFile(filepath.Join(mountPoint, "etc/resolv.conf"), data, 0644)
+	}
+
+	var installCmd *exec.Cmd
+	var pkgManager string
+
+	// Determine package manager and install command
+	if strings.Contains(osRelease, "Debian") || strings.Contains(osRelease, "Ubuntu") ||
+		fileExists(filepath.Join(mountPoint, "usr/bin/apt-get")) {
+		pkgManager = "apt"
+		s.db.AddVMLog(vmID, "info", "Detected Debian/Ubuntu system, using apt")
+
+		// Update package lists first
+		s.db.AddVMLog(vmID, "info", "Updating package lists...")
+		updateCmd := exec.Command("chroot", mountPoint, "apt-get", "update", "-qq")
+		updateCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		if output, err := updateCmd.CombinedOutput(); err != nil {
+			s.db.AddVMLog(vmID, "warning", "apt-get update warning: "+string(output))
+		}
+
+		installCmd = exec.Command("chroot", mountPoint, "apt-get", "install", "-y", "-qq", "openssh-server")
+		installCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+
+	} else if strings.Contains(osRelease, "Alpine") ||
+		fileExists(filepath.Join(mountPoint, "sbin/apk")) {
+		pkgManager = "apk"
+		s.db.AddVMLog(vmID, "info", "Detected Alpine system, using apk")
+		installCmd = exec.Command("chroot", mountPoint, "apk", "add", "--no-cache", "openssh-server")
+
+	} else if strings.Contains(osRelease, "CentOS") || strings.Contains(osRelease, "Red Hat") ||
+		strings.Contains(osRelease, "Fedora") ||
+		fileExists(filepath.Join(mountPoint, "usr/bin/dnf")) {
+		pkgManager = "dnf"
+		s.db.AddVMLog(vmID, "info", "Detected RHEL/CentOS/Fedora system, using dnf")
+		installCmd = exec.Command("chroot", mountPoint, "dnf", "install", "-y", "openssh-server")
+
+	} else if fileExists(filepath.Join(mountPoint, "usr/bin/yum")) {
+		pkgManager = "yum"
+		s.db.AddVMLog(vmID, "info", "Detected RHEL/CentOS system, using yum")
+		installCmd = exec.Command("chroot", mountPoint, "yum", "install", "-y", "openssh-server")
+
+	} else {
+		return fmt.Errorf("unsupported distribution: could not detect package manager")
+	}
+
+	// Run installation
+	s.db.AddVMLog(vmID, "info", fmt.Sprintf("Installing OpenSSH server using %s...", pkgManager))
+	output, err = installCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to install openssh-server: %v - %s", err, string(output))
+	}
+
+	// Install haveged for entropy (prevents systemd-random-seed.service hang)
+	s.db.AddVMLog(vmID, "info", "Installing haveged for entropy...")
+	var havegedCmd *exec.Cmd
+	switch pkgManager {
+	case "apt":
+		havegedCmd = exec.Command("chroot", mountPoint, "apt-get", "install", "-y", "-qq", "haveged")
+		havegedCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+	case "apk":
+		havegedCmd = exec.Command("chroot", mountPoint, "apk", "add", "--no-cache", "haveged")
+	case "dnf":
+		havegedCmd = exec.Command("chroot", mountPoint, "dnf", "install", "-y", "haveged")
+	case "yum":
+		havegedCmd = exec.Command("chroot", mountPoint, "yum", "install", "-y", "haveged")
+	}
+	if havegedCmd != nil {
+		if output, err := havegedCmd.CombinedOutput(); err != nil {
+			s.db.AddVMLog(vmID, "warning", "haveged installation warning: "+string(output))
+		}
+	}
+
+	// Pre-seed the random seed file to prevent boot hang
+	randomSeedDir := filepath.Join(mountPoint, "var/lib/systemd")
+	os.MkdirAll(randomSeedDir, 0755)
+	randomSeedFile := filepath.Join(randomSeedDir, "random-seed")
+	randomData := make([]byte, 512)
+	if _, err := rand.Read(randomData); err == nil {
+		os.WriteFile(randomSeedFile, randomData, 0600)
+		s.db.AddVMLog(vmID, "info", "Pre-seeded random-seed file for faster boot")
+	}
+
+	// Enable SSH and haveged services if systemd is present
+	if fileExists(filepath.Join(mountPoint, "usr/lib/systemd/systemd")) ||
+		fileExists(filepath.Join(mountPoint, "lib/systemd/systemd")) {
+		s.db.AddVMLog(vmID, "info", "Enabling SSH and haveged services in systemd")
+		exec.Command("chroot", mountPoint, "systemctl", "enable", "ssh").Run()
+		exec.Command("chroot", mountPoint, "systemctl", "enable", "sshd").Run()
+		exec.Command("chroot", mountPoint, "systemctl", "enable", "haveged").Run()
+	}
+
+	// For Alpine, enable OpenRC services
+	if pkgManager == "apk" {
+		s.db.AddVMLog(vmID, "info", "Enabling SSH and haveged services in OpenRC")
+		exec.Command("chroot", mountPoint, "rc-update", "add", "sshd", "default").Run()
+		exec.Command("chroot", mountPoint, "rc-update", "add", "haveged", "default").Run()
+	}
+
+	// Generate host keys if they don't exist
+	sshKeyDir := filepath.Join(mountPoint, "etc/ssh")
+	if _, err := os.Stat(filepath.Join(sshKeyDir, "ssh_host_rsa_key")); os.IsNotExist(err) {
+		s.db.AddVMLog(vmID, "info", "Generating SSH host keys")
+		exec.Command("chroot", mountPoint, "ssh-keygen", "-A").Run()
+	}
+
+	// Ensure sshd_config allows password authentication
+	sshdConfig := filepath.Join(sshKeyDir, "sshd_config")
+	if data, err := os.ReadFile(sshdConfig); err == nil {
+		config := string(data)
+		modified := false
+
+		// Enable password authentication
+		if strings.Contains(config, "#PasswordAuthentication") {
+			config = strings.ReplaceAll(config, "#PasswordAuthentication no", "PasswordAuthentication yes")
+			config = strings.ReplaceAll(config, "#PasswordAuthentication yes", "PasswordAuthentication yes")
+			modified = true
+		}
+
+		// Enable root login (for initial access)
+		if strings.Contains(config, "#PermitRootLogin") {
+			config = strings.ReplaceAll(config, "#PermitRootLogin prohibit-password", "PermitRootLogin yes")
+			config = strings.ReplaceAll(config, "#PermitRootLogin yes", "PermitRootLogin yes")
+			modified = true
+		}
+
+		if modified {
+			os.WriteFile(sshdConfig, []byte(config), 0644)
+			s.db.AddVMLog(vmID, "info", "Updated sshd_config to allow password authentication")
+		}
+	}
+
+	s.db.AddVMLog(vmID, "info", "OpenSSH server installation completed")
+	return nil
+}
+
+// fileExists checks if a file exists
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// getLDAPClient returns the current LDAP client, creating one if needed
+func (s *Server) getLDAPClient() (*ldap.Client, error) {
+	s.ldapClientMu.RLock()
+	if s.ldapClient != nil {
+		client := s.ldapClient
+		s.ldapClientMu.RUnlock()
+		return client, nil
+	}
+	s.ldapClientMu.RUnlock()
+
+	// Need to create client
+	s.ldapClientMu.Lock()
+	defer s.ldapClientMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if s.ldapClient != nil {
+		return s.ldapClient, nil
+	}
+
+	config, err := s.db.GetLDAPConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get LDAP config: %w", err)
+	}
+
+	if config == nil || !config.Enabled {
+		return nil, fmt.Errorf("LDAP is not enabled")
+	}
+
+	ldapConfig := &ldap.Config{
+		Enabled:         config.Enabled,
+		Server:          config.Server,
+		Port:            config.Port,
+		UseSSL:          config.UseSSL,
+		UseStartTLS:     config.UseStartTLS,
+		SkipVerify:      config.SkipVerify,
+		BindDN:          config.BindDN,
+		BindPassword:    config.BindPassword,
+		BaseDN:          config.BaseDN,
+		UserSearchBase:  config.UserSearchBase,
+		UserFilter:      config.UserFilter,
+		GroupSearchBase: config.GroupSearchBase,
+		GroupFilter:     config.GroupFilter,
+	}
+
+	s.ldapClient = ldap.NewClient(ldapConfig, s.logger)
+	return s.ldapClient, nil
+}
+
+// refreshLDAPClient forces recreation of the LDAP client (after config change)
+func (s *Server) refreshLDAPClient() {
+	s.ldapClientMu.Lock()
+	defer s.ldapClientMu.Unlock()
+	s.ldapClient = nil
+}
+
+// handleLDAPConfig handles GET/PUT for LDAP configuration
+func (s *Server) handleLDAPConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.getLDAPConfigHandler(w, r)
+	case http.MethodPut:
+		s.updateLDAPConfigHandler(w, r)
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) getLDAPConfigHandler(w http.ResponseWriter, r *http.Request) {
+	config, err := s.db.GetLDAPConfig()
+	if err != nil {
+		s.jsonError(w, "Failed to get LDAP config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if config == nil {
+		// Return default config
+		config = &database.LDAPConfig{
+			Enabled:     false,
+			Port:        389,
+			UseSSL:      false,
+			UseStartTLS: false,
+			SkipVerify:  true,
+			UserFilter:  "(&(objectClass=user)(sAMAccountName=%s))",
+			GroupFilter: "(objectClass=group)",
+		}
+	}
+
+	// Don't return the password
+	config.BindPassword = ""
+
+	s.jsonResponse(w, config)
+}
+
+// deriveBaseDNFromUsername extracts domain from user@domain.tld and converts to DC=domain,DC=tld
+func deriveBaseDNFromUsername(username string) string {
+	atIndex := strings.Index(username, "@")
+	if atIndex == -1 {
+		return ""
+	}
+	domain := username[atIndex+1:]
+	if domain == "" {
+		return ""
+	}
+	parts := strings.Split(domain, ".")
+	dcParts := make([]string, len(parts))
+	for i, p := range parts {
+		dcParts[i] = "DC=" + p
+	}
+	return strings.Join(dcParts, ",")
+}
+
+func (s *Server) updateLDAPConfigHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled      bool   `json:"enabled"`
+		Server       string `json:"server"`
+		Port         int    `json:"port"`
+		UseSSL       bool   `json:"use_ssl"`
+		UseStartTLS  bool   `json:"use_starttls"`
+		SkipVerify   bool   `json:"skip_verify"`
+		BindDN       string `json:"bind_dn"` // user@domain.tld format
+		BindPassword string `json:"bind_password"`
+		BaseDN       string `json:"base_dn"` // Optional, auto-derived from BindDN
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.jsonError(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Validate
+	if req.Enabled {
+		if req.Server == "" {
+			s.jsonError(w, "Server is required", http.StatusBadRequest)
+			return
+		}
+		if req.Port <= 0 {
+			req.Port = 389
+		}
+		if req.BindDN == "" {
+			s.jsonError(w, "Service account username is required", http.StatusBadRequest)
+			return
+		}
+		// Validate user@domain.tld format
+		if !strings.Contains(req.BindDN, "@") {
+			s.jsonError(w, "Service account must be in user@domain.tld format", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Get existing config to preserve password if not provided
+	existingConfig, _ := s.db.GetLDAPConfig()
+	if req.BindPassword == "" && existingConfig != nil {
+		req.BindPassword = existingConfig.BindPassword
+	}
+
+	// Auto-derive Base DN from username domain if not provided
+	baseDN := req.BaseDN
+	if baseDN == "" && req.BindDN != "" {
+		baseDN = deriveBaseDNFromUsername(req.BindDN)
+	}
+
+	config := &database.LDAPConfig{
+		Enabled:         req.Enabled,
+		Server:          req.Server,
+		Port:            req.Port,
+		UseSSL:          req.UseSSL,
+		UseStartTLS:     req.UseStartTLS,
+		SkipVerify:      req.SkipVerify,
+		BindDN:          req.BindDN,
+		BindPassword:    req.BindPassword,
+		BaseDN:          baseDN,
+		UserSearchBase:  baseDN, // Use BaseDN for user searches
+		UserFilter:      "(&(objectClass=user)(sAMAccountName=%s))",
+		GroupSearchBase: baseDN, // Use BaseDN for group searches
+		GroupFilter:     "(objectClass=group)",
+	}
+
+	if err := s.db.SaveLDAPConfig(config); err != nil {
+		s.jsonError(w, "Failed to save LDAP config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Refresh LDAP client
+	s.refreshLDAPClient()
+
+	s.logger("LDAP configuration updated, enabled=%v server=%s", config.Enabled, config.Server)
+	s.jsonResponse(w, map[string]string{"status": "success"})
+}
+
+// handleLDAPTest tests the LDAP connection
+func (s *Server) handleLDAPTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Option to test with provided config (before saving)
+	var req struct {
+		Server       string `json:"server"`
+		Port         int    `json:"port"`
+		UseSSL       bool   `json:"use_ssl"`
+		UseStartTLS  bool   `json:"use_starttls"`
+		SkipVerify   bool   `json:"skip_verify"`
+		BindDN       string `json:"bind_dn"` // user@domain.tld format
+		BindPassword string `json:"bind_password"`
+		BaseDN       string `json:"base_dn"` // Optional, auto-derived
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.jsonError(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Get existing password if not provided
+	if req.BindPassword == "" {
+		existingConfig, _ := s.db.GetLDAPConfig()
+		if existingConfig != nil {
+			req.BindPassword = existingConfig.BindPassword
+		}
+	}
+
+	if req.Server == "" {
+		s.jsonError(w, "Server is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Port <= 0 {
+		req.Port = 389
+	}
+
+	// Auto-derive Base DN from username domain if not provided
+	baseDN := req.BaseDN
+	if baseDN == "" && req.BindDN != "" {
+		baseDN = deriveBaseDNFromUsername(req.BindDN)
+	}
+
+	testConfig := &ldap.Config{
+		Enabled:      true,
+		Server:       req.Server,
+		Port:         req.Port,
+		UseSSL:       req.UseSSL,
+		UseStartTLS:  req.UseStartTLS,
+		SkipVerify:   req.SkipVerify,
+		BindDN:       req.BindDN,
+		BindPassword: req.BindPassword,
+		BaseDN:       baseDN,
+	}
+
+	client := ldap.NewClient(testConfig, s.logger)
+	if err := client.TestConnection(); err != nil {
+		s.jsonResponse(w, map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	s.jsonResponse(w, map[string]interface{}{
+		"success": true,
+		"message": "Connection successful",
+	})
+}
+
+// handleLDAPGroups searches for AD groups
+func (s *Server) handleLDAPGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	query := r.URL.Query().Get("q")
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	client, err := s.getLDAPClient()
+	if err != nil {
+		s.jsonError(w, "LDAP not available: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	groups, err := client.SearchGroups(query, limit)
+	if err != nil {
+		s.jsonError(w, "Failed to search groups: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.jsonResponse(w, groups)
+}
+
+// handleLDAPGroupMemberCount returns the member count or list for an AD group
+func (s *Server) handleLDAPGroupMemberCount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	groupDN := r.URL.Query().Get("dn")
+	if groupDN == "" {
+		s.jsonError(w, "Group DN is required", http.StatusBadRequest)
+		return
+	}
+
+	client, err := s.getLDAPClient()
+	if err != nil {
+		s.jsonError(w, "LDAP not available: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	// If list=true, return full member list; otherwise just count
+	if r.URL.Query().Get("list") == "true" {
+		members, err := client.GetGroupMembers(groupDN)
+		if err != nil {
+			s.jsonError(w, "Failed to get members: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.jsonResponse(w, map[string]interface{}{
+			"count":   len(members),
+			"members": members,
+		})
+		return
+	}
+
+	count, err := client.GetGroupMemberCount(groupDN)
+	if err != nil {
+		s.jsonError(w, "Failed to get member count: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.jsonResponse(w, map[string]int{"count": count})
+}
+
+// handleLDAPGroupMappings handles GET/POST for group mappings
+func (s *Server) handleLDAPGroupMappings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.listLDAPGroupMappings(w, r)
+	case http.MethodPost:
+		s.createLDAPGroupMapping(w, r)
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) listLDAPGroupMappings(w http.ResponseWriter, r *http.Request) {
+	mappings, err := s.db.ListLDAPGroupMappings()
+	if err != nil {
+		s.jsonError(w, "Failed to list group mappings: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.jsonResponse(w, mappings)
+}
+
+func (s *Server) createLDAPGroupMapping(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		GroupDN      string `json:"group_dn"`
+		GroupName    string `json:"group_name"`
+		LocalRole    string `json:"local_role"`
+		LocalGroupID string `json:"local_group_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.jsonError(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.GroupDN == "" {
+		s.jsonError(w, "Group DN is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.LocalRole == "" {
+		req.LocalRole = "user"
+	}
+
+	// Validate role
+	validRoles := map[string]bool{"admin": true, "user": true, "group": true}
+	if !validRoles[req.LocalRole] {
+		s.jsonError(w, "Invalid role, must be: admin, user, or group", http.StatusBadRequest)
+		return
+	}
+
+	if req.LocalRole == "group" && req.LocalGroupID == "" {
+		s.jsonError(w, "Local group ID is required when role is 'group'", http.StatusBadRequest)
+		return
+	}
+
+	mapping := &database.LDAPGroupMapping{
+		ID:           generateID(),
+		GroupDN:      req.GroupDN,
+		GroupName:    req.GroupName,
+		LocalRole:    req.LocalRole,
+		LocalGroupID: req.LocalGroupID,
+	}
+
+	if err := s.db.CreateLDAPGroupMapping(mapping); err != nil {
+		s.jsonError(w, "Failed to create mapping: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.logger("Created LDAP group mapping: %s -> %s", req.GroupDN, req.LocalRole)
+	s.jsonResponse(w, mapping)
+}
+
+// handleLDAPGroupMapping handles GET/PUT/DELETE for a specific group mapping
+func (s *Server) handleLDAPGroupMapping(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/ldap/group-mappings/")
+	if id == "" {
+		s.jsonError(w, "Mapping ID required", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		s.getLDAPGroupMapping(w, r, id)
+	case http.MethodPut:
+		s.updateLDAPGroupMapping(w, r, id)
+	case http.MethodDelete:
+		s.deleteLDAPGroupMapping(w, r, id)
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) getLDAPGroupMapping(w http.ResponseWriter, r *http.Request, id string) {
+	mapping, err := s.db.GetLDAPGroupMapping(id)
+	if err != nil {
+		s.jsonError(w, "Failed to get mapping: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if mapping == nil {
+		s.jsonError(w, "Mapping not found", http.StatusNotFound)
+		return
+	}
+	s.jsonResponse(w, mapping)
+}
+
+func (s *Server) updateLDAPGroupMapping(w http.ResponseWriter, r *http.Request, id string) {
+	var req struct {
+		GroupDN      string `json:"group_dn"`
+		GroupName    string `json:"group_name"`
+		LocalRole    string `json:"local_role"`
+		LocalGroupID string `json:"local_group_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.jsonError(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	mapping, err := s.db.GetLDAPGroupMapping(id)
+	if err != nil {
+		s.jsonError(w, "Failed to get mapping: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if mapping == nil {
+		s.jsonError(w, "Mapping not found", http.StatusNotFound)
+		return
+	}
+
+	if req.GroupDN != "" {
+		mapping.GroupDN = req.GroupDN
+	}
+	if req.GroupName != "" {
+		mapping.GroupName = req.GroupName
+	}
+	if req.LocalRole != "" {
+		validRoles := map[string]bool{"admin": true, "user": true, "group": true}
+		if !validRoles[req.LocalRole] {
+			s.jsonError(w, "Invalid role, must be: admin, user, or group", http.StatusBadRequest)
+			return
+		}
+		mapping.LocalRole = req.LocalRole
+	}
+	mapping.LocalGroupID = req.LocalGroupID
+
+	if mapping.LocalRole == "group" && mapping.LocalGroupID == "" {
+		s.jsonError(w, "Local group ID is required when role is 'group'", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.db.UpdateLDAPGroupMapping(mapping); err != nil {
+		s.jsonError(w, "Failed to update mapping: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.logger("Updated LDAP group mapping: %s", id)
+	s.jsonResponse(w, mapping)
+}
+
+func (s *Server) deleteLDAPGroupMapping(w http.ResponseWriter, r *http.Request, id string) {
+	if err := s.db.DeleteLDAPGroupMapping(id); err != nil {
+		s.jsonError(w, "Failed to delete mapping: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.logger("Deleted LDAP group mapping: %s", id)
+	s.jsonResponse(w, map[string]string{"status": "success"})
 }

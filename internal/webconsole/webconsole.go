@@ -94,6 +94,12 @@ func (wc *WebConsole) handleAssets(w http.ResponseWriter, r *http.Request) {
 	case "apexcharts.min.js":
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Write([]byte(ApexChartsJS))
+	case "sweetalert2.min.js":
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Write([]byte(SweetAlert2JS))
+	case "sweetalert2.min.css":
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Write([]byte(SweetAlert2CSS))
 	case "Articafond3.png":
 		w.Header().Set("Content-Type", "image/png")
 		w.Write(LoginBackgroundPNG)
@@ -241,7 +247,8 @@ func (wc *WebConsole) handleDockerPage(w http.ResponseWriter, r *http.Request) {
 func (wc *WebConsole) handleAppliancesPage(w http.ResponseWriter, r *http.Request) {
 	sess := wc.getSession(r)
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, wc.baseTemplate("Appliances", "appliances", wc.renderAppliancesPage(), sess))
+	title := `<svg xmlns="http://www.w3.org/2000/svg" height="28" viewBox="0 -960 960 960" width="28" fill="currentColor" style="vertical-align: middle; margin-right: 10px;"><path d="M200-80q-33 0-56.5-23.5T120-160v-451q-18-11-29-28.5T80-680v-120q0-33 23.5-56.5T160-880h640q33 0 56.5 23.5T880-800v120q0 23-11 40.5T840-611v451q0 33-23.5 56.5T760-80H200Zm0-520v440h560v-440H200Zm-40-80h640v-120H160v120Zm200 280h240v-80H360v80Zm120 20Z"/></svg>Appliances<div class="title-designation">Exported VM appliances (.fcrack archives) ready for download or import on other systems.</div>`
+	fmt.Fprint(w, wc.baseTemplate(title, "appliances", wc.renderAppliancesPage(), sess))
 }
 
 func (wc *WebConsole) handleStorePage(w http.ResponseWriter, r *http.Request) {
@@ -439,6 +446,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 	}
 
 	adminMenu := ""
+	settingsMenu := ""
 	if isAdmin {
 		adminMenu = `<a href="/vmgroups" class="nav-item" data-page="vmgroups">
             <span class="material-icons">folder_special</span>
@@ -448,6 +456,10 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
             <span class="material-icons">people</span>
             <span>Users & Groups</span>
         </a>`
+		settingsMenu = `<a href="/settings" class="nav-item" data-page="settings">
+                <span class="material-icons">settings</span>
+                <span>Settings</span>
+            </a>`
 	}
 
 	return fmt.Sprintf(`<!DOCTYPE html>
@@ -457,8 +469,89 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>%s - FireCrackManager</title>
     <link href="/assets/material-icons.css" rel="stylesheet">
+    <link href="/assets/sweetalert2.min.css" rel="stylesheet">
     <style>`+MainLayoutCSS+`</style>
+    <script src="/assets/sweetalert2.min.js"></script>
     <script>
+        // SweetAlert2 wrapper functions - override native dialogs
+        const _originalAlert = window.alert;
+        const _originalConfirm = window.confirm;
+
+        // Custom alert using SweetAlert2
+        window.alert = function(message) {
+            // Determine icon based on message content
+            let icon = 'info';
+            let title = 'Information';
+            const msgLower = (message || '').toLowerCase();
+            if (msgLower.includes('error') || msgLower.includes('failed') || msgLower.includes('cannot')) {
+                icon = 'error';
+                title = 'Error';
+            } else if (msgLower.includes('success') || msgLower.includes('completed') || msgLower.includes('saved') || msgLower.includes('created') || msgLower.includes('deleted') || msgLower.includes('updated')) {
+                icon = 'success';
+                title = 'Success';
+            } else if (msgLower.includes('warning') || msgLower.includes('please')) {
+                icon = 'warning';
+                title = 'Warning';
+            }
+
+            Swal.fire({
+                title: title,
+                text: message,
+                icon: icon,
+                confirmButtonText: 'OK',
+                confirmButtonColor: '#1ab394',
+                background: 'var(--bg-primary)',
+                color: 'var(--text-primary)',
+                customClass: {
+                    popup: 'swal-dark-theme'
+                }
+            });
+        };
+
+        // Custom confirm using SweetAlert2 - returns Promise
+        // For synchronous code compatibility, we provide showConfirm() as async alternative
+        window.showConfirm = async function(message, title = 'Confirm') {
+            const result = await Swal.fire({
+                title: title,
+                text: message,
+                icon: 'question',
+                showCancelButton: true,
+                confirmButtonText: 'Yes',
+                cancelButtonText: 'Cancel',
+                confirmButtonColor: '#1ab394',
+                cancelButtonColor: '#6c757d',
+                background: 'var(--bg-primary)',
+                color: 'var(--text-primary)',
+                customClass: {
+                    popup: 'swal-dark-theme'
+                }
+            });
+            return result.isConfirmed;
+        };
+
+        // Toast notification helper
+        window.showToast = function(message, icon = 'success') {
+            const Toast = Swal.mixin({
+                toast: true,
+                position: 'top-end',
+                showConfirmButton: false,
+                timer: 3000,
+                timerProgressBar: true,
+                background: 'var(--bg-secondary)',
+                color: 'var(--text-primary)',
+                didOpen: (toast) => {
+                    toast.addEventListener('mouseenter', Swal.stopTimer);
+                    toast.addEventListener('mouseleave', Swal.resumeTimer);
+                }
+            });
+            Toast.fire({ icon: icon, title: message });
+        };
+
+        // Percent icon SVG helper - returns SVG element for percent symbol
+        window.percentIcon = function(size = 14) {
+            return '<svg xmlns="http://www.w3.org/2000/svg" height="' + size + '" viewBox="0 -960 960 960" width="' + size + '" fill="currentColor" style="vertical-align: middle;"><path d="M300-520q-58 0-99-41t-41-99q0-58 41-99t99-41q58 0 99 41t41 99q0 58-41 99t-99 41Zm0-80q25 0 42.5-17.5T360-660q0-25-17.5-42.5T300-720q-25 0-42.5 17.5T240-660q0 25 17.5 42.5T300-600Zm360 440q-58 0-99-41t-41-99q0-58 41-99t99-41q58 0 99 41t41 99q0 58-41 99t-99 41Zm0-80q25 0 42.5-17.5T720-300q0-25-17.5-42.5T660-360q-25 0-42.5 17.5T600-300q0 25 17.5 42.5T660-240Zm-444 80-56-56 584-584 56 56-584 584Z"/></svg>';
+        };
+
         // Common utility functions - must be in head so they're available to page scripts
         // Modal functions
         function openModal(id) {
@@ -539,10 +632,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
                 <span class="material-icons">article</span>
                 <span>Logs</span>
             </a>
-            <a href="/settings" class="nav-item" data-page="settings">
-                <span class="material-icons">settings</span>
-                <span>Settings</span>
-            </a>
+            %s
             %s
             %s
             %s
@@ -572,7 +662,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
         });
     </script>
 </body>
-</html>`, title, dashboardMenu, networksMenu, imagesMenu, migrationMenu, hostNetworkMenu, adminMenu, title, username, content, page)
+</html>`, title, dashboardMenu, networksMenu, imagesMenu, settingsMenu, migrationMenu, hostNetworkMenu, adminMenu, title, username, content, page)
 }
 
 func (wc *WebConsole) renderDashboard() string {
@@ -601,7 +691,7 @@ func (wc *WebConsole) renderDashboard() string {
             <span class="label label-primary" id="cpuStatusLabel">OK</span>
         </div>
         <div class="ibox-content">
-            <h1 id="cpuPercent">-%%</h1>
+            <h1 id="cpuPercent">-</h1>
             <div class="stat-percent text-success" id="cpuCores">- CPUs <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
             <small>Used CPU</small>
         </div>
@@ -618,7 +708,7 @@ func (wc *WebConsole) renderDashboard() string {
         </div>
         <div class="ibox-content">
             <h1 id="memUsed">-</h1>
-            <div class="stat-percent text-success" id="memPercent">-%% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
+            <div class="stat-percent text-success" id="memPercent">- <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
             <small id="memTotal">Total: -</small>
         </div>
         <div class="ibox-footer">
@@ -634,7 +724,7 @@ func (wc *WebConsole) renderDashboard() string {
         </div>
         <div class="ibox-content">
             <h1 id="diskUsed">-</h1>
-            <div class="stat-percent text-success" id="diskPercent">-%% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
+            <div class="stat-percent text-success" id="diskPercent">- <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
             <small id="diskTotal">Total: -</small>
         </div>
         <div class="ibox-footer" style="padding: 15px;">
@@ -785,7 +875,7 @@ async function loadDashboard() {
 
         // CPU
         const cpuPercent = sys.cpu_percent || 0;
-        document.getElementById('cpuPercent').textContent = cpuPercent.toFixed(0) + '%%';
+        document.getElementById('cpuPercent').innerHTML = cpuPercent.toFixed(0) + percentIcon(20);
         document.getElementById('cpuCores').innerHTML = (sys.cpu_cores || '-') + ' CPUs <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
         const cpuLabel = document.getElementById('cpuStatusLabel');
         if (cpuPercent > 80) {
@@ -808,7 +898,7 @@ async function loadDashboard() {
         const memTotalMB = sys.mem_total_mb || 1;
         const memPct = (memUsedMB / memTotalMB * 100);
         document.getElementById('memUsed').textContent = formatMemory(memUsedMB);
-        document.getElementById('memPercent').innerHTML = memPct.toFixed(1) + '%% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
+        document.getElementById('memPercent').innerHTML = memPct.toFixed(1) + percentIcon(14) + ' <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
         document.getElementById('memTotal').textContent = 'Total: ' + formatMemory(memTotalMB);
         const memLabel = document.getElementById('memStatusLabel');
         if (memPct > 80) {
@@ -832,7 +922,7 @@ async function loadDashboard() {
         const diskFreeGB = diskTotalGB - diskUsedGB;
         const diskPct = sys.disk_percent || 0;
         document.getElementById('diskUsed').textContent = diskUsedGB.toFixed(1) + ' GB';
-        document.getElementById('diskPercent').innerHTML = diskPct.toFixed(1) + '%% <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
+        document.getElementById('diskPercent').innerHTML = diskPct.toFixed(1) + percentIcon(14) + ' <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span>';
         document.getElementById('diskTotal').textContent = 'Total: ' + diskTotalGB.toFixed(1) + ' GB';
         document.getElementById('diskFreeLabel').textContent = diskFreeGB.toFixed(1) + ' GB free';
         document.getElementById('diskUsedLabel').textContent = diskUsedGB.toFixed(1) + ' GB used';
@@ -1052,6 +1142,44 @@ func (wc *WebConsole) renderVMsPage() string {
                     <label>Memory (MB)</label>
                     <input type="number" name="memory_mb" value="512" min="128" step="128">
                 </div>
+                <div class="form-group" style="margin-top: 10px;">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" name="hotplug_enabled" id="createHotplugEnabled" onchange="toggleHotplugOptions('create')">
+                        <span>Enable Memory Hotplug</span>
+                    </label>
+                    <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Allow dynamic memory adjustment while VM is running (requires kernel 5.16+)</small>
+                </div>
+                <div id="createHotplugOptions" style="display: none; padding: 10px; background: var(--surface); border-radius: 4px; margin-top: 10px;">
+                    <div class="form-group">
+                        <label>Max Memory (MB)</label>
+                        <input type="number" name="hotplug_total_mb" id="createHotplugTotal" min="256" step="128" placeholder="2048">
+                        <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Maximum memory that can be hotplugged (must be greater than base memory)</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Block Size (MB)</label>
+                        <select name="hotplug_block_mb" id="createHotplugBlock">
+                            <option value="2" selected>2 MB (default)</option>
+                            <option value="4">4 MB</option>
+                            <option value="8">8 MB</option>
+                            <option value="16">16 MB</option>
+                            <option value="32">32 MB</option>
+                            <option value="64">64 MB</option>
+                            <option value="128">128 MB</option>
+                        </select>
+                        <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Memory block granularity (power of 2, min 2MB)</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Slot Size (MB)</label>
+                        <select name="hotplug_slot_mb" id="createHotplugSlot">
+                            <option value="32">32 MB</option>
+                            <option value="64">64 MB</option>
+                            <option value="128" selected>128 MB (default)</option>
+                            <option value="256">256 MB</option>
+                            <option value="512">512 MB</option>
+                        </select>
+                        <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Memory slot size for virtio-mem device</small>
+                    </div>
+                </div>
                 <div class="form-group">
                     <label>Kernel</label>
                     <select name="kernel_id" required id="kernelSelect">
@@ -1128,6 +1256,44 @@ func (wc *WebConsole) renderVMsPage() string {
                 <div class="form-group">
                     <label>Memory (MB)</label>
                     <input type="number" name="memory_mb" id="editVmMemory" min="128" step="128">
+                </div>
+                <div class="form-group" style="margin-top: 10px;">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" id="editHotplugEnabled" onchange="toggleHotplugOptions('edit')">
+                        <span>Enable Memory Hotplug</span>
+                    </label>
+                    <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Allow dynamic memory adjustment while VM is running (requires kernel 5.16+)</small>
+                </div>
+                <div id="editHotplugOptions" style="display: none; padding: 10px; background: var(--surface); border-radius: 4px; margin-top: 10px;">
+                    <div class="form-group">
+                        <label>Max Memory (MB)</label>
+                        <input type="number" id="editHotplugTotal" min="256" step="128" placeholder="2048">
+                        <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Maximum memory that can be hotplugged (must be greater than base memory)</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Block Size (MB)</label>
+                        <select id="editHotplugBlock">
+                            <option value="2">2 MB (default)</option>
+                            <option value="4">4 MB</option>
+                            <option value="8">8 MB</option>
+                            <option value="16">16 MB</option>
+                            <option value="32">32 MB</option>
+                            <option value="64">64 MB</option>
+                            <option value="128">128 MB</option>
+                        </select>
+                        <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Memory block granularity (power of 2, min 2MB)</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Slot Size (MB)</label>
+                        <select id="editHotplugSlot">
+                            <option value="32">32 MB</option>
+                            <option value="64">64 MB</option>
+                            <option value="128">128 MB (default)</option>
+                            <option value="256">256 MB</option>
+                            <option value="512">512 MB</option>
+                        </select>
+                        <small class="small-text-tip" style="color: var(--text-secondary); font-size: 11px;">Memory slot size for virtio-mem device</small>
+                    </div>
                 </div>
                 <div class="form-group">
                     <label>Network</label>
@@ -1262,7 +1428,7 @@ func (wc *WebConsole) renderVMsPage() string {
             <div id="duplicateProgress" style="display: none; margin-top: 15px;">
                 <div style="margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
                     <span id="duplicateProgressStage" style="color: var(--text-secondary); font-size: 13px;">Initializing...</span>
-                    <span id="duplicateProgressPercent" style="color: var(--primary); font-weight: 500;">0%%</span>
+                    <span id="duplicateProgressPercent" style="color: var(--primary); font-weight: 500;">0</span>
                 </div>
                 <div style="background: var(--bg-tertiary); border-radius: 4px; overflow: hidden; height: 8px;">
                     <div id="duplicateProgressBar" style="background: var(--primary); height: 100%%; width: 0%%; transition: width 0.3s ease;"></div>
@@ -1892,29 +2058,29 @@ function createVMRow(vm) {
                         <button class="action-dropdown-item" onclick="editVM('${vm.id}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">edit</span> Edit
                         </button>
-                        <button class="action-dropdown-item" onclick="openChangePasswordModal('${vm.id}', '${vm.name}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
+                        <button class="action-dropdown-item" onclick="openChangePasswordModal('${vm.id}', '${(vm.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">key</span> Change Password
                         </button>
                         <button class="action-dropdown-item" onclick="createSnapshot('${vm.id}'); closeAllMenus();" ${vm.status !== 'running' || !vm.snapshot_type ? 'disabled' : ''}>
                             <span class="material-icons">photo_camera</span> Snapshots
                         </button>
-                        <button class="action-dropdown-item" onclick="openDisksModal('${vm.id}', '${vm.name}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
+                        <button class="action-dropdown-item" onclick="openDisksModal('${vm.id}', '${(vm.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n')}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">storage</span> Disks
                         </button>
-                        <button class="action-dropdown-item" onclick="openNetworksModal('${vm.id}', '${vm.name}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
+                        <button class="action-dropdown-item" onclick="openNetworksModal('${vm.id}', '${(vm.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n')}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">lan</span> Networks
                         </button>
                         <div class="action-dropdown-divider"></div>
-                        <button class="action-dropdown-item" onclick="shrinkVM('${vm.id}', '${vm.name}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
+                        <button class="action-dropdown-item" onclick="shrinkVM('${vm.id}', '${(vm.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n')}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">compress</span> Shrink
                         </button>
-                        <button class="action-dropdown-item" onclick="duplicateVM('${vm.id}', '${vm.name}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
+                        <button class="action-dropdown-item" onclick="duplicateVM('${vm.id}', '${(vm.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n')}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">content_copy</span> Duplicate
                         </button>
-                        <button class="action-dropdown-item" onclick="exportVM('${vm.id}', '${vm.name}', '${(vm.description || '').replace(/'/g, "\\'")}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
+                        <button class="action-dropdown-item" onclick="exportVM('${vm.id}', '${(vm.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n')}', '${(vm.description || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n')}'); closeAllMenus();" ${vm.status === 'running' ? 'disabled' : ''}>
                             <span class="material-icons">download</span> Export
                         </button>
-                        <button class="action-dropdown-item" onclick="openMoveToGroupModal('${vm.id}', '${vm.name}'); closeAllMenus();">
+                        <button class="action-dropdown-item" onclick="openMoveToGroupModal('${vm.id}', '${(vm.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n')}'); closeAllMenus();">
                             <span class="material-icons">folder_special</span> Move to Group
                         </button>
                         <div class="action-dropdown-divider"></div>
@@ -1969,6 +2135,19 @@ function updateVMRow(row, vm, oldVm) {
                     btn.disabled = vm.status !== 'running' || !vm.snapshot_type;
                 }
             });
+        }
+
+        // Update reachability cell when status changes
+        const pingCell = document.getElementById('ping-' + vm.id);
+        if (pingCell) {
+            if (vm.status === 'running' && vm.ip_address) {
+                // Show loading spinner and trigger reachability check
+                pingCell.innerHTML = '<span class="material-icons" style="color: var(--text-secondary); animation: spin 1s linear infinite;">sync</span>';
+                checkVMReachability(vm.id, vm.ip_address);
+            } else {
+                // VM is not running, clear reachability status
+                pingCell.innerHTML = '-';
+            }
         }
     }
 
@@ -2121,6 +2300,7 @@ async function loadFormData() {
 async function createVM() {
     const form = document.getElementById('createVMForm');
     const formData = new FormData(form);
+    const hotplugEnabled = document.getElementById('createHotplugEnabled').checked;
     const data = {
         name: formData.get('name'),
         vcpu: parseInt(formData.get('vcpu')) || 1,
@@ -2131,17 +2311,28 @@ async function createVM() {
         kernel_args: formData.get('kernel_args') || '',
         dns_servers: formData.get('dns_servers') || '',
         snapshot_type: formData.get('snapshot_type') || '',
-        data_disk_id: formData.get('data_disk_id') || ''
+        data_disk_id: formData.get('data_disk_id') || '',
+        hotplug_memory_enabled: hotplugEnabled,
+        hotplug_memory_total_mb: hotplugEnabled ? (parseInt(formData.get('hotplug_total_mb')) || 0) : 0,
+        hotplug_memory_block_mb: hotplugEnabled ? (parseInt(formData.get('hotplug_block_mb')) || 2) : 2,
+        hotplug_memory_slot_mb: hotplugEnabled ? (parseInt(formData.get('hotplug_slot_mb')) || 128) : 128
     };
 
     const { ok, data: resp } = await apiCall('/api/vms', 'POST', data);
     if (ok) {
         closeModal('createVMModal');
         form.reset();
+        document.getElementById('createHotplugOptions').style.display = 'none';
         loadVMs(true); // Force refresh to show new VM
     } else {
         alert(resp.error || 'Failed to create VM');
     }
+}
+
+function toggleHotplugOptions(prefix) {
+    const checkbox = document.getElementById(prefix + 'HotplugEnabled');
+    const options = document.getElementById(prefix + 'HotplugOptions');
+    options.style.display = checkbox.checked ? 'block' : 'none';
 }
 
 function toggleActionMenu(vmId, event) {
@@ -2188,7 +2379,7 @@ async function stopVM(id) {
 }
 
 async function deleteVM(id) {
-    if (!confirm('Are you sure you want to delete this VM?')) return;
+    if (!await showConfirm('Are you sure you want to delete this VM?')) return;
     const { ok, data } = await apiCall(` + "`" + `/api/vms/${id}` + "`" + `, 'DELETE');
     if (ok) {
         loadVMs(true);
@@ -2220,6 +2411,13 @@ async function editVM(id) {
     document.getElementById('editVmSnapshotType').value = data.snapshot_type || '';
     document.getElementById('editVmAutorun').checked = data.autorun || false;
 
+    // Populate memory hotplug fields
+    document.getElementById('editHotplugEnabled').checked = data.hotplug_memory_enabled || false;
+    document.getElementById('editHotplugTotal').value = data.hotplug_memory_total_mb || '';
+    document.getElementById('editHotplugBlock').value = data.hotplug_memory_block_mb || 2;
+    document.getElementById('editHotplugSlot').value = data.hotplug_memory_slot_mb || 128;
+    document.getElementById('editHotplugOptions').style.display = data.hotplug_memory_enabled ? 'block' : 'none';
+
     // Load networks for the dropdown
     const editNetworkSelect = document.getElementById('editVmNetwork');
     editNetworkSelect.innerHTML = '<option value="">No network</option>';
@@ -2249,12 +2447,28 @@ async function saveVM() {
     };
 
     const { ok, data } = await apiCall(` + "`" + `/api/vms/${vmId}` + "`" + `, 'PUT', updateData);
-    if (ok) {
-        closeModal('editVMModal');
-        loadVMs();
-    } else {
+    if (!ok) {
         alert(data.error || 'Failed to update VM');
+        return;
     }
+
+    // Update memory hotplug configuration
+    const hotplugEnabled = document.getElementById('editHotplugEnabled').checked;
+    const hotplugData = {
+        enabled: hotplugEnabled,
+        total_size_mb: hotplugEnabled ? (parseInt(document.getElementById('editHotplugTotal').value) || 0) : 0,
+        block_size_mb: parseInt(document.getElementById('editHotplugBlock').value) || 2,
+        slot_size_mb: parseInt(document.getElementById('editHotplugSlot').value) || 128
+    };
+
+    const { ok: hotplugOk, data: hotplugResp } = await apiCall(` + "`" + `/api/vms/${vmId}/memory-hotplug` + "`" + `, 'PUT', hotplugData);
+    if (!hotplugOk) {
+        alert(hotplugResp.error || 'Failed to update memory hotplug configuration');
+        return;
+    }
+
+    closeModal('editVMModal');
+    loadVMs();
 }
 
 async function createSnapshot(id) {
@@ -2331,7 +2545,7 @@ function formatBytes(bytes) {
 
 async function createSnapshotFromModal() {
     const vmId = document.getElementById('snapshotsVmId').value;
-    if (!confirm('Create a snapshot of this VM? This will pause the VM briefly.')) return;
+    if (!await showConfirm('Create a snapshot of this VM? This will pause the VM briefly.')) return;
 
     const btn = document.getElementById('createSnapshotBtn');
     btn.disabled = true;
@@ -2351,7 +2565,7 @@ async function createSnapshotFromModal() {
 }
 
 async function restoreSnapshot(vmId, snapshotId) {
-    if (!confirm('Restore VM from this snapshot? The current VM state will be lost and replaced with the snapshot state.')) return;
+    if (!await showConfirm('Restore VM from this snapshot? The current VM state will be lost and replaced with the snapshot state.')) return;
 
     const tbody = document.getElementById('snapshotsList');
     tbody.innerHTML = '<tr><td colspan="4">Restoring snapshot...</td></tr>';
@@ -2368,7 +2582,7 @@ async function restoreSnapshot(vmId, snapshotId) {
 }
 
 async function deleteSnapshot(vmId, snapshotId) {
-    if (!confirm('Delete this snapshot? This action cannot be undone.')) return;
+    if (!await showConfirm('Delete this snapshot? This action cannot be undone.')) return;
 
     const { ok, data } = await apiCall(` + "`" + `/api/vms/${vmId}/snapshots/${snapshotId}` + "`" + `, 'DELETE');
     if (ok) {
@@ -2438,7 +2652,7 @@ async function submitDuplicateVM(event) {
         // Update progress UI
         const percent = Math.round(pollData.percent || 0);
         document.getElementById('duplicateProgressBar').style.width = percent + '%%';
-        document.getElementById('duplicateProgressPercent').textContent = percent + '%%';
+        document.getElementById('duplicateProgressPercent').innerHTML = percent + percentIcon(14);
         document.getElementById('duplicateProgressStage').textContent = pollData.stage || 'Processing...';
         document.getElementById('duplicateProgressCopied').textContent = formatBytes(pollData.copied || 0);
         document.getElementById('duplicateProgressTotal').textContent = formatBytes(pollData.total || 0);
@@ -2480,7 +2694,7 @@ async function submitDuplicateVM(event) {
 
 // Shrink VM rootfs functionality
 async function shrinkVM(vmId, vmName) {
-    if (!confirm(` + "`" + `Shrink rootfs for VM "${vmName}"?\n\nThis will minimize the disk size by removing unused space. The VM must be stopped.` + "`" + `)) return;
+    if (!await showConfirm('Shrink rootfs for VM "' + vmName + '"?\n\nThis will minimize the disk size by removing unused space. The VM must be stopped.')) return;
 
     // Show loading indicator
     const btn = event.target.closest('button');
@@ -2891,7 +3105,7 @@ async function submitAttachDisk(event) {
 }
 
 async function detachDisk(vmId, diskId, diskName) {
-    if (!confirm(` + "`" + `Detach disk "${diskName}"? This will permanently delete the disk and all data on it.` + "`" + `)) {
+    if (!await showConfirm('Detach disk "' + diskName + '"? This will permanently delete the disk and all data on it.')) {
         return;
     }
 
@@ -3047,7 +3261,7 @@ async function submitAttachNetwork(event) {
 }
 
 async function removeVMNetwork(vmId, netId, ifaceIndex) {
-    if (!confirm(` + "`" + `Remove network interface eth${ifaceIndex}?` + "`" + `)) {
+    if (!await showConfirm('Remove network interface eth' + ifaceIndex + '?')) {
         return;
     }
 
@@ -3240,10 +3454,17 @@ func (wc *WebConsole) renderVMDetailPage(vmID string) string {
                 <p><strong>ID:</strong> <span id="vmId">%s</span></p>
                 <p><strong>Status:</strong> <span id="vmStatus">-</span></p>
                 <p><strong>PID:</strong> <span id="vmPid">-</span></p>
+                <p><strong>Available ports:</strong> <span id="vmPorts">-</span></p>
             </div>
             <div>
                 <p><strong>vCPUs:</strong> <span id="vmVcpu">-</span></p>
                 <p><strong>Memory:</strong> <span id="vmMemory">-</span> MB</p>
+                <p id="vmHotplugRow" style="display: none;"><strong>Memory Hotplug:</strong>
+                    <span id="vmHotplugStatus">-</span>
+                    <button class="btn btn-info btn-xs" id="adjustMemoryBtn" onclick="openAdjustMemoryModal()" title="Adjust Memory" style="margin-left: 8px; display: none;">
+                        <span class="material-icons">memory</span> Adjust
+                    </button>
+                </p>
                 <p><strong>IP Address:</strong> <a href="#" id="vmIpLink" onclick="openChangeIPModal(); return false;" title="Click to change IP address" style="color: var(--primary); text-decoration: none;"><span id="vmIp">-</span> <span class="material-icons" style="font-size: 14px; vertical-align: middle;">edit</span></a> <span id="vmReachable"></span></p>
                 <p><strong>MAC Address:</strong> <span id="vmMac">-</span></p>
                 <p><strong>DNS Servers:</strong> <span id="vmDns">-</span></p>
@@ -3262,6 +3483,9 @@ func (wc *WebConsole) renderVMDetailPage(vmID string) string {
                 <p><strong>Operating System:</strong> <span id="vmOsRelease">-</span></p>
                 <p><strong>Init System:</strong> <span id="vmInitSystem">-</span></p>
                 <p><strong>Disk Type:</strong> <span id="vmDiskType">-</span></p>
+                <p><strong>Kernel:</strong> <a href="#" id="vmKernelLink" onclick="openChangeKernelModal(); return false;" title="Click to change kernel" style="color: var(--primary); text-decoration: none;"><span id="vmKernel">-</span> <span class="material-icons" style="font-size: 14px; vertical-align: middle;">edit</span></a></p>
+                <p><strong>SSH Server:</strong> <span id="vmSSHStatus">-</span>
+                </p>
             </div>
             <div>
                 <p><strong>Root Disk Size:</strong> <span id="vmDiskSize">-</span>
@@ -3391,6 +3615,29 @@ async function loadVMDetails() {
     document.getElementById('vmMac').textContent = data.mac_address || '-';
     document.getElementById('vmDns').textContent = data.dns_servers || '-';
 
+    // Update memory hotplug status
+    window.currentVMHotplugEnabled = data.hotplug_memory_enabled || false;
+    window.currentVMHotplugTotalMB = data.hotplug_memory_total_mb || 0;
+    window.currentVMBaseMemory = data.memory_mb || 0;
+    const hotplugRow = document.getElementById('vmHotplugRow');
+    const hotplugStatus = document.getElementById('vmHotplugStatus');
+    const adjustBtn = document.getElementById('adjustMemoryBtn');
+    if (data.hotplug_memory_enabled) {
+        hotplugRow.style.display = 'block';
+        if (data.status === 'running') {
+            hotplugStatus.innerHTML = '<span class="badge badge-success">Active</span>';
+            adjustBtn.style.display = 'inline-flex';
+            // Fetch current hotplug status for running VM
+            loadMemoryHotplugStatus();
+        } else {
+            hotplugStatus.innerHTML = '<span class="badge badge-warning">Configured</span> (Max: ' + data.hotplug_memory_total_mb + ' MB)';
+            adjustBtn.style.display = 'none';
+        }
+    } else {
+        hotplugRow.style.display = 'none';
+        adjustBtn.style.display = 'none';
+    }
+
     // Store network info for IP change feature
     window.currentVMNetworkId = data.network_id || '';
     window.currentVMIPAddress = data.ip_address || '';
@@ -3401,13 +3648,17 @@ async function loadVMDetails() {
     document.getElementById('consoleBtn').disabled = data.status !== 'running';
     document.getElementById('editBtn').disabled = data.status === 'running';
 
-    // Check reachability if VM is running and has an IP
+    // Check reachability and scan ports if VM is running and has an IP
     const reachableSpan = document.getElementById('vmReachable');
+    const portsSpan = document.getElementById('vmPorts');
     if (data.ip_address && data.status === 'running') {
         reachableSpan.innerHTML = '<span class="material-icons" style="color: var(--text-secondary); animation: spin 1s linear infinite; font-size: 16px; vertical-align: middle;">sync</span>';
+        portsSpan.innerHTML = '<span class="material-icons" style="color: var(--text-secondary); animation: spin 1s linear infinite; font-size: 14px; vertical-align: middle;">sync</span> scanning...';
         checkReachability(data.ip_address);
+        scanPorts(data.ip_address);
     } else {
         reachableSpan.innerHTML = '';
+        portsSpan.textContent = '-';
     }
 
     // Populate disk information
@@ -3416,6 +3667,19 @@ async function loadVMDetails() {
     document.getElementById('vmDiskType').textContent = data.disk_type || '-';
     document.getElementById('vmDiskSize').textContent = data.disk_size_human || '-';
     document.getElementById('vmRootfsPath').textContent = data.rootfs_path || '-';
+
+    // Populate kernel info
+    document.getElementById('vmKernel').textContent = data.kernel_name || '-';
+    window.currentVMKernelId = data.kernel_id || '';
+    window.currentVMKernelName = data.kernel_name || '';
+
+    // Populate SSH status
+    const sshStatusSpan = document.getElementById('vmSSHStatus');
+    if (data.ssh_installed) {
+        sshStatusSpan.innerHTML = '<span class="badge badge-success">Installed</span> ' + (data.ssh_version || '');
+    } else {
+        sshStatusSpan.innerHTML = '<button class="btn btn-info btn-xs" onclick="installSSHServer()" title="Install OpenSSH Server"><span class="material-icons">download</span> Install SSH</button>';
+    }
 
     // Load VM group info
     loadVMGroupInfo(vmId);
@@ -3487,7 +3751,7 @@ async function triggerShrinkRootFS() {
     if (!window.currentVMDetails) return;
 
     const vmName = window.currentVMDetails.name;
-    if (!confirm('Shrink rootfs for VM "' + vmName + '"?\n\nThis will minimize the disk size by removing unused space. The VM must be stopped.')) {
+    if (!await showConfirm('Shrink rootfs for VM "' + vmName + '"?\n\nThis will minimize the disk size by removing unused space. The VM must be stopped.')) {
         return;
     }
 
@@ -3512,6 +3776,51 @@ async function triggerShrinkRootFS() {
     }
 }
 
+async function installSSHServer() {
+    if (!window.currentVMDetails) return;
+
+    const vmName = window.currentVMDetails.name;
+    const isRunning = window.currentVMStatus === 'running';
+
+    let confirmMsg = 'Install OpenSSH server in VM "' + vmName + '"?\n\n';
+    if (isRunning) {
+        confirmMsg += 'WARNING: The VM is currently running and will be stopped automatically for this operation.\n\n';
+    }
+    confirmMsg += 'This will:\n- Mount the rootfs\n- Install openssh-server package\n- Enable SSH service\n- Generate host keys';
+
+    if (!await showConfirm(confirmMsg)) {
+        return;
+    }
+
+    const btn = document.getElementById('installSSHBtn');
+    const sshStatusSpan = document.getElementById('vmSSHStatus');
+    const originalContent = btn.innerHTML;
+    btn.innerHTML = '<span class="material-icons" style="animation: spin 1s linear infinite;">sync</span> Installing...';
+    btn.disabled = true;
+    sshStatusSpan.innerHTML = '<span class="badge badge-info">Installing...</span>';
+
+    try {
+        const { ok, data } = await apiCall('/api/vms/' + vmId + '/install-ssh', 'POST');
+        if (ok) {
+            let msg = 'OpenSSH server installed successfully!';
+            if (data.was_running) {
+                msg += '\n\nThe VM was stopped for installation. You can start it again to use SSH.';
+            }
+            alert(msg);
+            loadVMDetails(); // Refresh to show SSH status
+        } else {
+            alert(data.error || 'Failed to install SSH server');
+            sshStatusSpan.innerHTML = '<span class="badge badge-warning">Not installed</span>';
+        }
+    } catch (e) {
+        alert('Failed to install SSH server: ' + e.message);
+        sshStatusSpan.innerHTML = '<span class="badge badge-warning">Not installed</span>';
+    } finally {
+        btn.innerHTML = originalContent;
+        btn.disabled = false;
+    }
+}
+
 async function checkReachability(ip) {
     const reachableSpan = document.getElementById('vmReachable');
     try {
@@ -3527,6 +3836,24 @@ async function checkReachability(ip) {
         }
     } catch (e) {
         reachableSpan.innerHTML = '<span class="badge badge-warning" style="margin-left: 8px;">Error</span>';
+    }
+}
+
+async function scanPorts(ip) {
+    const portsSpan = document.getElementById('vmPorts');
+    try {
+        const { ok, data } = await apiCall('/api/scan-ports/' + ip);
+        if (ok) {
+            if (data.ports && data.ports.length > 0) {
+                portsSpan.textContent = data.ports.join(', ');
+            } else {
+                portsSpan.textContent = 'none';
+            }
+        } else {
+            portsSpan.textContent = 'scan failed';
+        }
+    } catch (e) {
+        portsSpan.textContent = 'error';
     }
 }
 
@@ -3613,13 +3940,13 @@ async function loadVMMetrics() {
 
     // Update CPU
     const cpuPercent = data.cpu_percent || 0;
-    document.getElementById('statCpuPercent').textContent = cpuPercent.toFixed(1) + '%%%%';
+    document.getElementById('statCpuPercent').innerHTML = cpuPercent.toFixed(1) + percentIcon(20);
 
     // Update Memory
     const memPercent = data.mem_percent || 0;
     const memUsed = data.mem_used_mb || 0;
     const memTotal = data.memory_mb || 0;
-    document.getElementById('statMemPercent').textContent = memPercent.toFixed(1) + '%%%%';
+    document.getElementById('statMemPercent').innerHTML = memPercent.toFixed(1) + percentIcon(20);
     document.getElementById('statMemDetail').textContent = memUsed + ' / ' + memTotal + ' MB';
 
     // Update Uptime
@@ -3740,7 +4067,7 @@ async function stopVM() {
 }
 
 async function deleteVM() {
-    if (!confirm('Are you sure you want to delete this VM?')) return;
+    if (!await showConfirm('Are you sure you want to delete this VM?')) return;
     const { ok, data } = await apiCall('/api/vms/' + vmId, 'DELETE');
     if (ok) {
         window.location.href = '/vms';
@@ -4031,7 +4358,13 @@ function openConsole() {
         return;
     }
 
-    // Show modal
+    // Open console in new browser window
+    const consoleUrl = '/console/' + vmId;
+    window.open(consoleUrl, 'vm_console_' + vmId, 'width=900,height=600,menubar=no,toolbar=no,location=no,status=no');
+}
+
+function openConsoleModal() {
+    // Show modal (legacy function for backwards compatibility)
     openModal('consoleModal');
 
     // Initialize terminal if not already done
@@ -4231,6 +4564,147 @@ async function changeVMIP() {
     }
 }
 
+// Memory Hotplug functions
+let currentHotplugStatus = null;
+
+async function loadMemoryHotplugStatus() {
+    const { ok, data } = await apiCall('/api/vms/' + vmId + '/memory-hotplug');
+    if (ok && data.running) {
+        currentHotplugStatus = data;
+        const pluggedMB = data.plugged_size_mib || 0;
+        const baseMB = window.currentVMBaseMemory || 0;
+        const totalMB = baseMB + pluggedMB;
+        document.getElementById('vmHotplugStatus').innerHTML =
+            '<span class="badge badge-success">Active</span> ' + totalMB + ' MB total (' + baseMB + ' + ' + pluggedMB + ' hotplugged)';
+    }
+}
+
+async function openAdjustMemoryModal() {
+    if (!window.currentVMHotplugEnabled) {
+        alert('Memory hotplug is not enabled for this VM');
+        return;
+    }
+
+    // Load current status
+    const { ok, data } = await apiCall('/api/vms/' + vmId + '/memory-hotplug');
+    if (!ok) {
+        alert(data.error || 'Failed to get memory hotplug status');
+        return;
+    }
+
+    currentHotplugStatus = data;
+
+    const baseMem = window.currentVMBaseMemory || 0;
+    const totalMem = data.total_size_mib || window.currentVMHotplugTotalMB || 0;
+    const pluggedMem = data.plugged_size_mib || 0;
+    const requestedMem = data.requested_size_mib || 0;
+    const maxHotplug = totalMem - baseMem;
+
+    document.getElementById('adjustMemBaseMemory').textContent = baseMem + ' MiB';
+    document.getElementById('adjustMemPluggedMemory').textContent = pluggedMem + ' MiB';
+    document.getElementById('adjustMemMaxMemory').textContent = totalMem + ' MiB';
+    document.getElementById('adjustMemTotalMemory').textContent = (baseMem + pluggedMem) + ' MiB';
+    document.getElementById('adjustMemMaxLabel').textContent = '+' + maxHotplug + ' MiB';
+
+    const slider = document.getElementById('adjustMemSlider');
+    slider.min = 0;
+    slider.max = maxHotplug;
+    slider.step = data.block_size_mib || 128;
+    slider.value = requestedMem;
+
+    updateAdjustMemDisplay();
+    openModal('adjustMemoryModal');
+}
+
+function updateAdjustMemDisplay() {
+    const slider = document.getElementById('adjustMemSlider');
+    const value = parseInt(slider.value) || 0;
+    const baseMem = window.currentVMBaseMemory || 0;
+    document.getElementById('adjustMemValue').textContent = '+' + value + ' MiB (Total: ' + (baseMem + value) + ' MiB)';
+}
+
+async function applyMemoryAdjustment() {
+    const slider = document.getElementById('adjustMemSlider');
+    const requestedMib = parseInt(slider.value) || 0;
+
+    document.getElementById('adjustMemBtn').disabled = true;
+
+    const { ok, data } = await apiCall('/api/vms/' + vmId + '/memory-hotplug', 'PATCH', {
+        requested_size_mib: requestedMib
+    });
+
+    document.getElementById('adjustMemBtn').disabled = false;
+
+    if (ok) {
+        closeModal('adjustMemoryModal');
+        loadVMDetails();
+    } else {
+        alert(data.error || 'Failed to adjust memory');
+    }
+}
+
+// Change Kernel functions
+async function openChangeKernelModal() {
+    // Show warning if VM is running
+    const warningDiv = document.getElementById('changeKernelRunningWarning');
+    const changeBtn = document.getElementById('changeKernelBtn');
+    if (window.currentVMStatus === 'running') {
+        warningDiv.style.display = 'block';
+        changeBtn.disabled = true;
+    } else {
+        warningDiv.style.display = 'none';
+        changeBtn.disabled = false;
+    }
+
+    // Set current kernel
+    document.getElementById('changeKernelCurrent').textContent = window.currentVMKernelName || '-';
+    document.getElementById('changeKernelProgress').style.display = 'none';
+
+    // Load available kernels
+    const select = document.getElementById('changeKernelSelect');
+    select.innerHTML = '<option value="">Loading kernels...</option>';
+
+    openModal('changeKernelModal');
+
+    const { ok, data } = await apiCall('/api/kernels');
+    if (ok && data.kernels) {
+        select.innerHTML = data.kernels.map(k =>
+            `+"`"+`<option value="${k.id}" ${k.id === window.currentVMKernelId ? 'selected' : ''}>${k.name} (${k.version})${!k.virtio_support ? ' ⚠️ No virtio' : ''}</option>`+"`"+`
+        ).join('');
+    } else {
+        select.innerHTML = '<option value="">Failed to load kernels</option>';
+    }
+}
+
+async function changeVMKernel() {
+    const newKernelId = document.getElementById('changeKernelSelect').value;
+
+    if (!newKernelId) {
+        alert('Please select a kernel');
+        return;
+    }
+
+    if (newKernelId === window.currentVMKernelId) {
+        closeModal('changeKernelModal');
+        return;
+    }
+
+    // Show progress
+    document.getElementById('changeKernelProgress').style.display = 'block';
+    document.getElementById('changeKernelBtn').disabled = true;
+
+    const { ok, data } = await apiCall('/api/vms/' + vmId, 'PUT', { kernel_id: newKernelId });
+
+    if (ok) {
+        closeModal('changeKernelModal');
+        loadVMDetails();
+    } else {
+        document.getElementById('changeKernelProgress').style.display = 'none';
+        document.getElementById('changeKernelBtn').disabled = false;
+        alert(data.error || 'Failed to change kernel');
+    }
+}
+
 // Expand RootFS functions
 function openExpandRootFSModal(vmId, vmName, currentSizeMB) {
     document.getElementById('expandRootFSVmId').value = vmId;
@@ -4374,6 +4848,57 @@ async function expandRootFS() {
     </div>
 </div>
 
+<!-- Adjust Memory Modal -->
+<div id="adjustMemoryModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3><span class="material-icons" style="vertical-align: middle;">memory</span> Adjust Memory (Hotplug)</h3>
+            <span class="material-icons modal-close" onclick="closeModal('adjustMemoryModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <div style="background: #e3f2fd; border: 1px solid #64b5f6; border-radius: 6px; padding: 12px; margin-bottom: 15px;">
+                <span class="material-icons" style="color: #1976d2; vertical-align: middle;">info</span>
+                <strong style="color: #0d47a1;">Memory Hotplug Active</strong>
+                <p style="margin: 5px 0 0; color: #1565c0; font-size: 13px;">Adjust the VM's memory while it's running. Changes take effect immediately.</p>
+            </div>
+            <div class="form-group">
+                <label>Current Status</label>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px;">
+                    <div style="background: var(--surface); padding: 10px; border-radius: 6px;">
+                        <p style="margin: 0; color: var(--text-secondary); font-size: 12px;">Base Memory</p>
+                        <p style="margin: 4px 0 0; font-size: 18px; font-weight: 500;" id="adjustMemBaseMemory">-</p>
+                    </div>
+                    <div style="background: var(--surface); padding: 10px; border-radius: 6px;">
+                        <p style="margin: 0; color: var(--text-secondary); font-size: 12px;">Currently Plugged</p>
+                        <p style="margin: 4px 0 0; font-size: 18px; font-weight: 500;" id="adjustMemPluggedMemory">-</p>
+                    </div>
+                    <div style="background: var(--surface); padding: 10px; border-radius: 6px;">
+                        <p style="margin: 0; color: var(--text-secondary); font-size: 12px;">Max Available</p>
+                        <p style="margin: 4px 0 0; font-size: 18px; font-weight: 500;" id="adjustMemMaxMemory">-</p>
+                    </div>
+                    <div style="background: var(--surface); padding: 10px; border-radius: 6px;">
+                        <p style="margin: 0; color: var(--text-secondary); font-size: 12px;">Total Effective</p>
+                        <p style="margin: 4px 0 0; font-size: 18px; font-weight: 500; color: var(--primary);" id="adjustMemTotalMemory">-</p>
+                    </div>
+                </div>
+            </div>
+            <div class="form-group" style="margin-top: 15px;">
+                <label>New Requested Memory (MiB)</label>
+                <input type="range" id="adjustMemSlider" min="0" max="1024" step="128" value="0" style="width: 100%%%%; margin-top: 8px;" oninput="updateAdjustMemDisplay()">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px;">
+                    <span style="color: var(--text-secondary); font-size: 12px;">Base Only</span>
+                    <span id="adjustMemValue" style="font-size: 18px; font-weight: 600; color: var(--primary);">0 MiB</span>
+                    <span style="color: var(--text-secondary); font-size: 12px;" id="adjustMemMaxLabel">Max</span>
+                </div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('adjustMemoryModal')">Cancel</button>
+            <button type="button" class="btn btn-primary" id="adjustMemBtn" onclick="applyMemoryAdjustment()"><span class="material-icons">check</span> Apply</button>
+        </div>
+    </div>
+</div>
+
 <div id="editDescriptionModal" class="modal">
     <div class="modal-content" style="max-width: 500px;">
         <div class="modal-header">
@@ -4389,6 +4914,43 @@ async function expandRootFS() {
         <div class="modal-footer">
             <button type="button" class="btn btn-secondary" onclick="closeModal('editDescriptionModal')">Cancel</button>
             <button type="button" class="btn btn-primary" onclick="saveDescription()"><span class="material-icons">save</span> Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- Change Kernel Modal -->
+<div id="changeKernelModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3><span class="material-icons" style="vertical-align: middle;">memory</span> Change Kernel</h3>
+            <span class="material-icons modal-close" onclick="closeModal('changeKernelModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <div id="changeKernelRunningWarning" style="display: none; background: #fff3e0; border: 1px solid #ffb74d; border-radius: 6px; padding: 12px; margin-bottom: 15px;">
+                <span class="material-icons" style="color: #f57c00; vertical-align: middle;">warning</span>
+                <strong style="color: #e65100;">VM must be stopped to change kernel.</strong>
+                <p style="margin: 5px 0 0; color: #795548; font-size: 13px;">Please stop the VM first, then change the kernel and restart.</p>
+            </div>
+            <div class="form-group">
+                <label>Current Kernel</label>
+                <p id="changeKernelCurrent" style="font-size: 16px; font-weight: 500; color: var(--primary);">-</p>
+            </div>
+            <div class="form-group">
+                <label>Select New Kernel</label>
+                <select id="changeKernelSelect" style="width: 100%%%%;">
+                    <option value="">Loading kernels...</option>
+                </select>
+            </div>
+            <div id="changeKernelProgress" style="display: none; margin-top: 15px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span class="material-icons" style="animation: spin 1s linear infinite;">sync</span>
+                    <span>Updating kernel...</span>
+                </div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('changeKernelModal')">Cancel</button>
+            <button type="button" class="btn btn-primary" id="changeKernelBtn" onclick="changeVMKernel()"><span class="material-icons">save</span> Save</button>
         </div>
     </div>
 </div>
@@ -4847,7 +5409,7 @@ async function toggleFirewallRule(ruleId, enabled) {
 }
 
 async function deleteFirewallRule(ruleId) {
-    if (!confirm('Delete this firewall rule?')) return;
+    if (!await showConfirm('Delete this firewall rule?')) return;
     const { ok } = await apiCall('/api/networks/' + currentNetworkId + '/firewall/' + ruleId, 'DELETE');
     if (ok) loadFirewallRules(currentNetworkId);
 }
@@ -4931,7 +5493,7 @@ async function deactivateNetwork(id) {
 }
 
 async function deleteNetwork(id) {
-    if (!confirm('Are you sure you want to delete this network?')) return;
+    if (!await showConfirm('Are you sure you want to delete this network?')) return;
     const { ok, data } = await apiCall(` + "`" + `/api/networks/${id}` + "`" + `, 'DELETE');
     if (ok) {
         loadNetworks();
@@ -5091,7 +5653,7 @@ func (wc *WebConsole) renderImagesPage() string {
                 <div id="uploadProgress" style="display: none; margin-top: 15px;">
                     <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
                         <span id="uploadProgressText">Uploading...</span>
-                        <span id="uploadProgressPercent">0%%</span>
+                        <span id="uploadProgressPercent">0</span>
                     </div>
                     <div style="background: var(--border); border-radius: 4px; height: 8px; overflow: hidden;">
                         <div id="uploadProgressBar" style="background: var(--primary); height: 100%%; width: 0%%; transition: width 0.3s;"></div>
@@ -5126,7 +5688,7 @@ func (wc *WebConsole) renderImagesPage() string {
                 <div id="convertQemuProgress" style="display: none; margin-top: 15px;">
                     <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
                         <span id="convertQemuProgressText">Converting...</span>
-                        <span id="convertQemuProgressPercent">0%%</span>
+                        <span id="convertQemuProgressPercent">0</span>
                     </div>
                     <div style="background: var(--border); border-radius: 4px; height: 8px; overflow: hidden;">
                         <div id="convertQemuProgressBar" style="background: var(--primary); height: 100%%; width: 0%%; transition: width 0.3s;"></div>
@@ -5323,7 +5885,7 @@ func (wc *WebConsole) renderImagesPage() string {
             <div id="debianBuildProgress" style="display: none; margin-top: 20px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                     <span id="debianBuildStep" style="font-weight: 500;">Initializing...</span>
-                    <span id="debianBuildPercent">0%%</span>
+                    <span id="debianBuildPercent">0</span>
                 </div>
                 <div style="background: var(--border); border-radius: 4px; height: 12px; overflow: hidden;">
                     <div id="debianBuildBar" style="background: var(--primary); height: 100%%; width: 0%%; transition: width 0.5s;"></div>
@@ -5354,7 +5916,10 @@ async function loadKernels() {
 
     tbody.innerHTML = data.kernels.map(k => ` + "`" + `
         <tr>
-            <td>${k.name}</td>
+            <td>
+                ${k.name}
+                ${!k.virtio_support ? '<span class="badge badge-danger" style="margin-left: 8px;" title="This kernel may not have proper virtio support. VMs using this kernel may fail to boot."><span class="material-icons" style="font-size: 12px; vertical-align: middle;">warning</span> No virtio</span>' : ''}
+            </td>
             <td>${k.version}</td>
             <td>${k.architecture}</td>
             <td>${formatBytes(k.size)}</td>
@@ -5513,7 +6078,7 @@ async function uploadRootfs() {
     cancelBtn.disabled = true;
     progressText.textContent = 'Uploading...';
     progressBar.style.width = '0%%';
-    progressPercent.textContent = '0%%';
+    progressPercent.innerHTML = '0' + percentIcon(14);
 
     const formData = new FormData();
     formData.append('name', name);
@@ -5525,7 +6090,7 @@ async function uploadRootfs() {
         if (e.lengthComputable) {
             const percent = Math.round((e.loaded / e.total) * 100);
             progressBar.style.width = percent + '%%';
-            progressPercent.textContent = percent + '%%';
+            progressPercent.innerHTML = percent + percentIcon(14);
             const sizeMB = (e.loaded / (1024 * 1024)).toFixed(1);
             const totalMB = (e.total / (1024 * 1024)).toFixed(1);
             progressText.textContent = 'Uploading... ' + sizeMB + ' MB / ' + totalMB + ' MB';
@@ -5541,7 +6106,7 @@ async function uploadRootfs() {
             if (resp.status === 'success') {
                 progressText.textContent = 'Upload complete!';
                 progressBar.style.width = '100%%';
-                progressPercent.textContent = '100%%';
+                progressPercent.innerHTML = '100' + percentIcon(14);
                 setTimeout(() => {
                     closeModal('uploadRootfsModal');
                     document.getElementById('uploadRootfsForm').reset();
@@ -5615,7 +6180,7 @@ async function openConvertQemuModal() {
 
     if (qemuUtilsStatus && !qemuUtilsStatus.available) {
         if (qemuUtilsStatus.can_install) {
-            if (confirm('qemu-utils is not installed.\\n\\nWould you like to install it now?\\n\\nThis requires administrator privileges and may take a moment.')) {
+            if (await showConfirm('qemu-utils is not installed.\n\nWould you like to install it now?\n\nThis requires administrator privileges and may take a moment.')) {
                 await installQemuUtils();
             }
             return;
@@ -5709,7 +6274,7 @@ async function startQemuConversion() {
     cancelBtn.disabled = true;
     progressText.textContent = 'Uploading...';
     progressBar.style.width = '0%%';
-    progressPercent.textContent = '0%%';
+    progressPercent.innerHTML = '0' + percentIcon(14);
 
     const formData = new FormData();
     formData.append('name', name);
@@ -5721,7 +6286,7 @@ async function startQemuConversion() {
         if (e.lengthComputable) {
             const percent = Math.round((e.loaded / e.total) * 50); // Upload is 0-50%%
             progressBar.style.width = percent + '%%';
-            progressPercent.textContent = percent + '%%';
+            progressPercent.innerHTML = percent + percentIcon(14);
             const sizeMB = (e.loaded / (1024 * 1024)).toFixed(1);
             const totalMB = (e.total / (1024 * 1024)).toFixed(1);
             progressText.textContent = 'Uploading... ' + sizeMB + ' MB / ' + totalMB + ' MB';
@@ -5736,7 +6301,7 @@ async function startQemuConversion() {
                 qemuConversionJobId = resp.job_id;
                 progressText.textContent = 'Converting... Please wait';
                 progressBar.style.width = '50%%';
-                progressPercent.textContent = '50%%';
+                progressPercent.innerHTML = '50' + percentIcon(14);
                 pollQemuConversionProgress();
             } else {
                 progressDiv.style.display = 'none';
@@ -5785,7 +6350,7 @@ function pollQemuConversionProgress() {
                 clearInterval(qemuConversionPollInterval);
                 qemuConversionPollInterval = null;
                 progressBar.style.width = '100%%';
-                progressPercent.textContent = '100%%';
+                progressPercent.innerHTML = '100' + percentIcon(14);
                 progressText.textContent = 'Conversion complete!';
                 setTimeout(() => {
                     closeQemuConvertModal();
@@ -5803,7 +6368,7 @@ function pollQemuConversionProgress() {
                 // Map conversion progress (0-100) to 50-100 (since upload was 0-50)
                 const displayPercent = 50 + Math.round(data.progress / 2);
                 progressBar.style.width = displayPercent + '%%';
-                progressPercent.textContent = displayPercent + '%%';
+                progressPercent.innerHTML = displayPercent + percentIcon(14);
                 progressText.textContent = data.message || 'Converting...';
             }
         } catch (e) {
@@ -5822,7 +6387,7 @@ async function setDefaultKernel(id) {
 }
 
 async function deleteKernel(id) {
-    if (!confirm('Are you sure you want to delete this kernel?')) return;
+    if (!await showConfirm('Are you sure you want to delete this kernel?')) return;
     const { ok, data } = await apiCall(` + "`" + `/api/kernels/${id}` + "`" + `, 'DELETE');
     if (ok) {
         loadKernels();
@@ -5832,7 +6397,7 @@ async function deleteKernel(id) {
 }
 
 async function deleteRootfs(id) {
-    if (!confirm('Are you sure you want to delete this root filesystem?')) return;
+    if (!await showConfirm('Are you sure you want to delete this root filesystem?')) return;
     const { ok, data } = await apiCall(` + "`" + `/api/rootfs/${id}` + "`" + `, 'DELETE');
     if (ok) {
         loadRootfs();
@@ -6111,7 +6676,7 @@ async function checkDebianBuildProgress() {
     };
 
     document.getElementById('debianBuildStep').textContent = stepNames[data.step] || data.step;
-    document.getElementById('debianBuildPercent').textContent = data.progress + '%%';
+    document.getElementById('debianBuildPercent').innerHTML = data.progress + percentIcon(14);
     document.getElementById('debianBuildBar').style.width = data.progress + '%%';
     document.getElementById('debianBuildMessage').textContent = data.message || '';
 
@@ -6252,7 +6817,16 @@ func (wc *WebConsole) renderDockerPage() string {
                         Inject minimal init script (recommended)
                     </label>
                     <small style="display: block; color: var(--text-secondary); margin-top: 5px; margin-left: 24px;">
-                        Adds /sbin/init that mounts proc, sys, dev and starts a shell
+                        Adds a basic init process for VMs without systemd
+                    </small>
+                </div>
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" id="convertInstallSSH" checked style="width: auto; margin: 0;">
+                        Install SSH Server
+                    </label>
+                    <small style="display: block; color: var(--text-secondary); margin-top: 5px; margin-left: 24px;">
+                        Installs OpenSSH server and haveged for remote access
                     </small>
                 </div>
                 <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--border-color);">
@@ -6323,6 +6897,15 @@ func (wc *WebConsole) renderDockerPage() string {
                         <input type="checkbox" id="composeInjectInit" checked style="width: auto; margin: 0;">
                         Inject minimal init script
                     </label>
+                </div>
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" id="composeInstallSSH" checked style="width: auto; margin: 0;">
+                        Install SSH Server
+                    </label>
+                    <small style="display: block; color: var(--text-secondary); margin-top: 5px; margin-left: 24px;">
+                        Installs OpenSSH server and haveged for remote access
+                    </small>
                 </div>
                 <div class="form-group">
                     <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
@@ -6460,6 +7043,7 @@ async function openConvertModal(imageRef) {
     document.getElementById('convertOutputName').value = '';
     document.getElementById('convertDataDiskSize').value = '0';
     document.getElementById('convertInjectInit').checked = true;
+    document.getElementById('convertInstallSSH').checked = true;
     document.getElementById('convertVCPU').value = '1';
     document.getElementById('convertMemory').value = '512';
 
@@ -6487,6 +7071,7 @@ async function startConversion() {
     const imageRef = document.getElementById('convertImageRef').value;
     const name = document.getElementById('convertOutputName').value.trim();
     const injectMinInit = document.getElementById('convertInjectInit').checked;
+    const installSSH = document.getElementById('convertInstallSSH').checked;
     const dataDiskSize = parseInt(document.getElementById('convertDataDiskSize').value) || 0;
     const vcpu = parseInt(document.getElementById('convertVCPU').value) || 1;
     const memory = parseInt(document.getElementById('convertMemory').value) || 512;
@@ -6497,6 +7082,7 @@ async function startConversion() {
         image_ref: imageRef,
         name: name,
         inject_min_init: injectMinInit,
+        install_ssh: installSSH,
         create_vm: true,
         vm_vcpu: vcpu,
         vm_memory_mb: memory
@@ -6680,6 +7266,7 @@ async function startComposeConversion() {
     const serviceName = document.getElementById('composeServiceName').value;
     const outputName = document.getElementById('composeOutputName').value.trim();
     const injectMinInit = document.getElementById('composeInjectInit').checked;
+    const installSSH = document.getElementById('composeInstallSSH').checked;
     const useDocker = document.getElementById('composeUseDocker').checked;
     const dataDiskSize = parseInt(document.getElementById('composeDataDiskSize').value) || 0;
 
@@ -6688,6 +7275,7 @@ async function startComposeConversion() {
         service_name: serviceName,
         output_name: outputName,
         inject_min_init: injectMinInit,
+        install_ssh: installSSH,
         use_docker: useDocker,
         environment: currentServiceEnv
     };
@@ -6729,7 +7317,7 @@ async function convertSelectedServices() {
         openComposeConvertModal(selected[0], '');
     } else {
         // Multiple services - convert each one
-        if (!confirm('Convert ' + selected.length + ' services? Each will create a separate rootfs.')) {
+        if (!await showConfirm('Convert ' + selected.length + ' services? Each will create a separate rootfs.')) {
             return;
         }
 
@@ -6971,6 +7559,15 @@ func (wc *WebConsole) renderSettingsPage() string {
                     </a>
                 </td>
             </tr>
+            <tr>
+                <td><strong>Active Directory:</strong></td>
+                <td>
+                    <a href="#" onclick="openModal('ldapModal'); return false;" style="color: var(--primary); text-decoration: none;">
+                        <span id="ldapStatusText">Loading...</span>
+                        <span class="material-icons" style="font-size: 16px; vertical-align: middle;">edit</span>
+                    </a>
+                </td>
+            </tr>
             <tr><td><strong>Config File:</strong></td><td>/etc/firecrackmanager/settings.json</td></tr>
             <tr><td><strong>Data Directory:</strong></td><td>/var/lib/firecrackmanager</td></tr>
             <tr><td><strong>Log File:</strong></td><td>/var/log/firecrackmanager/firecrackmanager.log</td></tr>
@@ -7128,6 +7725,89 @@ func (wc *WebConsole) renderSettingsPage() string {
     </div>
 </div>
 
+<!-- Active Directory Configuration Modal -->
+<div id="ldapModal" class="modal">
+    <div class="modal-content" style="max-width: 600px;">
+        <div class="modal-header">
+            <h2>Active Directory Configuration</h2>
+            <span class="material-icons modal-close" onclick="closeModal('ldapModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <p style="color: var(--text-secondary); margin-bottom: 20px;">
+                Configure Active Directory authentication. Users can log in with their AD credentials (user@domain.tld).
+            </p>
+            <form id="ldapForm">
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="checkbox" id="ldapEnabled" name="enabled" style="width: auto; margin-right: 8px;">
+                        Enable Active Directory Authentication
+                    </label>
+                </div>
+                <div id="ldapSettings" style="display: none;">
+                    <div class="grid" style="grid-template-columns: 2fr 1fr; gap: 15px;">
+                        <div class="form-group">
+                            <label>AD Server</label>
+                            <input type="text" id="ldapServer" name="server" placeholder="ad.example.com">
+                            <small style="color: var(--text-secondary);">Hostname or IP address</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Port</label>
+                            <input type="number" id="ldapPort" name="port" value="389" min="1" max="65535">
+                            <small style="color: var(--text-secondary);">389 or 636</small>
+                        </div>
+                    </div>
+                    <div class="grid" style="grid-template-columns: 1fr 1fr 1fr; gap: 15px;">
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" id="ldapUseSSL" name="use_ssl" style="width: auto;">
+                                <span>LDAPS</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" id="ldapUseStartTLS" name="use_starttls" style="width: auto;">
+                                <span>StartTLS</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" id="ldapSkipVerify" name="skip_verify" style="width: auto;" checked>
+                                <span>Skip Verify</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Service Account</label>
+                        <input type="text" id="ldapBindDN" name="bind_dn" placeholder="admin@example.com" oninput="updateLdapBaseDN()">
+                        <small style="color: var(--text-secondary);">user@domain.tld format</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" id="ldapBindPassword" name="bind_password" placeholder="Leave empty to keep current">
+                    </div>
+                    <div class="form-group">
+                        <label>Base DN</label>
+                        <div id="ldapBaseDNDisplay" style="padding: 8px 12px; background: var(--bg-tertiary); border-radius: 6px; font-family: monospace; min-height: 20px; color: var(--text-secondary);">-</div>
+                        <small style="color: var(--text-secondary);">Auto-derived from service account domain</small>
+                    </div>
+                    <div style="margin-top: 15px;">
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="testLDAPConnection()">
+                            <span class="material-icons">network_check</span> Test Connection
+                        </button>
+                        <span id="ldapTestResult" style="margin-left: 10px;"></span>
+                    </div>
+                </div>
+            </form>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('ldapModal')">Cancel</button>
+            <button type="button" class="btn btn-primary" onclick="saveLDAPConfig()">
+                <span class="material-icons">save</span> Save
+            </button>
+        </div>
+    </div>
+</div>
+
 <div class="card">
     <div class="card-header">
         <h3>Kernel Updates</h3>
@@ -7185,26 +7865,127 @@ func (wc *WebConsole) renderSettingsPage() string {
     </div>
 </div>
 
-<div class="card">
+<!-- Firecracker Upgrade Progress Modal -->
+<div id="upgradeProgressModal" class="modal">
+    <div class="modal-content" style="max-width: 600px;">
+        <div class="modal-header">
+            <h2><span class="material-icons" style="vertical-align: middle; margin-right: 8px;">system_update</span>Firecracker Upgrade</h2>
+            <span class="material-icons modal-close" onclick="closeUpgradeModal()" id="upgradeModalCloseBtn" style="display: none;">close</span>
+        </div>
+        <div class="modal-body">
+            <div style="margin-bottom: 20px;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                    <span id="upgradeCurrentTask">Initializing...</span>
+                    <span id="upgradeStepIndicator">Step 0/5</span>
+                </div>
+                <div class="progress-bar" style="height: 20px; background: var(--bg-tertiary); border-radius: 10px; overflow: hidden;">
+                    <div id="upgradeProgressBar" style="width: 0%%; height: 100%%; background: var(--primary); transition: width 0.3s;"></div>
+                </div>
+            </div>
+            <div style="display: flex; gap: 20px; margin-bottom: 20px;">
+                <div style="flex: 1;">
+                    <label style="font-size: 12px; color: var(--text-secondary);">Current Version</label>
+                    <div id="upgradeCurrentVersion" style="font-weight: bold;">-</div>
+                </div>
+                <div style="flex: 1;">
+                    <label style="font-size: 12px; color: var(--text-secondary);">Target Version</label>
+                    <div id="upgradeTargetVersion" style="font-weight: bold;">-</div>
+                </div>
+            </div>
+            <div style="background: var(--bg-tertiary); border-radius: 8px; padding: 15px; max-height: 250px; overflow-y: auto;" id="upgradeLogsContainer">
+                <div style="font-family: monospace; font-size: 13px; white-space: pre-wrap;" id="upgradeLogs"></div>
+            </div>
+            <div id="upgradeErrorSection" style="display: none; margin-top: 15px; padding: 10px; background: rgba(244, 67, 54, 0.1); border-radius: 8px; border-left: 3px solid #f44336;">
+                <span class="material-icons" style="color: #f44336; vertical-align: middle;">error</span>
+                <span id="upgradeErrorMessage" style="color: #f44336;"></span>
+            </div>
+            <div id="upgradeSuccessSection" style="display: none; margin-top: 15px; padding: 10px; background: rgba(76, 175, 80, 0.1); border-radius: 8px; border-left: 3px solid #4caf50;">
+                <span class="material-icons" style="color: #4caf50; vertical-align: middle;">check_circle</span>
+                <span style="color: #4caf50;">Upgrade completed successfully!</span>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeUpgradeModal()" id="upgradeCloseBtn" disabled>Close</button>
+        </div>
+    </div>
+</div>
+
+<div class="card" id="ldapGroupMappingsCard" style="display: none;">
     <div class="card-header">
-        <h3>Change Password</h3>
+        <h3>LDAP Group Mappings</h3>
+        <button class="btn btn-primary btn-sm" onclick="openModal('ldapGroupSearchModal')">
+            <span class="material-icons">add</span> Add Mapping
+        </button>
     </div>
     <div class="card-body">
-        <form id="passwordForm" style="max-width: 400px;">
+        <p style="color: var(--text-secondary); margin-bottom: 20px;">
+            Map Active Directory groups to local roles. Users will be assigned the role based on their AD group membership.
+        </p>
+        <table id="ldapMappingsTable" style="width: 100%%;">
+            <thead>
+                <tr>
+                    <th>AD Group</th>
+                    <th>Local Role</th>
+                    <th>Local Group</th>
+                    <th style="width: 100px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody id="ldapMappingsList">
+                <tr><td colspan="4" style="text-align: center;">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- LDAP Group Search Modal -->
+<div id="ldapGroupSearchModal" class="modal">
+    <div class="modal-content" style="max-width: 700px;">
+        <div class="modal-header">
+            <h2>Add LDAP Group Mapping</h2>
+            <span class="material-icons modal-close" onclick="closeModal('ldapGroupSearchModal')">close</span>
+        </div>
+        <div class="modal-body">
             <div class="form-group">
-                <label>Current Password</label>
-                <input type="password" name="current_password" required>
+                <label>Search AD Groups</label>
+                <div style="display: flex; gap: 10px;">
+                    <input type="text" id="ldapGroupSearch" placeholder="Enter group name to search...">
+                    <button type="button" class="btn btn-primary" onclick="searchLDAPGroups()">
+                        <span class="material-icons">search</span> Search
+                    </button>
+                </div>
             </div>
-            <div class="form-group">
-                <label>New Password</label>
-                <input type="password" name="new_password" required>
+            <div id="ldapGroupSearchResults" style="max-height: 300px; overflow-y: auto; margin: 15px 0; border: 1px solid var(--border-color); border-radius: 8px;">
+                <p style="padding: 20px; text-align: center; color: var(--text-secondary);">Enter a search term to find AD groups</p>
             </div>
-            <div class="form-group">
-                <label>Confirm New Password</label>
-                <input type="password" name="confirm_password" required>
+            <div id="ldapGroupMappingForm" style="display: none; border-top: 1px solid var(--border-color); padding-top: 15px;">
+                <h4 style="margin-bottom: 15px;">Configure Mapping</h4>
+                <input type="hidden" id="selectedGroupDN">
+                <div class="form-group">
+                    <label>Selected Group</label>
+                    <input type="text" id="selectedGroupName" disabled>
+                </div>
+                <div class="form-group">
+                    <label>Local Role</label>
+                    <select id="ldapMappingRole" onchange="toggleLocalGroupSelect()">
+                        <option value="admin">Admin (full access)</option>
+                        <option value="user">User (basic access)</option>
+                        <option value="group">Group-based (assign to local group)</option>
+                    </select>
+                </div>
+                <div class="form-group" id="localGroupSelectDiv" style="display: none;">
+                    <label>Assign to Local Group</label>
+                    <select id="ldapMappingLocalGroup">
+                        <option value="">Loading groups...</option>
+                    </select>
+                </div>
             </div>
-            <button type="submit" class="btn btn-primary">Update Password</button>
-        </form>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('ldapGroupSearchModal')">Cancel</button>
+            <button type="button" class="btn btn-primary" onclick="saveLDAPGroupMapping()" id="saveLDAPMappingBtn" disabled>
+                <span class="material-icons">save</span> Save Mapping
+            </button>
+        </div>
     </div>
 </div>
 
@@ -7246,37 +8027,41 @@ async function loadJailerConfig() {
     }
 }
 
-document.getElementById('jailerEnabled').addEventListener('change', function() {
-    document.getElementById('jailerSettings').style.display = this.checked ? 'block' : 'none';
-});
+if (document.getElementById('jailerEnabled')) {
+    document.getElementById('jailerEnabled').addEventListener('change', function() {
+        document.getElementById('jailerSettings').style.display = this.checked ? 'block' : 'none';
+    });
+}
 
-document.getElementById('jailerForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
+if (document.getElementById('jailerForm')) {
+    document.getElementById('jailerForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
 
-    const config = {
-        enabled: document.getElementById('jailerEnabled').checked,
-        jailer_path: document.getElementById('jailerPath').value,
-        chroot_base: document.getElementById('jailerChrootBase').value,
-        uid: parseInt(document.getElementById('jailerUID').value) || 1000,
-        gid: parseInt(document.getElementById('jailerGID').value) || 1000,
-        cgroup_version: parseInt(document.getElementById('jailerCgroupVer').value) || 2,
-        netns: document.getElementById('jailerNetNS').value,
-        daemonize: document.getElementById('jailerDaemonize').checked,
-        new_pid_ns: document.getElementById('jailerNewPidNS').checked,
-        resource_limits: {
-            fsize: parseInt(document.getElementById('jailerFsize').value) || 0,
-            no_file: parseInt(document.getElementById('jailerNoFile').value) || 0
+        const config = {
+            enabled: document.getElementById('jailerEnabled').checked,
+            jailer_path: document.getElementById('jailerPath').value,
+            chroot_base: document.getElementById('jailerChrootBase').value,
+            uid: parseInt(document.getElementById('jailerUID').value) || 1000,
+            gid: parseInt(document.getElementById('jailerGID').value) || 1000,
+            cgroup_version: parseInt(document.getElementById('jailerCgroupVer').value) || 2,
+            netns: document.getElementById('jailerNetNS').value,
+            daemonize: document.getElementById('jailerDaemonize').checked,
+            new_pid_ns: document.getElementById('jailerNewPidNS').checked,
+            resource_limits: {
+                fsize: parseInt(document.getElementById('jailerFsize').value) || 0,
+                no_file: parseInt(document.getElementById('jailerNoFile').value) || 0
+            }
+        };
+
+        const { ok, data } = await apiCall('/api/system/jailer', 'PUT', config);
+        if (ok) {
+            alert('Jailer configuration saved successfully');
+            loadJailerConfig();
+        } else {
+            alert(data.error || 'Failed to save jailer configuration');
         }
-    };
-
-    const { ok, data } = await apiCall('/api/system/jailer', 'PUT', config);
-    if (ok) {
-        alert('Jailer configuration saved successfully');
-        loadJailerConfig();
-    } else {
-        alert(data.error || 'Failed to save jailer configuration');
-    }
-});
+    });
+}
 
 async function loadSystemStatus() {
     // Load system status (fast - local only)
@@ -7345,8 +8130,10 @@ async function checkFirecrackerUpdate() {
     }
 }
 
+let upgradePollingInterval = null;
+
 async function upgradeFirecracker() {
-    if (!confirm('Are you sure you want to upgrade Firecracker? All VMs must be stopped.')) {
+    if (!await showConfirm('Are you sure you want to upgrade Firecracker? All VMs must be stopped.')) {
         return;
     }
 
@@ -7354,34 +8141,134 @@ async function upgradeFirecracker() {
     btn.disabled = true;
     btn.innerHTML = '<span class="material-icons">hourglass_empty</span> Upgrading...';
 
+    // Reset modal state
+    document.getElementById('upgradeCurrentTask').textContent = 'Initializing...';
+    document.getElementById('upgradeStepIndicator').textContent = 'Step 0/5';
+    document.getElementById('upgradeProgressBar').style.width = '0%%';
+    document.getElementById('upgradeCurrentVersion').textContent = '-';
+    document.getElementById('upgradeTargetVersion').textContent = '-';
+    document.getElementById('upgradeLogs').textContent = '';
+    document.getElementById('upgradeErrorSection').style.display = 'none';
+    document.getElementById('upgradeSuccessSection').style.display = 'none';
+    document.getElementById('upgradeCloseBtn').disabled = true;
+    document.getElementById('upgradeModalCloseBtn').style.display = 'none';
+
+    // Show the modal
+    openModal('upgradeProgressModal');
+
     const { ok, data } = await apiCall('/api/system/firecracker/upgrade', 'POST');
     if (ok) {
-        alert('Firecracker upgrade started. Please wait and refresh to see the new version.');
-        setTimeout(() => {
-            loadSystemStatus();
-            checkFirecrackerUpdate();
-        }, 10000);
+        // Start polling for progress
+        startUpgradePolling();
     } else {
-        alert(data.error || 'Failed to upgrade Firecracker');
+        document.getElementById('upgradeCurrentTask').textContent = 'Upgrade failed';
+        document.getElementById('upgradeStepIndicator').textContent = '';
+        document.getElementById('upgradeProgressBar').style.width = '100%%';
+        document.getElementById('upgradeProgressBar').style.background = '#f44336';
+        document.getElementById('upgradeErrorSection').style.display = 'block';
+        document.getElementById('upgradeErrorMessage').textContent = data.error || 'Failed to upgrade Firecracker';
+        document.getElementById('upgradeCloseBtn').disabled = false;
+        document.getElementById('upgradeModalCloseBtn').style.display = 'block';
         btn.disabled = false;
         btn.innerHTML = '<span class="material-icons">system_update</span> Upgrade Firecracker';
     }
 }
 
-document.getElementById('passwordForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const form = e.target;
-    const newPass = form.new_password.value;
-    const confirmPass = form.confirm_password.value;
-
-    if (newPass !== confirmPass) {
-        alert('Passwords do not match');
-        return;
+function startUpgradePolling() {
+    if (upgradePollingInterval) {
+        clearInterval(upgradePollingInterval);
     }
 
-    // Note: This would need backend implementation for current user password change
-    alert('Password change functionality requires backend implementation');
-});
+    upgradePollingInterval = setInterval(async () => {
+        const { ok, data } = await apiCall('/api/system/firecracker/upgrade/progress');
+        if (ok) {
+            updateUpgradeProgress(data);
+
+            // Stop polling if completed or error
+            if (data.status === 'completed' || data.status === 'error' || data.status === 'idle') {
+                clearInterval(upgradePollingInterval);
+                upgradePollingInterval = null;
+            }
+        }
+    }, 500);
+}
+
+function updateUpgradeProgress(data) {
+    const progressPercent = (data.step / data.total_steps) * 100;
+    document.getElementById('upgradeProgressBar').style.width = progressPercent + '%%';
+    document.getElementById('upgradeStepIndicator').textContent = 'Step ' + data.step + '/' + data.total_steps;
+    document.getElementById('upgradeCurrentTask').textContent = data.current_task || 'Processing...';
+
+    if (data.current_version) {
+        document.getElementById('upgradeCurrentVersion').textContent = data.current_version;
+    }
+    if (data.target_version) {
+        document.getElementById('upgradeTargetVersion').textContent = data.target_version;
+    }
+
+    // Update logs
+    if (data.logs && data.logs.length > 0) {
+        const logsContainer = document.getElementById('upgradeLogs');
+        logsContainer.textContent = data.logs.join('\\n');
+        // Auto-scroll to bottom
+        document.getElementById('upgradeLogsContainer').scrollTop = document.getElementById('upgradeLogsContainer').scrollHeight;
+    }
+
+    // Handle completion states
+    if (data.status === 'completed') {
+        document.getElementById('upgradeSuccessSection').style.display = 'block';
+        document.getElementById('upgradeCloseBtn').disabled = false;
+        document.getElementById('upgradeModalCloseBtn').style.display = 'block';
+        document.getElementById('upgradeProgressBar').style.background = '#4caf50';
+
+        // Reset upgrade button
+        const btn = document.getElementById('upgradeBtn');
+        btn.disabled = false;
+        btn.innerHTML = '<span class="material-icons">system_update</span> Upgrade Firecracker';
+
+        // Refresh system info
+        loadSystemStatus();
+        checkFirecrackerUpdate();
+    } else if (data.status === 'error') {
+        document.getElementById('upgradeErrorSection').style.display = 'block';
+        document.getElementById('upgradeErrorMessage').textContent = data.error || 'An error occurred during upgrade';
+        document.getElementById('upgradeCloseBtn').disabled = false;
+        document.getElementById('upgradeModalCloseBtn').style.display = 'block';
+        document.getElementById('upgradeProgressBar').style.background = '#f44336';
+
+        // Reset upgrade button
+        const btn = document.getElementById('upgradeBtn');
+        btn.disabled = false;
+        btn.innerHTML = '<span class="material-icons">system_update</span> Upgrade Firecracker';
+    }
+}
+
+function closeUpgradeModal() {
+    closeModal('upgradeProgressModal');
+    if (upgradePollingInterval) {
+        clearInterval(upgradePollingInterval);
+        upgradePollingInterval = null;
+    }
+    // Reset progress bar color
+    document.getElementById('upgradeProgressBar').style.background = 'var(--primary)';
+}
+
+if (document.getElementById('passwordForm')) {
+    document.getElementById('passwordForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const form = e.target;
+        const newPass = form.new_password.value;
+        const confirmPass = form.confirm_password.value;
+
+        if (newPass !== confirmPass) {
+            alert('Passwords do not match');
+            return;
+        }
+
+        // Note: This would need backend implementation for current user password change
+        alert('Password change functionality requires backend implementation');
+    });
+}
 
 // Proxy configuration functions
 async function loadProxyConfig() {
@@ -7415,9 +8302,11 @@ async function loadProxyConfig() {
     }
 }
 
-document.getElementById('proxyEnabled').addEventListener('change', function() {
-    document.getElementById('proxySettings').style.display = this.checked ? 'block' : 'none';
-});
+if (document.getElementById('proxyEnabled')) {
+    document.getElementById('proxyEnabled').addEventListener('change', function() {
+        document.getElementById('proxySettings').style.display = this.checked ? 'block' : 'none';
+    });
+}
 
 async function saveProxyConfig() {
     const config = {
@@ -7600,12 +8489,278 @@ async function downloadKernel(version) {
     }, 1000);
 }
 
+// LDAP Configuration Functions
+function deriveBaseDNFromUsername(username) {
+    // Extract domain from user@domain.tld format
+    const atIndex = username.indexOf('@');
+    if (atIndex === -1) return '';
+    const domain = username.substring(atIndex + 1);
+    if (!domain) return '';
+    // Convert domain.tld to DC=domain,DC=tld
+    const parts = domain.split('.');
+    return parts.map(p => 'DC=' + p).join(',');
+}
+
+async function loadLDAPConfig() {
+    const { ok, data } = await apiCall('/api/system/ldap');
+    const statusText = document.getElementById('ldapStatusText');
+    const settingsDiv = document.getElementById('ldapSettings');
+    const mappingsCard = document.getElementById('ldapGroupMappingsCard');
+
+    if (ok) {
+        const config = data || {};
+        // Update status text
+        if (config.enabled) {
+            statusText.innerHTML = '<span style="color: var(--success);">Enabled</span>';
+            mappingsCard.style.display = 'block';
+            loadLDAPGroupMappings();
+        } else {
+            statusText.innerHTML = '<span style="color: var(--text-secondary);">Disabled</span>';
+            mappingsCard.style.display = 'none';
+        }
+
+        // Populate form fields
+        document.getElementById('ldapEnabled').checked = config.enabled || false;
+        document.getElementById('ldapServer').value = config.server || '';
+        document.getElementById('ldapPort').value = config.port || 389;
+        document.getElementById('ldapUseSSL').checked = config.use_ssl || false;
+        document.getElementById('ldapUseStartTLS').checked = config.use_starttls || false;
+        document.getElementById('ldapSkipVerify').checked = config.skip_verify !== false;
+        document.getElementById('ldapBindDN').value = config.bind_dn || '';
+        // Auto-derive Base DN from bind_dn and update display
+        updateLdapBaseDN();
+
+        // Show/hide settings based on enabled state
+        settingsDiv.style.display = config.enabled ? 'block' : 'none';
+    } else {
+        statusText.innerHTML = '<span style="color: var(--danger);">Error</span>';
+    }
+}
+
+if (document.getElementById('ldapEnabled')) {
+    document.getElementById('ldapEnabled').addEventListener('change', function() {
+        document.getElementById('ldapSettings').style.display = this.checked ? 'block' : 'none';
+    });
+}
+
+if (document.getElementById('ldapUseSSL')) {
+    document.getElementById('ldapUseSSL').addEventListener('change', function() {
+        if (this.checked) {
+            document.getElementById('ldapPort').value = 636;
+            document.getElementById('ldapUseStartTLS').checked = false;
+        } else {
+            document.getElementById('ldapPort').value = 389;
+        }
+    });
+}
+
+// Auto-derive Base DN when username changes
+function updateLdapBaseDN() {
+    const bindDN = document.getElementById('ldapBindDN');
+    const baseDNDisplay = document.getElementById('ldapBaseDNDisplay');
+    if (bindDN && baseDNDisplay) {
+        const baseDN = deriveBaseDNFromUsername(bindDN.value);
+        baseDNDisplay.textContent = baseDN || '-';
+        baseDNDisplay.style.color = baseDN ? 'var(--text-primary)' : 'var(--text-secondary)';
+    }
+}
+
+async function saveLDAPConfig() {
+    const bindDN = document.getElementById('ldapBindDN').value;
+    const baseDN = deriveBaseDNFromUsername(bindDN);
+
+    const config = {
+        enabled: document.getElementById('ldapEnabled').checked,
+        server: document.getElementById('ldapServer').value,
+        port: parseInt(document.getElementById('ldapPort').value) || 389,
+        use_ssl: document.getElementById('ldapUseSSL').checked,
+        use_starttls: document.getElementById('ldapUseStartTLS').checked,
+        skip_verify: document.getElementById('ldapSkipVerify').checked,
+        bind_dn: bindDN,
+        bind_password: document.getElementById('ldapBindPassword').value,
+        base_dn: baseDN
+    };
+
+    const { ok, data } = await apiCall('/api/system/ldap', 'PUT', config);
+    if (ok) {
+        closeModal('ldapModal');
+        loadLDAPConfig();
+    } else {
+        alert(data.error || 'Failed to save configuration');
+    }
+}
+
+async function testLDAPConnection() {
+    const resultSpan = document.getElementById('ldapTestResult');
+    resultSpan.innerHTML = '<span style="color: var(--text-secondary);">Testing...</span>';
+
+    const bindDN = document.getElementById('ldapBindDN').value;
+    const baseDN = deriveBaseDNFromUsername(bindDN);
+
+    const config = {
+        server: document.getElementById('ldapServer').value,
+        port: parseInt(document.getElementById('ldapPort').value) || 389,
+        use_ssl: document.getElementById('ldapUseSSL').checked,
+        use_starttls: document.getElementById('ldapUseStartTLS').checked,
+        skip_verify: document.getElementById('ldapSkipVerify').checked,
+        bind_dn: bindDN,
+        bind_password: document.getElementById('ldapBindPassword').value,
+        base_dn: baseDN
+    };
+
+    const { ok, data } = await apiCall('/api/system/ldap/test', 'POST', config);
+    if (ok && data.success) {
+        resultSpan.innerHTML = '<span style="color: var(--success);"><span class="material-icons" style="font-size: 16px; vertical-align: middle;">check_circle</span> Connection successful</span>';
+    } else {
+        resultSpan.innerHTML = '<span style="color: var(--danger);"><span class="material-icons" style="font-size: 16px; vertical-align: middle;">error</span> ' + (data.error || 'Connection failed') + '</span>';
+    }
+}
+
+async function loadLDAPGroupMappings() {
+    const { ok, data } = await apiCall('/api/ldap/group-mappings');
+    const tbody = document.getElementById('ldapMappingsList');
+
+    if (!ok || !data || data.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-secondary);">No group mappings configured</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = data.map(m => ` + "`" + `
+        <tr>
+            <td>
+                <div style="font-weight: 500;">${m.group_name || m.group_dn}</div>
+                <small style="color: var(--text-secondary);">${m.group_dn}</small>
+            </td>
+            <td><span class="badge badge-${m.local_role === 'admin' ? 'info' : 'secondary'}">${m.local_role}</span></td>
+            <td>${m.local_group_id || '-'}</td>
+            <td>
+                <button class="btn btn-danger btn-sm" onclick="deleteLDAPMapping('${m.id}')">
+                    <span class="material-icons">delete</span>
+                </button>
+            </td>
+        </tr>
+    ` + "`" + `).join('');
+}
+
+async function searchLDAPGroups() {
+    const query = document.getElementById('ldapGroupSearch').value.trim();
+    const resultsDiv = document.getElementById('ldapGroupSearchResults');
+
+    if (!query) {
+        resultsDiv.innerHTML = '<p style="padding: 20px; text-align: center; color: var(--text-secondary);">Enter a search term to find AD groups</p>';
+        return;
+    }
+
+    resultsDiv.innerHTML = '<p style="padding: 20px; text-align: center;"><span class="material-icons" style="animation: spin 1s linear infinite;">sync</span> Searching...</p>';
+
+    const { ok, data } = await apiCall('/api/system/ldap/groups?q=' + encodeURIComponent(query));
+
+    if (!ok) {
+        resultsDiv.innerHTML = '<p style="padding: 20px; text-align: center; color: var(--danger);">Error: ' + (data.error || 'Failed to search groups') + '</p>';
+        return;
+    }
+
+    if (!data || data.length === 0) {
+        resultsDiv.innerHTML = '<p style="padding: 20px; text-align: center; color: var(--text-secondary);">No groups found matching "' + query + '"</p>';
+        return;
+    }
+
+    resultsDiv.innerHTML = data.map(g => ` + "`" + `
+        <div style="padding: 12px; border-bottom: 1px solid var(--border-color); cursor: pointer;"
+             onclick="selectLDAPGroup('${g.dn.replace(/'/g, "\\'")}', '${(g.name || g.cn || '').replace(/'/g, "\\'")}')"
+             onmouseover="this.style.background='var(--bg-tertiary)'"
+             onmouseout="this.style.background=''">
+            <div style="font-weight: 500;">${g.name || g.cn}</div>
+            <small style="color: var(--text-secondary);">${g.dn}</small>
+            ${g.description ? '<br><small>' + g.description + '</small>' : ''}
+        </div>
+    ` + "`" + `).join('');
+}
+
+function selectLDAPGroup(dn, name) {
+    document.getElementById('selectedGroupDN').value = dn;
+    document.getElementById('selectedGroupName').value = name || dn;
+    document.getElementById('ldapGroupMappingForm').style.display = 'block';
+    document.getElementById('saveLDAPMappingBtn').disabled = false;
+    loadLocalGroups();
+}
+
+function toggleLocalGroupSelect() {
+    const role = document.getElementById('ldapMappingRole').value;
+    document.getElementById('localGroupSelectDiv').style.display = role === 'group' ? 'block' : 'none';
+}
+
+async function loadLocalGroups() {
+    const { ok, data } = await apiCall('/api/groups');
+    const select = document.getElementById('ldapMappingLocalGroup');
+
+    if (!ok || !data.groups || data.groups.length === 0) {
+        select.innerHTML = '<option value="">No local groups available</option>';
+        return;
+    }
+
+    select.innerHTML = '<option value="">Select a group...</option>' +
+        data.groups.map(g => '<option value="' + g.id + '">' + g.name + '</option>').join('');
+}
+
+async function saveLDAPGroupMapping() {
+    const dn = document.getElementById('selectedGroupDN').value;
+    const name = document.getElementById('selectedGroupName').value;
+    const role = document.getElementById('ldapMappingRole').value;
+    const localGroupId = document.getElementById('ldapMappingLocalGroup').value;
+
+    if (role === 'group' && !localGroupId) {
+        alert('Please select a local group');
+        return;
+    }
+
+    const mapping = {
+        group_dn: dn,
+        group_name: name,
+        local_role: role,
+        local_group_id: localGroupId
+    };
+
+    const { ok, data } = await apiCall('/api/ldap/group-mappings', 'POST', mapping);
+    if (ok) {
+        closeModal('ldapGroupSearchModal');
+        resetLDAPGroupModal();
+        loadLDAPGroupMappings();
+    } else {
+        alert(data.error || 'Failed to create mapping');
+    }
+}
+
+async function deleteLDAPMapping(id) {
+    if (!await showConfirm('Are you sure you want to delete this group mapping?')) return;
+
+    const { ok, data } = await apiCall('/api/ldap/group-mappings/' + id, 'DELETE');
+    if (ok) {
+        loadLDAPGroupMappings();
+    } else {
+        alert(data.error || 'Failed to delete mapping');
+    }
+}
+
+function resetLDAPGroupModal() {
+    document.getElementById('ldapGroupSearch').value = '';
+    document.getElementById('ldapGroupSearchResults').innerHTML = '<p style="padding: 20px; text-align: center; color: var(--text-secondary);">Enter a search term to find AD groups</p>';
+    document.getElementById('ldapGroupMappingForm').style.display = 'none';
+    document.getElementById('selectedGroupDN').value = '';
+    document.getElementById('selectedGroupName').value = '';
+    document.getElementById('ldapMappingRole').value = 'admin';
+    document.getElementById('localGroupSelectDiv').style.display = 'none';
+    document.getElementById('saveLDAPMappingBtn').disabled = true;
+}
+
 // Load system status immediately (fast)
 loadSystemStatus();
 // Load jailer configuration
 loadJailerConfig();
 // Load proxy configuration
 loadProxyConfig();
+// Load LDAP configuration
+loadLDAPConfig();
 // Load cached version info (fast - reads from local JSON cache)
 checkFirecrackerUpdate();
 // Load installed kernels and cached kernel update info
@@ -7751,7 +8906,7 @@ async function resetPassword(id) {
 }
 
 async function deleteUser(id) {
-    if (!confirm('Are you sure you want to delete this user?')) return;
+    if (!await showConfirm('Are you sure you want to delete this user?')) return;
     const { ok, data } = await apiCall(` + "`" + `/api/users/${id}` + "`" + `, 'DELETE');
     if (ok) {
         loadUsers();
@@ -7780,10 +8935,16 @@ func (wc *WebConsole) renderGroupsPage() string {
 <div class="card">
     <div class="card-header">
         <h3>Groups</h3>
-        <button class="btn btn-primary" onclick="openModal('createGroupModal')">
-            <span class="material-icons">group_add</span>
-            Add Group
-        </button>
+        <div style="display: flex; gap: 10px;">
+            <button id="browseADBtn" class="btn btn-secondary" onclick="openModal('browseADModal')" style="display: none;">
+                <span class="material-icons">domain</span>
+                Browse Active Directory
+            </button>
+            <button class="btn btn-primary" onclick="openModal('createGroupModal')">
+                <span class="material-icons">group_add</span>
+                Add Group
+            </button>
+        </div>
     </div>
     <div class="card-body">
         <table>
@@ -7871,17 +9032,18 @@ func (wc *WebConsole) renderGroupsPage() string {
 <div id="editGroupModal" class="modal">
     <div class="modal-content" style="max-width: 700px;">
         <div class="modal-header">
-            <h3>Edit Group: <span id="editGroupName"></span></h3>
+            <h3>Edit Group: <span id="editGroupName"></span><span id="editGroupADBadge" class="badge badge-info" style="margin-left: 10px; display: none;">Active Directory</span></h3>
             <span class="material-icons modal-close" onclick="closeModal('editGroupModal')">close</span>
         </div>
         <div class="modal-body">
             <input type="hidden" id="editGroupId">
+            <input type="hidden" id="editGroupIsAD">
 
             <div style="display: flex; gap: 20px;">
-                <!-- Members Section -->
-                <div style="flex: 1;">
+                <!-- Members Section (Local Groups) -->
+                <div id="localMembersSection" style="flex: 1;">
                     <h4 style="margin-bottom: 10px;">Members</h4>
-                    <div style="margin-bottom: 10px;">
+                    <div id="addMemberControls" style="margin-bottom: 10px;">
                         <select id="addMemberSelect" style="width: calc(100% - 80px); display: inline-block;">
                             <option value="">Select user...</option>
                         </select>
@@ -7889,6 +9051,20 @@ func (wc *WebConsole) renderGroupsPage() string {
                     </div>
                     <div id="membersList" style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 4px; padding: 8px;">
                         <p style="color: var(--text-secondary);">No members</p>
+                    </div>
+                </div>
+
+                <!-- Members Section (AD Groups) -->
+                <div id="adMembersSection" style="flex: 1; display: none;">
+                    <h4 style="margin-bottom: 10px;">
+                        <span class="material-icons" style="vertical-align: middle; font-size: 18px;">domain</span>
+                        Active Directory Members
+                    </h4>
+                    <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 10px;">
+                        Members are managed in Active Directory
+                    </p>
+                    <div id="adMembersList" style="max-height: 250px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 4px; padding: 8px;">
+                        <p style="color: var(--text-secondary);">Loading...</p>
                     </div>
                 </div>
 
@@ -7913,9 +9089,105 @@ func (wc *WebConsole) renderGroupsPage() string {
     </div>
 </div>
 
+<!-- Browse Active Directory Groups Modal -->
+<div id="browseADModal" class="modal">
+    <div class="modal-content" style="max-width: 800px;">
+        <div class="modal-header">
+            <h3>Browse Active Directory Groups</h3>
+            <span class="material-icons modal-close" onclick="closeModal('browseADModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <div class="form-group">
+                <div style="display: flex; gap: 10px;">
+                    <input type="text" id="adGroupSearchInput" placeholder="Search AD groups..." style="flex: 1;">
+                    <button type="button" class="btn btn-primary" onclick="searchADGroups()">
+                        <span class="material-icons">search</span> Search
+                    </button>
+                </div>
+                <small style="color: var(--text-secondary);">Enter a group name to search or leave empty to list all groups</small>
+            </div>
+            <div id="adGroupSearchResults" style="max-height: 400px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; margin-top: 15px;">
+                <p style="padding: 20px; text-align: center; color: var(--text-secondary);">Click "Search" to browse Active Directory groups</p>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('browseADModal')">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Import AD Group Modal -->
+<div id="importADGroupModal" class="modal">
+    <div class="modal-content" style="max-width: 500px;">
+        <div class="modal-header">
+            <h3>Import Active Directory Group</h3>
+            <span class="material-icons modal-close" onclick="closeModal('importADGroupModal')">close</span>
+        </div>
+        <div class="modal-body">
+            <input type="hidden" id="importGroupDN">
+            <div class="form-group">
+                <label>Group Name</label>
+                <input type="text" id="importGroupName" disabled style="background: var(--bg-tertiary);">
+            </div>
+            <div class="form-group">
+                <label>Description</label>
+                <input type="text" id="importGroupDescription" placeholder="Optional description">
+            </div>
+            <div class="form-group">
+                <label>VM Permissions</label>
+                <div style="display: flex; flex-wrap: wrap; gap: 15px; margin-top: 8px;">
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="checkbox" id="import_perm_start" checked style="width: auto; margin-right: 5px;"> Start
+                    </label>
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="checkbox" id="import_perm_stop" checked style="width: auto; margin-right: 5px;"> Stop
+                    </label>
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="checkbox" id="import_perm_console" checked style="width: auto; margin-right: 5px;"> Console
+                    </label>
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="checkbox" id="import_perm_edit" style="width: auto; margin-right: 5px;"> Edit
+                    </label>
+                </div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('importADGroupModal')">Cancel</button>
+            <button type="button" class="btn btn-primary" onclick="confirmImportADGroup()">
+                <span class="material-icons">add</span> Import Group
+            </button>
+        </div>
+    </div>
+</div>
+
 <script>
 let allUsers = [];
 let allVMs = [];
+let ldapEnabled = false;
+
+// Check if LDAP is enabled and show/hide Browse AD button
+async function checkLDAPStatus() {
+    const { ok, data } = await apiCall('/api/system/ldap');
+    if (ok && data && data.enabled) {
+        ldapEnabled = true;
+        document.getElementById('browseADBtn').style.display = 'inline-flex';
+    } else {
+        ldapEnabled = false;
+        document.getElementById('browseADBtn').style.display = 'none';
+    }
+}
+
+// Check if a group name looks like an AD DN (contains CN= or DC=)
+function isADGroup(groupName) {
+    return groupName && (groupName.includes('CN=') || groupName.includes('DC='));
+}
+
+// Extract the CN (Common Name) from a DN
+function extractCNFromDN(dn) {
+    if (!dn) return dn;
+    const match = dn.match(/CN=([^,]+)/i);
+    return match ? match[1] : dn;
+}
 
 async function loadGroups() {
     const { ok, data } = await apiCall('/api/groups');
@@ -7929,27 +9201,48 @@ async function loadGroups() {
 
     // Fetch member and VM counts for each group
     const groupsWithCounts = await Promise.all(data.groups.map(async (group) => {
-        const [membersResp, vmsResp] = await Promise.all([
-            apiCall(` + "`" + `/api/groups/${group.id}/members` + "`" + `),
-            apiCall(` + "`" + `/api/groups/${group.id}/vms` + "`" + `)
-        ]);
+        const isAD = isADGroup(group.name);
+        let memberCount = 0;
+
+        if (isAD && ldapEnabled) {
+            // For AD groups, get member count from AD
+            const adResp = await apiCall('/api/system/ldap/group-members?dn=' + encodeURIComponent(group.name));
+            memberCount = adResp.ok && adResp.data ? adResp.data.count : 0;
+        } else {
+            // For local groups, get member count from local database
+            const membersResp = await apiCall(` + "`" + `/api/groups/${group.id}/members` + "`" + `);
+            memberCount = membersResp.ok && membersResp.data.members ? membersResp.data.members.length : 0;
+        }
+
+        const vmsResp = await apiCall(` + "`" + `/api/groups/${group.id}/vms` + "`" + `);
+
         return {
             ...group,
-            memberCount: membersResp.ok && membersResp.data.members ? membersResp.data.members.length : 0,
+            isAD: isAD,
+            displayName: isAD ? extractCNFromDN(group.name) : group.name,
+            memberCount: memberCount,
             vmCount: vmsResp.ok && vmsResp.data.vms ? vmsResp.data.vms.length : 0
         };
     }));
 
     tbody.innerHTML = groupsWithCounts.map(group => ` + "`" + `
         <tr>
-            <td><a href="#" onclick="editGroup('${group.id}'); return false;" style="font-weight: bold; text-decoration: none;">${group.name}</a></td>
+            <td>
+                <a href="#" onclick="editGroup('${group.id}'); return false;" style="font-weight: bold; text-decoration: none;">
+                    ${group.displayName}
+                </a>
+                ${group.isAD ? '<span class="badge badge-info" style="margin-left: 8px; font-size: 10px;">Active Directory</span>' : ''}
+            </td>
             <td>${group.description || '-'}</td>
             <td>
                 <ul class="permission-list">
                     ${group.permissions.split(',').map(p => ` + "`" + `<li><span class="material-icons" style="font-size: 14px; color: var(--success); vertical-align: middle;">check</span> ${p.trim()}</li>` + "`" + `).join('')}
                 </ul>
             </td>
-            <td><span class="badge badge-secondary">${group.memberCount}</span></td>
+            <td>
+                <span class="badge badge-secondary">${group.memberCount}</span>
+                ${group.isAD ? '<small style="color: var(--text-secondary); margin-left: 4px;">(AD)</small>' : ''}
+            </td>
             <td><span class="badge badge-secondary">${group.vmCount}</span></td>
             <td>
                 <div class="actions">
@@ -8003,8 +9296,17 @@ async function editGroup(groupId) {
         return;
     }
 
+    const isAD = isADGroup(data.name);
+    const displayName = isAD ? extractCNFromDN(data.name) : data.name;
+
     document.getElementById('editGroupId').value = groupId;
-    document.getElementById('editGroupName').textContent = data.name;
+    document.getElementById('editGroupIsAD').value = isAD ? 'true' : 'false';
+    document.getElementById('editGroupName').textContent = displayName;
+    document.getElementById('editGroupADBadge').style.display = isAD ? 'inline' : 'none';
+
+    // Show/hide appropriate members section
+    document.getElementById('localMembersSection').style.display = isAD ? 'none' : 'block';
+    document.getElementById('adMembersSection').style.display = isAD ? 'block' : 'none';
 
     // Load all users and VMs for dropdowns
     const [usersResp, vmsResp] = await Promise.all([
@@ -8015,28 +9317,16 @@ async function editGroup(groupId) {
     allVMs = vmsResp.ok && vmsResp.data.vms ? vmsResp.data.vms : [];
 
     // Load current members and VMs
-    await refreshGroupDetails(groupId);
+    await refreshGroupDetails(groupId, isAD, data.name);
 
     openModal('editGroupModal');
 }
 
-async function refreshGroupDetails(groupId) {
-    const [membersResp, groupVmsResp] = await Promise.all([
-        apiCall(` + "`" + `/api/groups/${groupId}/members` + "`" + `),
-        apiCall(` + "`" + `/api/groups/${groupId}/vms` + "`" + `)
-    ]);
-
-    const currentMembers = membersResp.ok && membersResp.data.members ? membersResp.data.members : [];
+async function refreshGroupDetails(groupId, isAD = false, groupDN = '') {
+    // Load VMs for the group
+    const groupVmsResp = await apiCall(` + "`" + `/api/groups/${groupId}/vms` + "`" + `);
     const currentVMs = groupVmsResp.ok && groupVmsResp.data.vms ? groupVmsResp.data.vms : [];
-    const memberIds = currentMembers.map(m => m.user_id);
     const vmIds = currentVMs.map(v => v.vm_id);
-
-    // Populate member dropdown (exclude already added)
-    const memberSelect = document.getElementById('addMemberSelect');
-    memberSelect.innerHTML = '<option value="">Select user...</option>';
-    allUsers.filter(u => !memberIds.includes(u.id)).forEach(u => {
-        memberSelect.innerHTML += ` + "`" + `<option value="${u.id}">${u.username} (${u.role})</option>` + "`" + `;
-    });
 
     // Populate VM dropdown (exclude already added)
     const vmSelect = document.getElementById('addVmSelect');
@@ -8044,21 +9334,6 @@ async function refreshGroupDetails(groupId) {
     allVMs.filter(v => !vmIds.includes(v.id)).forEach(v => {
         vmSelect.innerHTML += ` + "`" + `<option value="${v.id}">${v.name}</option>` + "`" + `;
     });
-
-    // Show members list
-    const membersList = document.getElementById('membersList');
-    if (currentMembers.length === 0) {
-        membersList.innerHTML = '<p style="color: var(--text-secondary);">No members</p>';
-    } else {
-        membersList.innerHTML = currentMembers.map(m => ` + "`" + `
-            <div style="display: flex; justify-content: space-between; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--border-color);">
-                <span>${m.username}</span>
-                <button class="btn btn-danger btn-xs" onclick="removeMember(${m.user_id})">
-                    <span class="material-icons" style="font-size: 14px;">close</span>
-                </button>
-            </div>
-        ` + "`" + `).join('');
-    }
 
     // Show VMs list
     const vmsList = document.getElementById('vmsList');
@@ -8073,6 +9348,64 @@ async function refreshGroupDetails(groupId) {
                 </button>
             </div>
         ` + "`" + `).join('');
+    }
+
+    if (isAD && groupDN) {
+        // Load AD group members
+        const adMembersList = document.getElementById('adMembersList');
+        adMembersList.innerHTML = '<p style="text-align: center; color: var(--text-secondary);"><span class="material-icons" style="animation: spin 1s linear infinite;">sync</span> Loading members from Active Directory...</p>';
+
+        const adResp = await apiCall('/api/system/ldap/group-members?dn=' + encodeURIComponent(groupDN) + '&list=true');
+
+        if (!adResp.ok) {
+            adMembersList.innerHTML = '<p style="color: var(--danger);">Failed to load AD members: ' + (adResp.data.error || 'Unknown error') + '</p>';
+            return;
+        }
+
+        const adMembers = adResp.data.members || [];
+        if (adMembers.length === 0) {
+            adMembersList.innerHTML = '<p style="color: var(--text-secondary);">No members in this group</p>';
+        } else {
+            adMembersList.innerHTML = adMembers.map(m => ` + "`" + `
+                <div style="display: flex; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border-color);">
+                    <span class="material-icons" style="font-size: 18px; margin-right: 8px; color: ${m.type === 'group' ? 'var(--warning)' : 'var(--primary)'};">
+                        ${m.type === 'group' ? 'folder' : 'person'}
+                    </span>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">${m.display_name || m.cn}</div>
+                        ${m.email ? '<small style="color: var(--text-secondary);">' + m.email + '</small>' : ''}
+                    </div>
+                    <span class="badge badge-${m.type === 'group' ? 'warning' : 'secondary'}" style="font-size: 10px;">${m.type}</span>
+                </div>
+            ` + "`" + `).join('');
+        }
+    } else {
+        // Load local group members
+        const membersResp = await apiCall(` + "`" + `/api/groups/${groupId}/members` + "`" + `);
+        const currentMembers = membersResp.ok && membersResp.data.members ? membersResp.data.members : [];
+        const memberIds = currentMembers.map(m => m.user_id);
+
+        // Populate member dropdown (exclude already added)
+        const memberSelect = document.getElementById('addMemberSelect');
+        memberSelect.innerHTML = '<option value="">Select user...</option>';
+        allUsers.filter(u => !memberIds.includes(u.id)).forEach(u => {
+            memberSelect.innerHTML += ` + "`" + `<option value="${u.id}">${u.username} (${u.role})</option>` + "`" + `;
+        });
+
+        // Show members list
+        const membersList = document.getElementById('membersList');
+        if (currentMembers.length === 0) {
+            membersList.innerHTML = '<p style="color: var(--text-secondary);">No members</p>';
+        } else {
+            membersList.innerHTML = currentMembers.map(m => ` + "`" + `
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--border-color);">
+                    <span>${m.username}</span>
+                    <button class="btn btn-danger btn-xs" onclick="removeMember(${m.user_id})">
+                        <span class="material-icons" style="font-size: 14px;">close</span>
+                    </button>
+                </div>
+            ` + "`" + `).join('');
+        }
     }
 }
 
@@ -8127,7 +9460,7 @@ async function removeVmFromGroup(vmId) {
 }
 
 async function deleteGroup(groupId) {
-    if (!confirm('Are you sure you want to delete this group?')) return;
+    if (!await showConfirm('Are you sure you want to delete this group?')) return;
     const { ok, data } = await apiCall(` + "`" + `/api/groups/${groupId}` + "`" + `, 'DELETE');
     if (ok) {
         loadGroups();
@@ -8136,6 +9469,89 @@ async function deleteGroup(groupId) {
     }
 }
 
+// Search Active Directory groups
+async function searchADGroups() {
+    const query = document.getElementById('adGroupSearchInput').value.trim();
+    const resultsDiv = document.getElementById('adGroupSearchResults');
+
+    resultsDiv.innerHTML = '<p style="padding: 20px; text-align: center;"><span class="material-icons" style="animation: spin 1s linear infinite;">sync</span> Searching...</p>';
+
+    const { ok, data } = await apiCall('/api/system/ldap/groups?q=' + encodeURIComponent(query) + '&limit=100');
+
+    if (!ok) {
+        resultsDiv.innerHTML = '<p style="padding: 20px; text-align: center; color: var(--danger);">Error: ' + (data.error || 'Failed to search groups') + '</p>';
+        return;
+    }
+
+    if (!data || data.length === 0) {
+        resultsDiv.innerHTML = '<p style="padding: 20px; text-align: center; color: var(--text-secondary);">No groups found</p>';
+        return;
+    }
+
+    resultsDiv.innerHTML = '<table style="width: 100%;"><thead><tr><th>Group Name</th><th>Description</th><th style="width: 100px;">Action</th></tr></thead><tbody>' +
+        data.map(g => ` + "`" + `
+            <tr>
+                <td>
+                    <strong>${g.cn || g.name}</strong>
+                    <br><small style="color: var(--text-secondary);">${g.dn}</small>
+                </td>
+                <td>${g.description || '-'}</td>
+                <td>
+                    <button class="btn btn-primary btn-sm" onclick="openImportADGroupModal('${encodeURIComponent(g.dn)}', '${encodeURIComponent(g.cn || g.name)}')">
+                        <span class="material-icons">add</span> Import
+                    </button>
+                </td>
+            </tr>
+        ` + "`" + `).join('') +
+        '</tbody></table>';
+}
+
+// Open import AD group modal
+function openImportADGroupModal(encodedDN, encodedName) {
+    const dn = decodeURIComponent(encodedDN);
+    const name = decodeURIComponent(encodedName);
+
+    document.getElementById('importGroupDN').value = dn;
+    document.getElementById('importGroupName').value = name;
+    document.getElementById('importGroupDescription').value = '';
+    document.getElementById('import_perm_start').checked = true;
+    document.getElementById('import_perm_stop').checked = true;
+    document.getElementById('import_perm_console').checked = true;
+    document.getElementById('import_perm_edit').checked = false;
+
+    closeModal('browseADModal');
+    openModal('importADGroupModal');
+}
+
+// Confirm import AD group
+async function confirmImportADGroup() {
+    const dn = document.getElementById('importGroupDN').value;
+    const description = document.getElementById('importGroupDescription').value;
+
+    // Build permissions
+    const perms = [];
+    if (document.getElementById('import_perm_start').checked) perms.push('start');
+    if (document.getElementById('import_perm_stop').checked) perms.push('stop');
+    if (document.getElementById('import_perm_console').checked) perms.push('console');
+    if (document.getElementById('import_perm_edit').checked) perms.push('edit');
+
+    const groupData = {
+        name: dn,  // Store the DN as the group name to identify it as an AD group
+        description: description,
+        permissions: perms.join(',')
+    };
+
+    const { ok, data } = await apiCall('/api/groups', 'POST', groupData);
+    if (ok) {
+        closeModal('importADGroupModal');
+        loadGroups();
+    } else {
+        alert(data.error || 'Failed to import group');
+    }
+}
+
+// Initialize
+checkLDAPStatus();
 loadGroups();
 </script>
 `
@@ -8596,7 +10012,7 @@ function copyKey() {
 }
 
 async function deleteKey(keyId) {
-    if (!confirm('Are you sure you want to delete this migration key?')) return;
+    if (!await showConfirm('Are you sure you want to delete this migration key?')) return;
     const { ok, data } = await apiCall(` + "`" + `/api/migration/keys/${keyId}` + "`" + `, 'DELETE');
     if (ok) {
         loadKeys();
@@ -9125,7 +10541,7 @@ async function setInterfaceUp(name) {
 }
 
 async function setInterfaceDown(name) {
-    if (!confirm('Are you sure you want to bring down ' + name + '? This may disconnect you!')) {
+    if (!await showConfirm('Are you sure you want to bring down ' + name + '? This may disconnect you!')) {
         return;
     }
     const { ok, data } = await apiCall('/api/hostnet/interfaces/' + name + '/down', 'POST');
@@ -9137,7 +10553,7 @@ async function setInterfaceDown(name) {
 }
 
 async function removeAddress(ifaceName, address) {
-    if (!confirm('Remove address ' + address + ' from ' + ifaceName + '?')) {
+    if (!await showConfirm('Remove address ' + address + ' from ' + ifaceName + '?')) {
         return;
     }
     const { ok, data } = await apiCall('/api/hostnet/interfaces/' + ifaceName + '/address', 'DELETE', { address: address });
@@ -9258,7 +10674,7 @@ document.getElementById('addRouteForm').addEventListener('submit', async (e) => 
 });
 
 async function deleteRoute(destination, gateway, iface) {
-    if (!confirm('Delete route to ' + destination + '?')) {
+    if (!await showConfirm('Delete route to ' + destination + '?')) {
         return;
     }
 
@@ -9588,7 +11004,7 @@ async function updateVMGroup(e) {
 }
 
 async function deleteVMGroup() {
-    if (!confirm('Are you sure you want to delete this VM group?')) return;
+    if (!await showConfirm('Are you sure you want to delete this VM group?')) return;
 
     const id = document.getElementById('editGroupId').value;
     const { ok, data } = await apiCall('/api/vmgroups/' + id, 'DELETE');
@@ -9738,8 +11154,8 @@ func (wc *WebConsole) renderAccountPage() string {
 	return `
 <div class="card">
     <div class="card-header">
-        <h3><span class="material-icons" style="vertical-align: middle; margin-right: 8px;">account_circle</span>My Account</h3>
-        <button class="btn btn-primary" onclick="openModal('changePasswordModal')">
+        <h3><span class="material-icons" style="vertical-align: middle; margin-right: 8px;">account_circle</span><span id="accountHeaderUsername">My Account</span></h3>
+        <button id="changePasswordHeaderBtn" class="btn btn-primary" onclick="openModal('changePasswordModal')">
             <span class="material-icons">key</span> Change Password
         </button>
     </div>
@@ -9969,10 +11385,19 @@ async function loadAccountData() {
     }
 
     // Populate user info
+    document.getElementById('accountHeaderUsername').textContent = data.user.username;
     document.getElementById('accountUsername').textContent = data.user.username;
     document.getElementById('accountEmail').textContent = data.user.email || '-';
     document.getElementById('accountRole').innerHTML = '<span class="badge badge-' + (data.user.role === 'admin' ? 'success' : 'info') + '">' + data.user.role + '</span>';
     document.getElementById('accountCreatedAt').textContent = formatDate(data.user.created_at);
+
+    // Hide Change Password button for LDAP/AD users
+    if (data.user.ldap_user) {
+        const changePasswordBtn = document.getElementById('changePasswordHeaderBtn');
+        if (changePasswordBtn) {
+            changePasswordBtn.style.display = 'none';
+        }
+    }
 
     // Show admin notice if admin
     if (data.is_admin) {
@@ -10132,15 +11557,6 @@ func (wc *WebConsole) renderAppliancesPage() string {
 	return `
 <div class="card">
     <div class="card-header">
-        <h3><span class="material-icons" style="vertical-align: middle; margin-right: 8px;">inventory_2</span>Appliances</h3>
-    </div>
-    <div class="card-body">
-        <p>Exported VM appliances (.fcrack archives) ready for download or import on other systems.</p>
-    </div>
-</div>
-
-<div class="card">
-    <div class="card-header">
         <h3>Exported VMs</h3>
     </div>
     <div class="card-body">
@@ -10151,14 +11567,25 @@ func (wc *WebConsole) renderAppliancesPage() string {
                     <th style="width: 100px;">OWNER</th>
                     <th style="width: 180px;">EXPORTED DATE</th>
                     <th style="width: 100px;">SIZE</th>
+                    <th style="width: 80px; text-align: center;">ACTIONS</th>
                 </tr>
             </thead>
             <tbody id="appliancesList">
                 <tr>
-                    <td colspan="4">Loading...</td>
+                    <td colspan="5">Loading...</td>
                 </tr>
             </tbody>
         </table>
+        <!-- Delete progress bar -->
+        <div id="deleteApplianceProgress" style="display: none; margin-top: 15px; padding: 15px; background: var(--bg-secondary); border-radius: 8px;">
+            <div style="display: flex; align-items: center; margin-bottom: 10px;">
+                <span class="material-icons" style="color: var(--danger); margin-right: 8px; animation: spin 1s linear infinite;">sync</span>
+                <span id="deleteProgressText" style="color: var(--text-primary);">Deleting appliance...</span>
+            </div>
+            <div style="background: var(--bg-tertiary); border-radius: 4px; height: 8px; overflow: hidden;">
+                <div id="deleteProgressBar" style="background: var(--danger); height: 100%%; width: 0%%; transition: width 0.3s ease;"></div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -10318,6 +11745,20 @@ func (wc *WebConsole) renderAppliancesPage() string {
                             <option value="">Loading kernels...</option>
                         </select>
                     </div>
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="restoreExpandDisk" onchange="toggleExpandDiskOptions()">
+                            <span>Expand Disk After Restore</span>
+                        </label>
+                        <small style="color: var(--text-secondary); font-size: 11px;">Increase the disk size during restore operation</small>
+                    </div>
+                    <div id="restoreExpandDiskOptions" style="display: none; padding: 10px; background: var(--surface); border-radius: 4px; margin-top: 10px;">
+                        <div class="form-group">
+                            <label for="restoreExpandDiskGB">New Disk Size (GB)</label>
+                            <input type="number" id="restoreExpandDiskGB" min="1" step="1" placeholder="e.g., 10">
+                            <small style="color: var(--text-secondary); font-size: 11px;">The disk will be expanded to this size in GB. Must be larger than the current disk size.</small>
+                        </div>
+                    </div>
                 </div>
                 <!-- Progress display -->
                 <div id="restoreProgress" style="display: none;">
@@ -10330,7 +11771,7 @@ func (wc *WebConsole) renderAppliancesPage() string {
                     <div style="background: #e0e0e0; border-radius: 4px; height: 20px; overflow: hidden;">
                         <div id="restoreProgressBar" style="background: linear-gradient(90deg, #1ab394, #23c6a5); height: 100%%; width: 0%%; transition: width 0.3s ease;"></div>
                     </div>
-                    <div id="restorePercent" style="text-align: center; margin-top: 5px; font-weight: 500;">0%%</div>
+                    <div id="restorePercent" style="text-align: center; margin-top: 5px; font-weight: 500;">0</div>
                 </div>
             </div>
             <div class="modal-footer" id="restoreFooter">
@@ -10364,17 +11805,17 @@ async function loadAppliances() {
         const data = await response.json();
 
         if (!response.ok) {
-            tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><span class="material-icons">error</span><p>' + (data.error || 'Failed to load appliances') + '</p></td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><span class="material-icons">error</span><p>' + (data.error || 'Failed to load appliances') + '</p></td></tr>';
             return;
         }
 
         if (!data.appliances || data.appliances.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><span class="material-icons">inventory_2</span><p>No exported appliances</p><small>Export a VM from the Virtual Machines page to create an appliance</small></td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><span class="material-icons">inventory_2</span><p>No exported appliances</p><small>Export a VM from the Virtual Machines page to create an appliance</small></td></tr>';
             return;
         }
 
         tbody.innerHTML = data.appliances.map(app => ` + "`" + `
-            <tr>
+            <tr id="appliance-row-${app.filename.replace(/[^a-zA-Z0-9]/g, '_')}">
                 <td>
                     <a href="#" onclick="openApplianceActions('${app.filename}', '${app.vm_name}', ${app.is_owner || app.can_write}, '${encodeURIComponent(app.description || '')}'); return false;" style="text-decoration: none; color: inherit;">
                         <svg xmlns="http://www.w3.org/2000/svg" height="48px" viewBox="0 -960 960 960" width="48px" fill="#1ab394" style="vertical-align: middle; margin-right: 8px;"><path d="M480-80q-10 0-19-3t-17-9L204-252q-8-6-12-14.5T188-284v-248q0-9 4-17.5t12-14.5l240-160q8-6 17-9t19-3q10 0 19 3t17 9l240 160q8 6 12 14.5t4 17.5v248q0 9-4 17.5T756-252L516-92q-8 6-17 9t-19 3Zm0-308 168-110-168-112-168 112 168 110Zm40 203 160-106v-150l-160 106v150Zm-80 0v-150l-160-106v150l160 106Zm40-203Z"/></svg>
@@ -10388,11 +11829,95 @@ async function loadAppliances() {
                 </td>
                 <td>${app.exported_date}</td>
                 <td>${formatBytes(app.size)}</td>
+                <td style="text-align: center;">
+                    ${app.can_write ? ` + "`" + `
+                        <button class="btn btn-icon btn-danger" onclick="deleteApplianceWithProgress('${app.filename}', '${app.vm_name}'); event.stopPropagation();" title="Delete" style="padding: 6px;">
+                            <span class="material-icons" style="font-size: 18px;">delete</span>
+                        </button>
+                    ` + "`" + ` : '<span style="color: var(--text-secondary);">-</span>'}
+                </td>
             </tr>
         ` + "`" + `).join('');
     } catch (error) {
         console.error('loadAppliances error:', error);
-        tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><span class="material-icons">error</span><p>Error: ' + error.message + '</p></td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><span class="material-icons">error</span><p>Error: ' + error.message + '</p></td></tr>';
+    }
+}
+
+async function deleteApplianceWithProgress(filename, vmName) {
+    if (!await showConfirm('Are you sure you want to delete the appliance "' + vmName + '"?\n\nThis action cannot be undone.')) {
+        return;
+    }
+
+    const progressContainer = document.getElementById('deleteApplianceProgress');
+    const progressBar = document.getElementById('deleteProgressBar');
+    const progressText = document.getElementById('deleteProgressText');
+    const rowId = 'appliance-row-' + filename.replace(/[^a-zA-Z0-9]/g, '_');
+    const row = document.getElementById(rowId);
+
+    // Show progress
+    progressContainer.style.display = 'block';
+    progressText.textContent = 'Deleting "' + vmName + '"...';
+    progressBar.style.width = '30%';
+
+    // Fade out the row
+    if (row) {
+        row.style.opacity = '0.5';
+        row.style.pointerEvents = 'none';
+    }
+
+    try {
+        progressBar.style.width = '60%';
+
+        const response = await fetch('/api/appliances/' + encodeURIComponent(filename), {
+            method: 'DELETE',
+            credentials: 'include'
+        });
+
+        progressBar.style.width = '90%';
+
+        if (!response.ok) {
+            const data = await response.json();
+            throw new Error(data.error || 'Failed to delete appliance');
+        }
+
+        progressBar.style.width = '100%';
+        progressText.textContent = 'Deleted successfully!';
+        progressBar.style.background = 'var(--success)';
+
+        // Remove the row with animation
+        if (row) {
+            row.style.transition = 'all 0.3s ease';
+            row.style.transform = 'translateX(-100%)';
+            row.style.opacity = '0';
+            setTimeout(() => row.remove(), 300);
+        }
+
+        // Hide progress after a short delay and reload
+        setTimeout(() => {
+            progressContainer.style.display = 'none';
+            progressBar.style.width = '0%';
+            progressBar.style.background = 'var(--danger)';
+            loadAppliances();
+        }, 1500);
+
+    } catch (error) {
+        console.error('Delete appliance error:', error);
+        progressText.textContent = 'Error: ' + error.message;
+        progressBar.style.width = '100%';
+        progressBar.style.background = 'var(--danger)';
+
+        // Restore the row
+        if (row) {
+            row.style.opacity = '1';
+            row.style.pointerEvents = 'auto';
+        }
+
+        // Hide progress after showing error
+        setTimeout(() => {
+            progressContainer.style.display = 'none';
+            progressBar.style.width = '0%';
+        }, 3000);
     }
 }
 
@@ -10544,6 +12069,16 @@ function closeRestoreModal() {
     document.getElementById('restoreFooter').style.display = 'flex';
     document.getElementById('restoreSubmitBtn').disabled = false;
     document.getElementById('restoreSubmitBtn').innerHTML = '<span class="material-icons">restore</span> Restore';
+    // Reset expand disk fields
+    document.getElementById('restoreExpandDisk').checked = false;
+    document.getElementById('restoreExpandDiskOptions').style.display = 'none';
+    document.getElementById('restoreExpandDiskGB').value = '';
+}
+
+function toggleExpandDiskOptions() {
+    const checkbox = document.getElementById('restoreExpandDisk');
+    const options = document.getElementById('restoreExpandDiskOptions');
+    options.style.display = checkbox.checked ? 'block' : 'none';
 }
 
 async function submitRestore(event) {
@@ -10552,9 +12087,16 @@ async function submitRestore(event) {
     const filename = document.getElementById('restoreFilename').value;
     const name = document.getElementById('restoreVmName').value;
     const kernelId = document.getElementById('restoreKernelSelect').value;
+    const expandDisk = document.getElementById('restoreExpandDisk').checked;
+    const expandDiskGB = expandDisk ? parseInt(document.getElementById('restoreExpandDiskGB').value) || 0 : 0;
 
     if (!name || !kernelId) {
         alert('Please fill in all fields');
+        return;
+    }
+
+    if (expandDisk && expandDiskGB <= 0) {
+        alert('Please enter a valid disk size in GB');
         return;
     }
 
@@ -10563,11 +12105,16 @@ async function submitRestore(event) {
     submitBtn.innerHTML = '<span class="material-icons">hourglass_empty</span> Starting...';
 
     try {
+        const requestBody = { name: name, kernel_id: kernelId };
+        if (expandDiskGB > 0) {
+            requestBody.expand_disk_gb = expandDiskGB;
+        }
+
         const response = await fetch('/api/appliances/restore/' + encodeURIComponent(filename), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             credentials: 'include',
-            body: JSON.stringify({ name: name, kernel_id: kernelId })
+            body: JSON.stringify(requestBody)
         });
 
         const data = await response.json();
@@ -10609,7 +12156,7 @@ function pollRestoreProgress(progressKey, vmName) {
             // Update progress UI
             document.getElementById('restoreStage').textContent = progress.stage || 'Processing...';
             document.getElementById('restoreProgressBar').style.width = (progress.percent || 0) + '%%';
-            document.getElementById('restorePercent').textContent = (progress.percent || 0) + '%%';
+            document.getElementById('restorePercent').innerHTML = (progress.percent || 0) + percentIcon(14);
 
             if (progress.status === 'completed') {
                 clearInterval(restoreProgressInterval);
@@ -10639,7 +12186,7 @@ function pollRestoreProgress(progressKey, vmName) {
 }
 
 async function deleteAppliance(filename) {
-    if (!confirm('Are you sure you want to delete this appliance?\n\n' + filename)) {
+    if (!await showConfirm('Are you sure you want to delete this appliance?\n\n' + filename)) {
         return;
     }
 
@@ -10779,7 +12326,7 @@ async function addPrivilege() {
 async function removePrivilege(type, id) {
     const filename = document.getElementById('privFilename').value;
 
-    if (!confirm('Are you sure you want to remove this privilege?')) {
+    if (!await showConfirm('Are you sure you want to remove this privilege?')) {
         return;
     }
 

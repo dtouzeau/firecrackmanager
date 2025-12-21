@@ -139,6 +139,7 @@ func (s *Server) handleRegistryConvert(w http.ResponseWriter, r *http.Request) {
 		ImageRef       string `json:"image_ref"`
 		Name           string `json:"name"`
 		InjectMinInit  bool   `json:"inject_min_init"`
+		InstallSSH     bool   `json:"install_ssh"`
 		DataDiskSizeGB int64  `json:"data_disk_size_gib"`
 		CreateVM       bool   `json:"create_vm"`
 		VMVCPU         int    `json:"vm_vcpu"`
@@ -191,7 +192,7 @@ func (s *Server) handleRegistryConvert(w http.ResponseWriter, r *http.Request) {
 	conversionJobsMu.Unlock()
 
 	// Start conversion in background
-	go s.runConversion(job, req.Name, req.InjectMinInit, req.DataDiskSizeGB, vmConfig)
+	go s.runConversion(job, req.Name, req.InjectMinInit, req.InstallSSH, req.DataDiskSizeGB, vmConfig)
 
 	s.jsonResponse(w, map[string]interface{}{
 		"job_id":  jobID,
@@ -201,7 +202,7 @@ func (s *Server) handleRegistryConvert(w http.ResponseWriter, r *http.Request) {
 }
 
 // runConversion executes the image conversion in background
-func (s *Server) runConversion(job *ConversionJob, name string, injectMinInit bool, dataDiskSizeGB int64, vmConfig *VMConfig) {
+func (s *Server) runConversion(job *ConversionJob, name string, injectMinInit bool, installSSH bool, dataDiskSizeGB int64, vmConfig *VMConfig) {
 	updateJob := func(status string, progress int, message string) {
 		conversionJobsMu.Lock()
 		job.Status = status
@@ -237,6 +238,7 @@ func (s *Server) runConversion(job *ConversionJob, name string, injectMinInit bo
 		RegistryToFC.ImageToFCOptions{
 			OutputImage:   outputPath,
 			InjectMinInit: injectMinInit,
+			InstallSSH:    installSSH,
 		},
 		progressCb,
 	)
@@ -614,6 +616,7 @@ func (s *Server) handleComposeConvert(w http.ResponseWriter, r *http.Request) {
 		OutputName    string            `json:"output_name"`
 		UseDocker     bool              `json:"use_docker"`
 		InjectMinInit bool              `json:"inject_min_init"`
+		InstallSSH    bool              `json:"install_ssh"`
 		Environment   map[string]string `json:"environment"`
 	}
 
@@ -645,7 +648,7 @@ func (s *Server) handleComposeConvert(w http.ResponseWriter, r *http.Request) {
 	conversionJobsMu.Unlock()
 
 	// Start conversion in background
-	go s.runComposeConversion(job, req.ComposePath, req.ServiceName, req.OutputName, req.UseDocker, req.InjectMinInit, req.Environment)
+	go s.runComposeConversion(job, req.ComposePath, req.ServiceName, req.OutputName, req.UseDocker, req.InjectMinInit, req.InstallSSH, req.Environment)
 
 	s.jsonResponse(w, map[string]interface{}{
 		"job_id":  jobID,
@@ -655,7 +658,7 @@ func (s *Server) handleComposeConvert(w http.ResponseWriter, r *http.Request) {
 }
 
 // runComposeConversion executes compose-based conversion in background
-func (s *Server) runComposeConversion(job *ConversionJob, composePath, serviceName, outputName string, useDocker, injectMinInit bool, environment map[string]string) {
+func (s *Server) runComposeConversion(job *ConversionJob, composePath, serviceName, outputName string, useDocker, injectMinInit, installSSH bool, environment map[string]string) {
 	updateJob := func(status string, progress int, message string) {
 		conversionJobsMu.Lock()
 		job.Status = status
@@ -692,6 +695,7 @@ func (s *Server) runComposeConversion(job *ConversionJob, composePath, serviceNa
 			ServiceName:   serviceName,
 			OutputImage:   outputPath,
 			InjectMinInit: injectMinInit,
+			InstallSSH:    installSSH,
 			UseDocker:     useDocker,
 			Environment:   environment,
 		},

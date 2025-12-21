@@ -65,6 +65,9 @@ type Store struct {
 	downloads   map[string]*DownloadProgress
 
 	stopChan chan struct{}
+
+	// Callback invoked when a download completes successfully
+	onDownloadComplete func()
 }
 
 // New creates a new Store instance
@@ -76,6 +79,11 @@ func New(dataDir string, logger func(format string, args ...interface{})) *Store
 		stopChan:  make(chan struct{}),
 	}
 	return s
+}
+
+// SetOnDownloadComplete sets the callback to invoke when a download completes successfully
+func (s *Store) SetOnDownloadComplete(cb func()) {
+	s.onDownloadComplete = cb
 }
 
 // Start begins the background catalog refresh
@@ -371,6 +379,11 @@ func (s *Store) downloadAppliance(key string, app *Appliance) {
 	})
 
 	s.logger("Store download completed: %s", outputFile)
+
+	// Trigger callback to refresh appliances index
+	if s.onDownloadComplete != nil {
+		s.onDownloadComplete()
+	}
 }
 
 // downloadPart downloads a single part

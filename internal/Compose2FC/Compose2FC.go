@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -58,6 +59,8 @@ type Options struct {
 	Label string
 	// If true, install a tiny /sbin/init that execs /bin/sh (skipped if /sbin/init already exists)
 	InjectMinInit bool
+	// If true, install OpenSSH server and haveged for entropy
+	InstallSSH bool
 	// Temporary directory to store the exported tar; if empty uses os.MkdirTemp
 	TempDir string
 	// If false (default), pull directly from registry (no Docker daemon).
@@ -231,11 +234,31 @@ func BuildExt4FromComposeWithProgress(ctx context.Context, opts Options, progres
 	}
 
 	if opts.InjectMinInit {
-		reportProgress(90, "Installing minimal init")
+		reportProgress(85, "Installing minimal init")
 		if err := installMinInit(mnt, opts.Environment, imgConfig); err != nil {
 			return nil, err
 		}
 	}
+
+	// Install SSH and entropy tools if requested
+	if opts.InstallSSH {
+		reportProgress(90, "Installing SSH and entropy tools")
+		if err := installSSHAndEntropy(mnt, reportProgress); err != nil {
+			// Log warning but don't fail the conversion
+			reportProgress(92, "Warning: SSH installation incomplete: "+err.Error())
+		}
+	}
+
+	// Install container entrypoint as systemd service
+	if imgConfig != nil {
+		reportProgress(94, "Creating container entrypoint service")
+		if err := installContainerEntrypoint(mnt, imgConfig, opts.Environment, reportProgress); err != nil {
+			reportProgress(96, "Warning: Entrypoint service creation incomplete: "+err.Error())
+		}
+	}
+
+	// Configure DNS fallback (add public DNS servers)
+	configureDNSFallback(mnt)
 
 	_ = runCmd(futils.FindProgram("sync"))
 
@@ -666,20 +689,30 @@ mount -t tmpfs tmpfs /tmp -o mode=1777 2>/dev/null || true
 mkdir -p /run 2>/dev/null || true
 mount -t tmpfs tmpfs /run -o mode=755 2>/dev/null || true
 
+# Setup /var/log for application logs
+mkdir -p /var/log 2>/dev/null || true
+
 # Set hostname
 hostname firecracker 2>/dev/null || true
 
-# Setup loopback interface
-ip link set lo up 2>/dev/null || true
-
-# Setup networking if eth0 exists
-if [ -e /sys/class/net/eth0 ]; then
-    ip link set eth0 up 2>/dev/null || true
-    # Try DHCP if udhcpc is available and no IP is configured
-    if ! ip addr show eth0 | grep -q 'inet '; then
-        if command -v udhcpc >/dev/null 2>&1; then
-            udhcpc -i eth0 -q -f -n 2>/dev/null &
+# Setup loopback interface (only if ip command exists)
+if command -v ip >/dev/null 2>&1; then
+    ip link set lo up 2>/dev/null || true
+    # Setup networking if eth0 exists
+    if [ -e /sys/class/net/eth0 ]; then
+        ip link set eth0 up 2>/dev/null || true
+        # Try DHCP if udhcpc is available and no IP is configured
+        if ! ip addr show eth0 | grep -q 'inet '; then
+            if command -v udhcpc >/dev/null 2>&1; then
+                udhcpc -i eth0 -q -f -n 2>/dev/null &
+            fi
         fi
+    fi
+elif command -v ifconfig >/dev/null 2>&1; then
+    # Fallback to ifconfig if available
+    ifconfig lo up 2>/dev/null || true
+    if [ -e /sys/class/net/eth0 ]; then
+        ifconfig eth0 up 2>/dev/null || true
     fi
 fi
 
@@ -707,8 +740,36 @@ export HOME="${HOME:-/root}"
 %s
 echo "[init] Environment configured"
 %s
-echo "[init] Starting application: %s"
-%sexec %s
+echo "[init] Starting application in background: %s"
+
+# Run application in background and log output
+# Use subshell to prevent exec in userSwitch from replacing init
+( %s%s ) > /var/log/app.log 2>&1 &
+APP_PID=$!
+echo "[init] Application started with PID: $APP_PID"
+
+# Give the app a moment to start
+sleep 1
+
+# Check if app is still running
+if kill -0 $APP_PID 2>/dev/null; then
+    echo "[init] Application is running"
+else
+    echo "[init] Warning: Application may have exited, check /var/log/app.log"
+fi
+
+echo "[init] Starting shell on console..."
+echo "=== Application running in background (PID: $APP_PID) ==="
+echo "=== Logs: /var/log/app.log ==="
+echo ""
+
+# Ensure console is properly set up
+exec 0</dev/console 2>/dev/null || true
+exec 1>/dev/console 2>/dev/null || true
+exec 2>/dev/console 2>/dev/null || true
+
+# Start interactive shell with proper job control
+exec setsid /bin/sh -i </dev/console >/dev/console 2>&1 || exec /bin/sh -i
 `, envExports.String(), cdLine, cmdLine, userSwitch, cmdLine)
 	return os.WriteFile(initPath, []byte(script), 0o755)
 }
@@ -1080,4 +1141,300 @@ func listComposeServices(ctx context.Context, composePath string) ([]string, err
 	}
 	sort.Strings(names)
 	return names, nil
+}
+
+// installSSHAndEntropy installs OpenSSH server, haveged, and pre-seeds random for a mounted rootfs
+func installSSHAndEntropy(mountPoint string, reportProgress func(int, string)) error {
+	// Detect distribution and package manager
+	osRelease := ""
+	if data, err := os.ReadFile(filepath.Join(mountPoint, "etc/os-release")); err == nil {
+		osRelease = string(data)
+	}
+
+	// Bind mount required filesystems for chroot
+	for _, mount := range []struct {
+		src, dst, fstype, opts string
+	}{
+		{"/proc", filepath.Join(mountPoint, "proc"), "proc", ""},
+		{"/sys", filepath.Join(mountPoint, "sys"), "sysfs", ""},
+		{"/dev", filepath.Join(mountPoint, "dev"), "", "bind"},
+	} {
+		os.MkdirAll(mount.dst, 0755)
+		var mountCmd *exec.Cmd
+		if mount.opts == "bind" {
+			mountCmd = exec.Command("mount", "--bind", mount.src, mount.dst)
+		} else {
+			mountCmd = exec.Command("mount", "-t", mount.fstype, mount.fstype, mount.dst)
+		}
+		mountCmd.Run()
+		defer exec.Command("umount", "-l", mount.dst).Run()
+	}
+
+	// Copy resolv.conf for network access
+	if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+		os.WriteFile(filepath.Join(mountPoint, "etc/resolv.conf"), data, 0644)
+	}
+
+	var pkgManager string
+	var installSSHCmd, installHavegedCmd *exec.Cmd
+
+	// Determine package manager and install commands
+	if strings.Contains(osRelease, "Debian") || strings.Contains(osRelease, "Ubuntu") ||
+		futils.FileExists(filepath.Join(mountPoint, "usr/bin/apt-get")) {
+		pkgManager = "apt"
+		reportProgress(91, "Detected Debian/Ubuntu, updating package lists...")
+
+		updateCmd := exec.Command("chroot", mountPoint, "apt-get", "update", "-qq")
+		updateCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		updateCmd.Run()
+
+		installSSHCmd = exec.Command("chroot", mountPoint, "apt-get", "install", "-y", "-qq", "openssh-server")
+		installSSHCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+
+		installHavegedCmd = exec.Command("chroot", mountPoint, "apt-get", "install", "-y", "-qq", "haveged")
+		installHavegedCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+
+	} else if strings.Contains(osRelease, "Alpine") ||
+		futils.FileExists(filepath.Join(mountPoint, "sbin/apk")) {
+		pkgManager = "apk"
+		reportProgress(91, "Detected Alpine, installing packages...")
+
+		installSSHCmd = exec.Command("chroot", mountPoint, "apk", "add", "--no-cache", "openssh-server")
+		installHavegedCmd = exec.Command("chroot", mountPoint, "apk", "add", "--no-cache", "haveged")
+
+	} else if strings.Contains(osRelease, "CentOS") || strings.Contains(osRelease, "Red Hat") ||
+		strings.Contains(osRelease, "Fedora") ||
+		futils.FileExists(filepath.Join(mountPoint, "usr/bin/dnf")) {
+		pkgManager = "dnf"
+		reportProgress(91, "Detected RHEL/CentOS/Fedora, installing packages...")
+
+		installSSHCmd = exec.Command("chroot", mountPoint, "dnf", "install", "-y", "openssh-server")
+		installHavegedCmd = exec.Command("chroot", mountPoint, "dnf", "install", "-y", "haveged")
+
+	} else if futils.FileExists(filepath.Join(mountPoint, "usr/bin/yum")) {
+		pkgManager = "yum"
+		reportProgress(91, "Detected RHEL/CentOS, installing packages...")
+
+		installSSHCmd = exec.Command("chroot", mountPoint, "yum", "install", "-y", "openssh-server")
+		installHavegedCmd = exec.Command("chroot", mountPoint, "yum", "install", "-y", "haveged")
+
+	} else {
+		return fmt.Errorf("unsupported distribution: could not detect package manager")
+	}
+
+	// Install OpenSSH server
+	reportProgress(92, "Installing OpenSSH server...")
+	if installSSHCmd != nil {
+		if output, err := installSSHCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to install openssh-server: %v - %s", err, string(output))
+		}
+	}
+
+	// Install haveged for entropy
+	reportProgress(93, "Installing haveged for entropy...")
+	if installHavegedCmd != nil {
+		installHavegedCmd.Run()
+	}
+
+	// Pre-seed the random seed file
+	randomSeedDir := filepath.Join(mountPoint, "var/lib/systemd")
+	os.MkdirAll(randomSeedDir, 0755)
+	randomSeedFile := filepath.Join(randomSeedDir, "random-seed")
+	randomData := make([]byte, 512)
+	if _, err := rand.Read(randomData); err == nil {
+		os.WriteFile(randomSeedFile, randomData, 0600)
+	}
+
+	// Enable services based on init system
+	if futils.FileExists(filepath.Join(mountPoint, "usr/lib/systemd/systemd")) ||
+		futils.FileExists(filepath.Join(mountPoint, "lib/systemd/systemd")) {
+		reportProgress(94, "Enabling SSH and haveged in systemd...")
+		exec.Command("chroot", mountPoint, "systemctl", "enable", "ssh").Run()
+		exec.Command("chroot", mountPoint, "systemctl", "enable", "sshd").Run()
+		exec.Command("chroot", mountPoint, "systemctl", "enable", "haveged").Run()
+	}
+
+	// For Alpine, enable OpenRC services
+	if pkgManager == "apk" {
+		reportProgress(94, "Enabling SSH and haveged in OpenRC...")
+		exec.Command("chroot", mountPoint, "rc-update", "add", "sshd", "default").Run()
+		exec.Command("chroot", mountPoint, "rc-update", "add", "haveged", "default").Run()
+	}
+
+	// Generate host keys if they don't exist
+	sshKeyDir := filepath.Join(mountPoint, "etc/ssh")
+	if _, err := os.Stat(filepath.Join(sshKeyDir, "ssh_host_rsa_key")); os.IsNotExist(err) {
+		reportProgress(95, "Generating SSH host keys...")
+		exec.Command("chroot", mountPoint, "ssh-keygen", "-A").Run()
+	}
+
+	// Configure sshd_config
+	sshdConfig := filepath.Join(sshKeyDir, "sshd_config")
+	if data, err := os.ReadFile(sshdConfig); err == nil {
+		config := string(data)
+		modified := false
+
+		if strings.Contains(config, "#PasswordAuthentication") {
+			config = strings.ReplaceAll(config, "#PasswordAuthentication no", "PasswordAuthentication yes")
+			config = strings.ReplaceAll(config, "#PasswordAuthentication yes", "PasswordAuthentication yes")
+			modified = true
+		}
+
+		if strings.Contains(config, "#PermitRootLogin") {
+			config = strings.ReplaceAll(config, "#PermitRootLogin prohibit-password", "PermitRootLogin yes")
+			config = strings.ReplaceAll(config, "#PermitRootLogin yes", "PermitRootLogin yes")
+			modified = true
+		}
+
+		if modified {
+			os.WriteFile(sshdConfig, []byte(config), 0644)
+		}
+	}
+
+	reportProgress(96, "SSH and entropy tools installed successfully")
+	return nil
+}
+
+// installContainerEntrypoint creates a systemd service to run the container's entrypoint/cmd on boot
+func installContainerEntrypoint(root string, config *ImageConfig, extraEnv map[string]string, reportProgress func(int, string)) error {
+	if config == nil {
+		return nil
+	}
+
+	// Combine entrypoint and cmd to form the full command
+	var cmdParts []string
+	cmdParts = append(cmdParts, config.Entrypoint...)
+	cmdParts = append(cmdParts, config.Cmd...)
+
+	if len(cmdParts) == 0 {
+		return nil // No entrypoint or cmd defined
+	}
+
+	// Check if systemd exists
+	systemdDir := filepath.Join(root, "etc/systemd/system")
+	if !futils.FileExists(filepath.Join(root, "usr/lib/systemd/systemd")) &&
+		!futils.FileExists(filepath.Join(root, "lib/systemd/systemd")) {
+		// No systemd, skip
+		return nil
+	}
+
+	if err := os.MkdirAll(systemdDir, 0755); err != nil {
+		return err
+	}
+
+	// Build environment variables from image config
+	var envLines []string
+	for _, env := range config.Env {
+		envLines = append(envLines, fmt.Sprintf("Environment=%s", env))
+	}
+	// Add extra environment variables
+	for k, v := range extraEnv {
+		envLines = append(envLines, fmt.Sprintf("Environment=%s=%s", k, v))
+	}
+	envSection := strings.Join(envLines, "\n")
+
+	// Determine working directory
+	workDir := config.WorkingDir
+	if workDir == "" {
+		workDir = "/"
+	}
+
+	// Determine user
+	user := config.User
+	if user == "" {
+		user = "root"
+	}
+
+	// Build the ExecStart command - create a wrapper script
+	wrapperScript := filepath.Join(root, "usr/local/bin/container-entrypoint.sh")
+	if err := os.MkdirAll(filepath.Dir(wrapperScript), 0755); err != nil {
+		return err
+	}
+
+	// Create wrapper script that handles the command properly
+	scriptContent := "#!/bin/sh\n"
+	scriptContent += fmt.Sprintf("cd %s\n", workDir)
+	scriptContent += "exec " + shellQuoteCommand(cmdParts) + "\n"
+
+	if err := os.WriteFile(wrapperScript, []byte(scriptContent), 0755); err != nil {
+		return err
+	}
+
+	// Create systemd service
+	serviceName := "container-app.service"
+	servicePath := filepath.Join(systemdDir, serviceName)
+
+	serviceContent := fmt.Sprintf(`[Unit]
+Description=Container Application
+After=network.target
+
+[Service]
+Type=simple
+User=%s
+WorkingDirectory=%s
+%s
+ExecStart=/usr/local/bin/container-entrypoint.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, user, workDir, envSection)
+
+	if err := os.WriteFile(servicePath, []byte(serviceContent), 0644); err != nil {
+		return err
+	}
+
+	// Enable the service by creating symlink
+	wantsDir := filepath.Join(systemdDir, "multi-user.target.wants")
+	if err := os.MkdirAll(wantsDir, 0755); err != nil {
+		return err
+	}
+
+	symlinkPath := filepath.Join(wantsDir, serviceName)
+	os.Remove(symlinkPath) // Remove existing symlink if present
+	if err := os.Symlink(servicePath, symlinkPath); err != nil {
+		// Try relative symlink
+		os.Symlink("../"+serviceName, symlinkPath)
+	}
+
+	reportProgress(95, "Container entrypoint service created and enabled")
+	return nil
+}
+
+// shellQuoteCommand properly quotes a command for shell execution
+func shellQuoteCommand(parts []string) string {
+	var quoted []string
+	for _, p := range parts {
+		if strings.ContainsAny(p, " \t\n\"'\\$`!") {
+			p = "\"" + strings.ReplaceAll(strings.ReplaceAll(p, "\\", "\\\\"), "\"", "\\\"") + "\""
+		}
+		quoted = append(quoted, p)
+	}
+	return strings.Join(quoted, " ")
+}
+
+// configureDNSFallback adds public DNS servers to resolv.conf as fallback
+func configureDNSFallback(root string) {
+	resolvConf := filepath.Join(root, "etc/resolv.conf")
+
+	existingContent := ""
+	if data, err := os.ReadFile(resolvConf); err == nil {
+		existingContent = string(data)
+	}
+
+	// Check if public DNS already configured
+	if strings.Contains(existingContent, "8.8.8.8") || strings.Contains(existingContent, "1.1.1.1") {
+		return
+	}
+
+	os.MkdirAll(filepath.Join(root, "etc"), 0755)
+
+	fallbackDNS := "\n# Fallback DNS servers added by FireCrackManager\nnameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\n"
+
+	if existingContent != "" {
+		os.WriteFile(resolvConf, []byte(existingContent+fallbackDNS), 0644)
+	} else {
+		os.WriteFile(resolvConf, []byte("# DNS configuration\n"+fallbackDNS), 0644)
+	}
 }

@@ -23,16 +23,18 @@ const (
 
 // ScanResult holds the result of scanning a rootfs
 type ScanResult struct {
-	ID          string    `json:"id"`
-	DiskType    DiskType  `json:"disk_type"`
-	HasInit     bool      `json:"has_init"`
-	HasBinaries bool      `json:"has_binaries"`
-	HasEtc      bool      `json:"has_etc"`
-	HasLib      bool      `json:"has_lib"`
-	InitSystem  string    `json:"init_system,omitempty"` // systemd, openrc, sysvinit, busybox, minimal
-	OSRelease   string    `json:"os_release,omitempty"`
-	ScannedAt   time.Time `json:"scanned_at"`
-	Error       string    `json:"error,omitempty"`
+	ID           string    `json:"id"`
+	DiskType     DiskType  `json:"disk_type"`
+	HasInit      bool      `json:"has_init"`
+	HasBinaries  bool      `json:"has_binaries"`
+	HasEtc       bool      `json:"has_etc"`
+	HasLib       bool      `json:"has_lib"`
+	InitSystem   string    `json:"init_system,omitempty"` // systemd, openrc, sysvinit, busybox, minimal
+	OSRelease    string    `json:"os_release,omitempty"`
+	SSHInstalled bool      `json:"ssh_installed"`
+	SSHVersion   string    `json:"ssh_version,omitempty"`
+	ScannedAt    time.Time `json:"scanned_at"`
+	Error        string    `json:"error,omitempty"`
 }
 
 // Scanner handles background scanning of root filesystems
@@ -129,11 +131,17 @@ func (s *Scanner) scanAll() {
 			fs.DiskType = string(result.DiskType)
 			fs.InitSystem = result.InitSystem
 			fs.OSRelease = result.OSRelease
+			fs.SSHInstalled = result.SSHInstalled
+			fs.SSHVersion = result.SSHVersion
 			fs.ScannedAt = result.ScannedAt
 			if err := s.db.UpdateRootFS(fs); err != nil {
 				s.logger("Failed to update rootfs %s: %v", fs.ID, err)
 			} else {
-				s.logger("Scanned rootfs %s: type=%s, init=%s", fs.Name, result.DiskType, result.InitSystem)
+				sshInfo := "no"
+				if result.SSHInstalled {
+					sshInfo = result.SSHVersion
+				}
+				s.logger("Scanned rootfs %s: type=%s, init=%s, ssh=%s", fs.Name, result.DiskType, result.InitSystem, sshInfo)
 			}
 		} else {
 			s.logger("Failed to scan rootfs %s: %v", fs.Name, result.Error)
@@ -185,6 +193,9 @@ func (s *Scanner) ScanRootFS(fs *database.RootFS) *ScanResult {
 	result.HasLib = s.checkLib(mountPoint)
 	result.InitSystem = s.detectInitSystem(mountPoint)
 	result.OSRelease = s.readOSRelease(mountPoint)
+
+	// Detect SSH server
+	result.SSHInstalled, result.SSHVersion = s.detectSSH(mountPoint)
 
 	// Determine disk type based on findings
 	if result.HasInit || (result.HasBinaries && result.HasEtc && result.HasLib) {
@@ -380,6 +391,97 @@ func (s *Scanner) readOSRelease(mountPoint string) string {
 	return ""
 }
 
+// detectSSH checks for OpenSSH server installation and returns version if available
+func (s *Scanner) detectSSH(mountPoint string) (installed bool, version string) {
+	// Check for sshd binary in common locations
+	sshdPaths := []string{
+		"usr/sbin/sshd",
+		"sbin/sshd",
+		"usr/bin/sshd",
+	}
+
+	var sshdPath string
+	for _, p := range sshdPaths {
+		fullPath := filepath.Join(mountPoint, p)
+		if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+			sshdPath = fullPath
+			installed = true
+			break
+		}
+	}
+
+	if !installed {
+		// Also check for dropbear (lightweight SSH server)
+		dropbearPaths := []string{
+			"usr/sbin/dropbear",
+			"sbin/dropbear",
+			"usr/bin/dropbear",
+		}
+		for _, p := range dropbearPaths {
+			fullPath := filepath.Join(mountPoint, p)
+			if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+				installed = true
+				version = "dropbear"
+				return
+			}
+		}
+		return false, ""
+	}
+
+	// Try to get OpenSSH version by running sshd -V (requires static binary or compatible libs)
+	// This may not work in all cases, so we also try to parse package info
+	cmd := exec.Command(sshdPath, "-V")
+	output, err := cmd.CombinedOutput()
+	if err == nil || len(output) > 0 {
+		// OpenSSH outputs version to stderr with -V
+		outputStr := string(output)
+		if strings.Contains(outputStr, "OpenSSH") {
+			// Parse version like "OpenSSH_8.9p1"
+			parts := strings.Fields(outputStr)
+			for _, part := range parts {
+				if strings.HasPrefix(part, "OpenSSH_") {
+					version = strings.TrimSuffix(part, ",")
+					return
+				}
+			}
+		}
+	}
+
+	// Try to get version from dpkg status file (Debian/Ubuntu)
+	dpkgStatus := filepath.Join(mountPoint, "var/lib/dpkg/status")
+	if data, err := os.ReadFile(dpkgStatus); err == nil {
+		// Look for openssh-server package
+		packages := strings.Split(string(data), "\n\n")
+		for _, pkg := range packages {
+			if strings.Contains(pkg, "Package: openssh-server") {
+				lines := strings.Split(pkg, "\n")
+				for _, line := range lines {
+					if strings.HasPrefix(line, "Version: ") {
+						version = "OpenSSH " + strings.TrimPrefix(line, "Version: ")
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// Try rpm database for RHEL/CentOS/Fedora
+	rpmDb := filepath.Join(mountPoint, "var/lib/rpm")
+	if info, err := os.Stat(rpmDb); err == nil && info.IsDir() {
+		// RPM database exists, try to query it
+		cmd := exec.Command("chroot", mountPoint, "rpm", "-q", "openssh-server", "--queryformat", "%{VERSION}")
+		output, err := cmd.CombinedOutput()
+		if err == nil && len(output) > 0 {
+			version = "OpenSSH " + strings.TrimSpace(string(output))
+			return
+		}
+	}
+
+	// If we found sshd but couldn't get version
+	version = "OpenSSH (version unknown)"
+	return
+}
+
 // ScanSingle scans a single rootfs by ID (for on-demand scanning)
 func (s *Scanner) ScanSingle(id string) (*ScanResult, error) {
 	fs, err := s.db.GetRootFS(id)
@@ -395,6 +497,8 @@ func (s *Scanner) ScanSingle(id string) (*ScanResult, error) {
 		fs.DiskType = string(result.DiskType)
 		fs.InitSystem = result.InitSystem
 		fs.OSRelease = result.OSRelease
+		fs.SSHInstalled = result.SSHInstalled
+		fs.SSHVersion = result.SSHVersion
 		fs.ScannedAt = result.ScannedAt
 		if err := s.db.UpdateRootFS(fs); err != nil {
 			return result, err

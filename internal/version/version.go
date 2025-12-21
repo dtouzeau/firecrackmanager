@@ -2,7 +2,7 @@ package version
 
 const (
 	// Version is the current version of FireCrackManager
-	Version = "1.0.0"
+	Version = "1.0.1"
 
 	// BuildDate can be set at build time using -ldflags
 	// go build -ldflags="-X firecrackmanager/internal/version.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

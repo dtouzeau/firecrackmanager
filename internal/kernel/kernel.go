@@ -550,3 +550,36 @@ func (m *Manager) ResizeRootFS(name string, newSizeMB int64) error {
 
 	return nil
 }
+
+// CheckVirtioSupport checks if a kernel binary has virtio drivers built-in
+// by searching for virtio-related strings in the kernel binary.
+// Returns true if virtio_blk support is detected, false otherwise.
+// Note: Firecracker uses virtio-mmio transport, not virtio-pci.
+func CheckVirtioSupport(kernelPath string) bool {
+	// Read the kernel binary
+	data, err := os.ReadFile(kernelPath)
+	if err != nil {
+		return false // Assume no support if we can't read
+	}
+
+	// Convert to string for searching
+	content := string(data)
+
+	// Check for virtio_blk driver
+	hasVirtioBlk := strings.Contains(content, "virtio_blk") ||
+		strings.Contains(content, "virtio-blk") ||
+		strings.Contains(content, "VIRTIO_BLK")
+
+	// Firecracker uses virtio-mmio transport (not virtio-pci)
+	hasVirtioMmio := strings.Contains(content, "virtio_mmio") ||
+		strings.Contains(content, "virtio-mmio") ||
+		strings.Contains(content, "VIRTIO_MMIO")
+
+	// Also check for virtio ring (core virtio support)
+	hasVirtioRing := strings.Contains(content, "virtio_ring") ||
+		strings.Contains(content, "virtio-ring")
+
+	// Kernel needs virtio_blk and virtio_mmio (Firecracker's transport) for proper support
+	// virtio_ring is also needed for core virtio functionality
+	return hasVirtioBlk && hasVirtioMmio && hasVirtioRing
+}
