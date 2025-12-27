@@ -961,6 +961,21 @@ func (d *DB) CreateKernelImage(img *KernelImage) error {
 	return err
 }
 
+func (d *DB) UpdateKernelImage(img *KernelImage) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if img.IsDefault {
+		d.db.Exec("UPDATE kernel_images SET is_default = 0")
+	}
+
+	_, err := d.db.Exec(`
+		UPDATE kernel_images SET name = ?, version = ?, architecture = ?, path = ?, size = ?, checksum = ?, is_default = ?, virtio_support = ?
+		WHERE id = ?`,
+		img.Name, img.Version, img.Architecture, img.Path, img.Size, img.Checksum, img.IsDefault, img.VirtioSupport, img.ID)
+	return err
+}
+
 func (d *DB) GetKernelImage(id string) (*KernelImage, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

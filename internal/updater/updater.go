@@ -57,21 +57,30 @@ func (u *Updater) Start() error {
 
 	// Schedule daily check at 3:00 AM
 	_, err := u.cron.AddFunc("0 3 * * *", func() {
-		u.logger("Running scheduled Firecracker version check")
+		u.logger("Running scheduled Firecracker version check (daily)")
 		u.CheckForUpdates()
 	})
 	if err != nil {
-		return fmt.Errorf("failed to schedule update check: %w", err)
+		return fmt.Errorf("failed to schedule daily update check: %w", err)
+	}
+
+	// Schedule hourly cache refresh
+	_, err = u.cron.AddFunc("0 * * * *", func() {
+		u.logger("Running hourly Firecracker version check")
+		u.CheckForUpdates()
+	})
+	if err != nil {
+		return fmt.Errorf("failed to schedule hourly update check: %w", err)
 	}
 
 	// Start the cron scheduler
 	u.cron.Start()
-	u.logger("Update checker started (scheduled daily at 3:00 AM)")
+	u.logger("Update checker started (hourly refresh, full check daily at 3:00 AM)")
 
 	// Run initial check in background if cache is old or missing
 	go func() {
 		u.mu.RLock()
-		needsCheck := u.cache == nil || time.Since(u.cache.CheckedAt) > 24*time.Hour
+		needsCheck := u.cache == nil || time.Since(u.cache.CheckedAt) > 1*time.Hour
 		u.mu.RUnlock()
 
 		if needsCheck {
@@ -122,6 +131,8 @@ func (u *Updater) CheckForUpdates() {
 		if cache.CurrentVersion != "" && cache.LatestVersion != "" {
 			if cache.CurrentVersion != cache.LatestVersion {
 				cache.UpdateAvailable = true
+			} else {
+				cache.UpdateAvailable = false
 			}
 		}
 	}

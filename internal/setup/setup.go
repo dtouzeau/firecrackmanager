@@ -184,12 +184,17 @@ func (s *Setup) checkPrerequisites() error {
 		}
 	}
 
-	// Check iptables
+	// Check iptables - install if not found
 	if _, err := exec.LookPath("iptables"); err != nil {
-		s.addResult("iptables", false, "iptables not found", err)
-		return fmt.Errorf("iptables not found: %w", err)
+		s.logger("  iptables not found, attempting to install...")
+		if err := s.installIptables(); err != nil {
+			s.addResult("iptables", false, "Failed to install iptables", err)
+			return fmt.Errorf("iptables installation failed: %w", err)
+		}
+		s.addResult("iptables", true, "iptables installed", nil)
+	} else {
+		s.addResult("iptables", true, "iptables available", nil)
 	}
-	s.addResult("iptables", true, "iptables available", nil)
 
 	// Check curl or wget for downloads
 	hasCurl := exec.Command("which", "curl").Run() == nil
@@ -627,6 +632,52 @@ func (s *Setup) UpgradeFirecrackerWithProgress(progress ProgressCallback, versio
 	return nil
 }
 
+// installIptables installs iptables using the system package manager
+func (s *Setup) installIptables() error {
+	// Detect package manager and install iptables
+	var cmd *exec.Cmd
+
+	if _, err := exec.LookPath("apt-get"); err == nil {
+		// Debian/Ubuntu
+		s.logger("  Detected apt-get, installing iptables...")
+		// Update package list first
+		exec.Command("apt-get", "update", "-qq").Run()
+		cmd = exec.Command("apt-get", "install", "-y", "iptables")
+	} else if _, err := exec.LookPath("dnf"); err == nil {
+		// Fedora/RHEL 8+
+		s.logger("  Detected dnf, installing iptables...")
+		cmd = exec.Command("dnf", "install", "-y", "iptables")
+	} else if _, err := exec.LookPath("yum"); err == nil {
+		// CentOS/RHEL 7
+		s.logger("  Detected yum, installing iptables...")
+		cmd = exec.Command("yum", "install", "-y", "iptables")
+	} else if _, err := exec.LookPath("apk"); err == nil {
+		// Alpine
+		s.logger("  Detected apk, installing iptables...")
+		cmd = exec.Command("apk", "add", "iptables")
+	} else if _, err := exec.LookPath("pacman"); err == nil {
+		// Arch Linux
+		s.logger("  Detected pacman, installing iptables...")
+		cmd = exec.Command("pacman", "-S", "--noconfirm", "iptables")
+	} else {
+		return fmt.Errorf("no supported package manager found (apt-get, dnf, yum, apk, pacman)")
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		s.logger("  Installation output: %s", string(output))
+		return fmt.Errorf("failed to install iptables: %w", err)
+	}
+
+	// Verify installation
+	if _, err := exec.LookPath("iptables"); err != nil {
+		return fmt.Errorf("iptables not found after installation")
+	}
+
+	s.logger("  iptables installed successfully")
+	return nil
+}
+
 // createDirectories creates all required directories
 func (s *Setup) createDirectories() error {
 	s.logger("[3/10] Creating data directories...")
@@ -1046,9 +1097,14 @@ func (s *Setup) downloadFile(url, destPath string) error {
 	tmpPath := destPath + ".tmp"
 	out, err := os.Create(tmpPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create temp file %s: %w", tmpPath, err)
 	}
-	defer out.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			out.Close()
+		}
+	}()
 
 	total := resp.ContentLength
 	var downloaded int64
@@ -1081,8 +1137,26 @@ func (s *Setup) downloadFile(url, destPath string) error {
 		}
 	}
 
-	out.Close()
-	return os.Rename(tmpPath, destPath)
+	// Sync to ensure data is flushed to disk
+	if err := out.Sync(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	// Close and check for errors (important for detecting write failures)
+	if err := out.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to close file: %w", err)
+	}
+	closed = true
+
+	// Rename tmp file to final destination
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to rename %s to %s: %w", tmpPath, destPath, err)
+	}
+
+	return nil
 }
 
 // registerImages registers downloaded images in the database

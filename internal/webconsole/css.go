@@ -607,13 +607,11 @@ th {
 
 /* Badges */
 .badge {
-    display: inline-block !important;
     padding: 4px 10px;
     border-radius: 4px;
     font-size: 10px;
     font-weight: 500;
-	display: ruby;
-	min-width: 54px;
+    min-width: 54px;
 }
 .badge-success { background: #1ab394; color: #FFFFFF; border:1px solid #e8f5e9; }
 .badge-danger { background: #dc3545; color: #FFFFFF; border:1px solid #ffebee; }

@@ -266,6 +266,7 @@ func (wc *WebConsole) handleLogsPage(w http.ResponseWriter, r *http.Request) {
 func (wc *WebConsole) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	sess := wc.getSession(r)
 	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	fmt.Fprint(w, wc.baseTemplate("Settings", "settings", wc.renderSettingsPage(), sess))
 }
 
@@ -7506,7 +7507,9 @@ func (wc *WebConsole) renderSettingsPage() string {
                         <td><strong>Version:</strong></td>
                         <td>
                             <span id="fcVersion">-</span>
-                            <span id="fcUpdateBadge" class="badge badge-success" style="display: none; margin-left: 8px;">Update available</span>
+                            <span id="fcUpdateBadge" class="badge badge-success" style="display: none; margin-left: 8px; cursor: pointer;" onclick="upgradeFirecracker()" title="Click to upgrade">
+                                <span class="material-icons" style="font-size: 14px; vertical-align: middle;">upgrade</span> Update available
+                            </span>
                         </td>
                     </tr>
                     <tr><td><strong>Latest:</strong></td><td id="fcLatestVersion">-</td></tr>
@@ -7812,7 +7815,9 @@ func (wc *WebConsole) renderSettingsPage() string {
     <div class="card-header">
         <h3>Kernel Updates</h3>
         <div style="display: flex; gap: 10px; align-items: center;">
-            <span id="kernelUpdateBadge" class="badge badge-secondary" style="display: none;">Updates available</span>
+            <span id="kernelUpdateBadge" class="badge badge-success" style="display: none; cursor: pointer;" onclick="document.getElementById('availableKernelList').scrollIntoView({behavior: 'smooth'})" title="Click to view available updates">
+                <span class="material-icons" style="font-size: 14px; vertical-align: middle;">download</span> Updates available
+            </span>
             <button class="btn btn-secondary btn-sm" onclick="checkKernelUpdates(true)" id="kernelCheckBtn">
                 <span class="material-icons">refresh</span> Check Now
             </button>
@@ -8127,6 +8132,8 @@ async function checkFirecrackerUpdate() {
     } else {
         document.getElementById('fcLatestVersion').textContent = 'check failed';
         document.getElementById('fcLastChecked').textContent = '-';
+        document.getElementById('fcUpdateBadge').style.display = 'none';
+        document.getElementById('upgradeSection').style.display = 'none';
     }
 }
 
@@ -8391,10 +8398,11 @@ async function checkKernelUpdates(forceRefresh = false) {
         }
 
         // Show available versions
-        if (data.available_versions && data.available_versions.length > 0) {
+        if (data.available_kernels && data.available_kernels.length > 0) {
             let hasNewVersions = false;
             let html = '<div style="display: flex; flex-direction: column; gap: 8px;">';
-            data.available_versions.forEach(v => {
+            data.available_kernels.forEach(kernel => {
+                const v = kernel.version;
                 const isInstalled = installedKernelVersions.includes(v);
                 if (isInstalled) {
                     html += '<div style="display: flex; align-items: center; gap: 10px;">';
@@ -8404,7 +8412,7 @@ async function checkKernelUpdates(forceRefresh = false) {
                 } else {
                     hasNewVersions = true;
                     html += '<div style="display: flex; align-items: center; gap: 10px;">';
-                    html += '<span class="badge badge-warning" style="font-size: 13px;">v' + v + '</span>';
+                    html += '<span class="badge badge-success" style="font-size: 13px;">v' + v + '</span>';
                     html += '<button class="btn btn-primary btn-sm" onclick="downloadKernel(\'' + v + '\')">';
                     html += '<span class="material-icons">download</span> Download';
                     html += '</button>';
@@ -8417,12 +8425,8 @@ async function checkKernelUpdates(forceRefresh = false) {
             // Show/hide update badge
             if (hasNewVersions) {
                 badge.style.display = 'inline-block';
-                badge.className = 'badge badge-warning';
-                badge.textContent = 'New versions available';
             } else {
-                badge.style.display = 'inline-block';
-                badge.className = 'badge badge-success';
-                badge.textContent = 'Up to date';
+                badge.style.display = 'none';
             }
         } else {
             listDiv.innerHTML = '<p style="color: var(--text-secondary);">No versions found. Try checking again.</p>';
@@ -8475,13 +8479,21 @@ async function downloadKernel(version) {
                 statusP.innerHTML = '<span style="color: var(--danger);">Error: ' + progress.error + '</span>';
                 clearInterval(kernelDownloadPollInterval);
                 closeBtn.disabled = false;
-            } else if (progress.complete) {
+            } else if (progress.status === 'completed') {
                 statusP.innerHTML = '<span style="color: var(--success);">Download complete!</span>';
                 clearInterval(kernelDownloadPollInterval);
                 closeBtn.disabled = false;
                 // Refresh the lists
                 loadInstalledKernels();
                 checkKernelUpdates(false);
+                // Auto-close dialog after 1.5 seconds
+                setTimeout(() => {
+                    closeModal('kernelDownloadModal');
+                }, 1500);
+            } else if (progress.status === 'failed') {
+                statusP.innerHTML = '<span style="color: var(--danger);">Failed: ' + (progress.message || 'Unknown error') + '</span>';
+                clearInterval(kernelDownloadPollInterval);
+                closeBtn.disabled = false;
             } else {
                 statusP.textContent = progress.message || 'Downloading...';
             }

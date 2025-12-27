@@ -438,20 +438,44 @@ func (u *KernelUpdater) performDownload(jobID string, kernelInfo *KernelInfo) {
 		u.logger("Warning: Kernel %s may not have proper virtio support", kernelInfo.Version)
 	}
 
-	kernelImg := &database.KernelImage{
-		ID:            kernelID,
-		Name:          kernelName,
-		Version:       kernelInfo.Version,
-		Architecture:  "x86_64",
-		Path:          destPath,
-		Size:          fileInfo.Size(),
-		IsDefault:     false,
-		VirtioSupport: virtioSupport,
+	// Check if kernel with this name already exists
+	existingKernels, _ := u.db.ListKernelImages()
+	var existingKernel *database.KernelImage
+	for _, k := range existingKernels {
+		if k.Name == kernelName {
+			existingKernel = k
+			break
+		}
 	}
 
-	if err := u.db.CreateKernelImage(kernelImg); err != nil {
-		updateProgress("failed", 0, "Failed to register kernel", err.Error())
-		return
+	if existingKernel != nil {
+		// Update existing kernel record
+		existingKernel.Path = destPath
+		existingKernel.Size = fileInfo.Size()
+		existingKernel.VirtioSupport = virtioSupport
+		if err := u.db.UpdateKernelImage(existingKernel); err != nil {
+			updateProgress("failed", 0, "Failed to update kernel", err.Error())
+			return
+		}
+		kernelID = existingKernel.ID
+		u.logger("Kernel %s updated: %s", kernelInfo.Version, destPath)
+	} else {
+		// Create new kernel record
+		kernelImg := &database.KernelImage{
+			ID:            kernelID,
+			Name:          kernelName,
+			Version:       kernelInfo.Version,
+			Architecture:  "x86_64",
+			Path:          destPath,
+			Size:          fileInfo.Size(),
+			IsDefault:     false,
+			VirtioSupport: virtioSupport,
+		}
+
+		if err := u.db.CreateKernelImage(kernelImg); err != nil {
+			updateProgress("failed", 0, "Failed to register kernel", err.Error())
+			return
+		}
 	}
 
 	// Update progress with kernel ID
