@@ -670,17 +670,26 @@ func (wc *WebConsole) renderDashboard() string {
 	return `
 <div class="dashboard-grid">
     <!-- Virtual Machines Widget -->
-    <div class="ibox">
+    <div class="ibox" id="vmWidget">
         <div class="ibox-title">
             <h5>Virtual Machines</h5>
             <span class="label label-primary" id="vmStatusLabel">-</span>
         </div>
-        <div class="ibox-content">
+        <div class="ibox-content" id="vmWidgetContent">
             <h1 id="vmCount">-</h1>
             <div class="stat-percent text-success" id="vmRunning">- running <span class="material-icons" style="font-size: 14px; vertical-align: middle;">bolt</span></div>
             <small>Total VMs</small>
         </div>
-        <div class="ibox-footer">
+        <div class="ibox-content" id="kvmWarning" style="display: none; background: #ffebee; border-left: 4px solid #f44336; padding: 15px;">
+            <div style="display: flex; align-items: center; gap: 10px; color: #c62828;">
+                <span class="material-icons" style="font-size: 32px;">error</span>
+                <div>
+                    <strong style="font-size: 14px;">KVM device not found</strong>
+                    <p style="margin: 5px 0 0 0; font-size: 12px; color: #b71c1c;">(VMs will not run)</p>
+                </div>
+            </div>
+        </div>
+        <div class="ibox-footer" id="vmWidgetFooter">
             <canvas id="vmChart"></canvas>
         </div>
     </div>
@@ -940,6 +949,25 @@ async function loadDashboard() {
         }
 
         updateDiskProgressBar(diskPct);
+
+        // Check KVM availability and show warning if not available
+        const kvmWarning = document.getElementById('kvmWarning');
+        const vmWidgetContent = document.getElementById('vmWidgetContent');
+        const vmWidgetFooter = document.getElementById('vmWidgetFooter');
+        const vmWidget = document.getElementById('vmWidget');
+        if (sys.kvm && !sys.kvm.available) {
+            kvmWarning.style.display = 'block';
+            vmWidgetContent.style.display = 'none';
+            vmWidgetFooter.style.display = 'none';
+            vmWidget.style.borderColor = '#f44336';
+            document.getElementById('vmStatusLabel').textContent = 'Error';
+            document.getElementById('vmStatusLabel').className = 'label label-danger';
+        } else {
+            kvmWarning.style.display = 'none';
+            vmWidgetContent.style.display = 'block';
+            vmWidgetFooter.style.display = 'block';
+            vmWidget.style.borderColor = '';
+        }
     }
 
     const logsResp = await apiCall('/api/logs?limit=10');
