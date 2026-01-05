@@ -9,15 +9,19 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
+
+	"firecrackmanager/internal/database"
 )
 
 const (
-	CatalogURL      = "http://firecracker.articatech.download/index.json"
-	BaseURL         = "http://firecracker.articatech.download/"
-	RefreshInterval = 30 * time.Minute
+	CatalogURL         = "http://firecracker.articatech.download/index.json"
+	BaseURL            = "http://firecracker.articatech.download/"
+	RefreshInterval    = 30 * time.Minute
+	KernelSyncInterval = 4 * time.Hour
 )
 
 // Part represents a part of a split appliance file
@@ -39,6 +43,32 @@ type Appliance struct {
 	Parts       []Part `json:"parts"`
 }
 
+// CatalogKernel represents a kernel in the store catalog
+type CatalogKernel struct {
+	Filename     string `json:"filename"`
+	Name         string `json:"name,omitempty"` // Alternative to filename
+	Version      string `json:"version"`
+	Architecture string `json:"architecture,omitempty"`
+	URL          string `json:"url,omitempty"`
+	Size         int64  `json:"size"`
+	MD5          string `json:"md5"`
+	Description  string `json:"description,omitempty"`
+}
+
+// GetName returns the kernel filename (prefers filename over name)
+func (k CatalogKernel) GetName() string {
+	if k.Filename != "" {
+		return k.Filename
+	}
+	return k.Name
+}
+
+// FullCatalog represents the complete catalog with appliances and kernels
+type FullCatalog struct {
+	Appliances []Appliance     `json:"appliances"`
+	Kernels    []CatalogKernel `json:"kernels"`
+}
+
 // DownloadProgress tracks the progress of a download
 type DownloadProgress struct {
 	Status          string  `json:"status"` // pending, downloading, verifying, merging, completed, error
@@ -57,14 +87,17 @@ type DownloadProgress struct {
 type Store struct {
 	mu        sync.RWMutex
 	catalog   []Appliance
+	kernels   []CatalogKernel
 	lastFetch time.Time
 	dataDir   string
 	logger    func(format string, args ...interface{})
+	db        *database.DB
 
 	downloadsMu sync.RWMutex
 	downloads   map[string]*DownloadProgress
 
-	stopChan chan struct{}
+	stopChan       chan struct{}
+	kernelStopChan chan struct{}
 
 	// Callback invoked when a download completes successfully
 	onDownloadComplete func()
@@ -73,12 +106,18 @@ type Store struct {
 // New creates a new Store instance
 func New(dataDir string, logger func(format string, args ...interface{})) *Store {
 	s := &Store{
-		dataDir:   dataDir,
-		logger:    logger,
-		downloads: make(map[string]*DownloadProgress),
-		stopChan:  make(chan struct{}),
+		dataDir:        dataDir,
+		logger:         logger,
+		downloads:      make(map[string]*DownloadProgress),
+		stopChan:       make(chan struct{}),
+		kernelStopChan: make(chan struct{}),
 	}
 	return s
+}
+
+// SetDatabase sets the database for kernel registration
+func (s *Store) SetDatabase(db *database.DB) {
+	s.db = db
 }
 
 // SetOnDownloadComplete sets the callback to invoke when a download completes successfully
@@ -105,11 +144,15 @@ func (s *Store) Start() {
 			}
 		}
 	}()
+
+	// Start kernel sync (initial sync after catalog is fetched, then every 4 hours)
+	go s.startKernelSync()
 }
 
 // Stop stops the background refresh
 func (s *Store) Stop() {
 	close(s.stopChan)
+	close(s.kernelStopChan)
 }
 
 // fetchCatalog fetches the catalog from the remote server
@@ -129,8 +172,29 @@ func (s *Store) fetchCatalog() {
 		return
 	}
 
+	// Read body to try both formats
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		s.logger("Failed to read store catalog: %v", err)
+		return
+	}
+
+	// Try to parse as new format (object with appliances and kernels)
+	var fullCatalog FullCatalog
+	if err := json.Unmarshal(body, &fullCatalog); err == nil && (len(fullCatalog.Appliances) > 0 || len(fullCatalog.Kernels) > 0) {
+		s.mu.Lock()
+		s.catalog = fullCatalog.Appliances
+		s.kernels = fullCatalog.Kernels
+		s.lastFetch = time.Now()
+		s.mu.Unlock()
+
+		s.logger("Store catalog updated: %d appliances, %d kernels available", len(fullCatalog.Appliances), len(fullCatalog.Kernels))
+		return
+	}
+
+	// Fall back to old format (array of appliances)
 	var catalog []Appliance
-	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+	if err := json.Unmarshal(body, &catalog); err != nil {
 		s.logger("Failed to parse store catalog: %v", err)
 		return
 	}
@@ -532,4 +596,238 @@ func (s *Store) CleanupDownloads() {
 			delete(s.downloads, key)
 		}
 	}
+}
+
+// GetKernelsCatalog returns the current kernels catalog
+func (s *Store) GetKernelsCatalog() []CatalogKernel {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make([]CatalogKernel, len(s.kernels))
+	copy(result, s.kernels)
+	return result
+}
+
+// startKernelSync starts the kernel synchronization scheduler
+func (s *Store) startKernelSync() {
+	// Wait a bit for catalog to be fetched first
+	time.Sleep(10 * time.Second)
+
+	// Initial sync on startup (non-blocking)
+	s.syncKernels()
+
+	// Periodic sync every 4 hours
+	ticker := time.NewTicker(KernelSyncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.syncKernels()
+		case <-s.kernelStopChan:
+			return
+		}
+	}
+}
+
+// syncKernels checks remote kernels and downloads missing ones
+func (s *Store) syncKernels() {
+	if s.db == nil {
+		s.logger("Kernel sync: database not set, skipping")
+		return
+	}
+
+	s.mu.RLock()
+	kernels := make([]CatalogKernel, len(s.kernels))
+	copy(kernels, s.kernels)
+	s.mu.RUnlock()
+
+	if len(kernels) == 0 {
+		s.logger("Kernel sync: no kernels in catalog")
+		return
+	}
+
+	// Get current architecture
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "x86_64"
+	}
+
+	kernelsDir := filepath.Join(s.dataDir, "kernels")
+	if err := os.MkdirAll(kernelsDir, 0755); err != nil {
+		s.logger("Kernel sync: failed to create kernels directory: %v", err)
+		return
+	}
+
+	s.logger("Kernel sync: checking %d kernels from catalog", len(kernels))
+
+	for _, kernel := range kernels {
+		kernelName := kernel.GetName()
+		if kernelName == "" {
+			continue
+		}
+
+		// Skip kernels for different architectures
+		if kernel.Architecture != "" && kernel.Architecture != arch {
+			continue
+		}
+
+		localPath := filepath.Join(kernelsDir, kernelName)
+
+		// Check if kernel exists locally
+		if _, err := os.Stat(localPath); err == nil {
+			// Verify MD5
+			localMD5 := s.getLocalKernelMD5(localPath)
+			if localMD5 == kernel.MD5 {
+				// Kernel exists and matches, ensure it's in database
+				s.ensureKernelInDatabase(kernel, localPath)
+				continue
+			}
+			s.logger("Kernel sync: %s exists but MD5 mismatch (local=%s, remote=%s), re-downloading", kernelName, localMD5, kernel.MD5)
+		}
+
+		// Download kernel
+		s.logger("Kernel sync: downloading %s", kernelName)
+		if err := s.downloadKernel(kernel, localPath); err != nil {
+			s.logger("Kernel sync: failed to download %s: %v", kernelName, err)
+			continue
+		}
+
+		// Verify downloaded file
+		downloadedMD5 := s.getLocalKernelMD5(localPath)
+		if downloadedMD5 != kernel.MD5 {
+			s.logger("Kernel sync: MD5 verification failed for %s (expected=%s, got=%s)", kernelName, kernel.MD5, downloadedMD5)
+			os.Remove(localPath)
+			continue
+		}
+
+		// Add to database
+		if err := s.addKernelToDatabase(kernel, localPath); err != nil {
+			s.logger("Kernel sync: failed to add %s to database: %v", kernelName, err)
+			continue
+		}
+
+		s.logger("Kernel sync: successfully downloaded and registered %s", kernelName)
+	}
+
+	s.logger("Kernel sync: completed")
+}
+
+// getLocalKernelMD5 calculates the MD5 hash of a local file
+func (s *Store) getLocalKernelMD5(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// downloadKernel downloads a kernel from the catalog
+func (s *Store) downloadKernel(kernel CatalogKernel, destPath string) error {
+	url := kernel.URL
+	if url == "" {
+		url = BaseURL + "kernels/" + kernel.GetName()
+	}
+
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	// Create temp file first
+	tempPath := destPath + ".tmp"
+	out, err := os.Create(tempPath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+
+	_, err = io.Copy(out, resp.Body)
+	out.Close()
+	if err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("download failed: %w", err)
+	}
+
+	// Move to final location
+	if err := os.Rename(tempPath, destPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to rename file: %w", err)
+	}
+
+	return nil
+}
+
+// ensureKernelInDatabase ensures a kernel is registered in the database
+func (s *Store) ensureKernelInDatabase(kernel CatalogKernel, localPath string) {
+	kernelName := kernel.GetName()
+
+	// Check if already in database
+	existingKernels, err := s.db.ListKernelImages()
+	if err != nil {
+		return
+	}
+
+	for _, k := range existingKernels {
+		if k.Name == kernelName || k.Path == localPath {
+			return // Already exists
+		}
+	}
+
+	// Not in database, add it
+	s.addKernelToDatabase(kernel, localPath)
+}
+
+// addKernelToDatabase adds a kernel to the database
+func (s *Store) addKernelToDatabase(kernel CatalogKernel, localPath string) error {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat kernel: %w", err)
+	}
+
+	kernelName := kernel.GetName()
+
+	// Generate unique ID
+	hash := md5.Sum([]byte(localPath + time.Now().String()))
+	kernelID := hex.EncodeToString(hash[:])
+
+	arch := kernel.Architecture
+	if arch == "" {
+		arch = runtime.GOARCH
+		if arch == "amd64" {
+			arch = "x86_64"
+		}
+	}
+
+	kernelImg := &database.KernelImage{
+		ID:            kernelID,
+		Name:          kernelName,
+		Version:       kernel.Version,
+		Architecture:  arch,
+		Path:          localPath,
+		Size:          info.Size(),
+		Checksum:      kernel.MD5,
+		IsDefault:     false,
+		VirtioSupport: true, // Assume catalog kernels have virtio support
+		FCCompatible:  true, // Assume catalog kernels are FC compatible
+	}
+
+	return s.db.CreateKernelImage(kernelImg)
+}
+
+// TriggerKernelSync forces an immediate kernel sync
+func (s *Store) TriggerKernelSync() {
+	go s.syncKernels()
 }

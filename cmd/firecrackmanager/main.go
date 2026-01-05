@@ -19,6 +19,8 @@ import (
 	"firecrackmanager/internal/database"
 	"firecrackmanager/internal/hostnet"
 	"firecrackmanager/internal/kernel"
+	"firecrackmanager/internal/kernelbuilder"
+	"firecrackmanager/internal/kernelscanner"
 	"firecrackmanager/internal/kernelupdater"
 	"firecrackmanager/internal/network"
 	"firecrackmanager/internal/rootfs"
@@ -210,6 +212,10 @@ func main() {
 	rootfsScanner := rootfs.NewScanner(db, config.DataDir, logger)
 	rootfsScanner.Start()
 
+	// Initialize kernel compatibility scanner (background Firecracker compatibility check)
+	kernelScanner := kernelscanner.NewScanner(db, logger)
+	kernelScanner.Start()
+
 	// Initialize appliances scanner (background exported VMs cache)
 	appliancesScanner := appliances.NewScanner(config.DataDir, logger)
 	appliancesScanner.SetDescriptionGetter(vmMgr.GetApplianceDescription)
@@ -232,12 +238,13 @@ func main() {
 
 	// Initialize store (appliance store)
 	applianceStore := store.New(config.DataDir, logger)
+	applianceStore.SetDatabase(db) // Enable kernel sync from catalog
 	applianceStore.SetOnDownloadComplete(func() {
 		logger("Store download complete, refreshing appliances cache...")
 		appliancesScanner.TriggerScan()
 	})
 	applianceStore.Start()
-	logger("Appliance store initialized")
+	logger("Appliance store initialized (kernel sync enabled)")
 
 	// Initialize API server
 	apiServer := api.NewServer(db, vmMgr, netMgr, kernelMgr, upd, logger)
@@ -248,6 +255,11 @@ func main() {
 	apiServer.SetRootFSScanner(rootfsScanner)
 	apiServer.SetKernelUpdater(kernelUpd)
 	apiServer.SetAppliancesScanner(appliancesScanner)
+
+	// Initialize kernel builder for compiling custom kernels
+	kernelBld := kernelbuilder.NewBuilder(db, config.DataDir, logger)
+	apiServer.SetKernelBuilder(kernelBld)
+	logger("Kernel builder initialized")
 
 	// Initialize default admin user
 	if err := apiServer.InitDefaultAdmin(); err != nil {
@@ -381,6 +393,9 @@ func main() {
 
 	// Stop rootfs scanner
 	rootfsScanner.Stop()
+
+	// Stop kernel scanner
+	kernelScanner.Stop()
 
 	// Stop all running VMs
 	vmMgr.StopAllVMs()

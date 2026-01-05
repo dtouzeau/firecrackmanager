@@ -5542,10 +5542,16 @@ func (wc *WebConsole) renderImagesPage() string {
 <div class="card">
     <div class="card-header">
         <h3>Kernel Images</h3>
-        <button class="btn btn-primary" onclick="openModal('downloadKernelModal')">
-            <span class="material-icons">download</span>
-            Download Kernel
-        </button>
+        <div class="actions">
+            <button class="btn btn-primary" onclick="openModal('downloadKernelModal')">
+                <span class="material-icons">download</span>
+                Download Kernel
+            </button>
+            <button class="btn btn-secondary" onclick="openBuildKernelModal()" id="buildKernelBtn">
+                <span class="material-icons">build</span>
+                Build Kernel 6.x
+            </button>
+        </div>
     </div>
     <div class="card-body">
         <table>
@@ -5633,6 +5639,68 @@ func (wc *WebConsole) renderImagesPage() string {
         <div class="modal-footer">
             <button type="button" class="btn btn-secondary" onclick="closeModal('downloadKernelModal')">Cancel</button>
             <button type="button" class="btn btn-primary" onclick="downloadKernel()">Download</button>
+        </div>
+    </div>
+</div>
+
+<!-- Build Kernel Modal -->
+<div id="buildKernelModal" class="modal">
+    <div class="modal-content" style="max-width: 700px;">
+        <div class="modal-header">
+            <h3>Build Firecracker Kernel</h3>
+            <span class="material-icons modal-close" onclick="closeBuildKernelModal()">close</span>
+        </div>
+        <div class="modal-body">
+            <div id="buildKernelStart">
+                <p style="margin-bottom: 16px;">
+                    Build a Firecracker-compatible Linux 6.1 kernel from the Amazon Linux sources.
+                    This process will:
+                </p>
+                <ul style="margin-left: 20px; margin-bottom: 16px; color: var(--text-secondary);">
+                    <li>Install required build dependencies (gcc, make, etc.)</li>
+                    <li>Clone the Amazon Linux kernel repository</li>
+                    <li>Apply Firecracker microVM configuration</li>
+                    <li>Compile the kernel (this may take 15-30 minutes)</li>
+                </ul>
+                <div class="alert alert-warning" style="margin-bottom: 16px;">
+                    <span class="material-icons">warning</span>
+                    <span>This requires significant CPU and disk space (~4GB). The system may be slow during compilation.</span>
+                </div>
+            </div>
+            <div id="buildKernelProgress" style="display: none;">
+                <div style="margin-bottom: 16px;">
+                    <strong>Status:</strong> <span id="buildKernelState">Initializing...</span>
+                </div>
+                <div style="margin-bottom: 16px;">
+                    <strong>Step:</strong> <span id="buildKernelStep">-</span>
+                </div>
+                <div style="background: var(--bg-tertiary); border-radius: 8px; height: 24px; overflow: hidden; margin-bottom: 16px;">
+                    <div id="buildKernelProgressBar" style="width: 0%%; height: 100%%; background: var(--primary); transition: width 0.3s;"></div>
+                </div>
+                <div id="buildKernelPercent" style="text-align: center; margin-bottom: 16px; font-weight: 600;">0%%</div>
+                <div style="background: var(--bg-tertiary); border-radius: 8px; padding: 12px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px;">
+                    <div id="buildKernelOutput" style="white-space: pre-wrap; word-break: break-all;"></div>
+                </div>
+            </div>
+            <div id="buildKernelComplete" style="display: none;">
+                <div class="alert alert-success">
+                    <span class="material-icons">check_circle</span>
+                    <span id="buildKernelCompleteMsg">Kernel built successfully!</span>
+                </div>
+            </div>
+            <div id="buildKernelError" style="display: none;">
+                <div class="alert alert-danger">
+                    <span class="material-icons">error</span>
+                    <span id="buildKernelErrorMsg">Build failed</span>
+                </div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeBuildKernelModal()" id="buildKernelCancelBtn">Cancel</button>
+            <button type="button" class="btn btn-primary" onclick="startKernelBuild()" id="buildKernelStartBtn">
+                <span class="material-icons">play_arrow</span>
+                Start Build
+            </button>
         </div>
     </div>
 </div>
@@ -5952,9 +6020,11 @@ async function loadKernels() {
             <td>${k.version}</td>
             <td>${k.architecture}</td>
             <td>${formatBytes(k.size)}</td>
-            <td>${k.is_default
-                ? '<span class="badge badge-success">Default</span>'
-                : ` + "`" + `<span class="badge badge-secondary" style="cursor: pointer;" onclick="setDefaultKernel('${k.id}')" title="Click to set as default">Default</span>` + "`" + `}</td>
+            <td>${k.fc_compatible === false
+                ? '<span class="badge badge-danger" title="This kernel is not compatible with Firecracker (missing required virtio-mmio symbols)"><span class="material-icons" style="font-size: 12px; vertical-align: middle;">error</span> Incompatible</span>'
+                : k.is_default
+                    ? '<span class="badge badge-success">Default</span>'
+                    : ` + "`" + `<span class="badge badge-secondary" style="cursor: pointer;" onclick="setDefaultKernel('${k.id}')" title="Click to set as default">Default</span>` + "`" + `}</td>
             <td class="actions">
                 <button class="btn btn-danger btn-sm" onclick="deleteKernel('${k.id}')">
                     <span class="material-icons">delete</span>
@@ -6058,6 +6128,139 @@ async function downloadKernel() {
         setTimeout(loadKernels, 5000);
     } else {
         alert(resp.error || 'Failed to start download');
+    }
+}
+
+// Kernel Build Functions
+let kernelBuildPollInterval = null;
+
+function openBuildKernelModal() {
+    // Reset modal state
+    document.getElementById('buildKernelStart').style.display = 'block';
+    document.getElementById('buildKernelProgress').style.display = 'none';
+    document.getElementById('buildKernelComplete').style.display = 'none';
+    document.getElementById('buildKernelError').style.display = 'none';
+    document.getElementById('buildKernelStartBtn').style.display = 'inline-flex';
+    document.getElementById('buildKernelStartBtn').disabled = false;
+    document.getElementById('buildKernelCancelBtn').textContent = 'Cancel';
+    document.getElementById('buildKernelOutput').textContent = '';
+
+    openModal('buildKernelModal');
+
+    // Check if a build is already in progress
+    checkExistingBuild();
+}
+
+function closeBuildKernelModal() {
+    if (kernelBuildPollInterval) {
+        clearInterval(kernelBuildPollInterval);
+        kernelBuildPollInterval = null;
+    }
+    closeModal('buildKernelModal');
+}
+
+async function checkExistingBuild() {
+    const { ok, data } = await apiCall('/api/kernels/build');
+    if (ok && data.building && data.progress) {
+        // Resume monitoring existing build
+        showBuildProgress();
+        updateBuildProgress(data.progress);
+        startBuildPolling();
+    }
+}
+
+async function startKernelBuild() {
+    const startBtn = document.getElementById('buildKernelStartBtn');
+    startBtn.disabled = true;
+
+    const { ok, data } = await apiCall('/api/kernels/build', 'POST', { version: '6.1' });
+    if (!ok) {
+        startBtn.disabled = false;
+        alert(data.error || 'Failed to start kernel build');
+        return;
+    }
+
+    showBuildProgress();
+    startBuildPolling();
+}
+
+function showBuildProgress() {
+    document.getElementById('buildKernelStart').style.display = 'none';
+    document.getElementById('buildKernelProgress').style.display = 'block';
+    document.getElementById('buildKernelComplete').style.display = 'none';
+    document.getElementById('buildKernelError').style.display = 'none';
+    document.getElementById('buildKernelStartBtn').style.display = 'none';
+    document.getElementById('buildKernelCancelBtn').textContent = 'Close';
+}
+
+function startBuildPolling() {
+    if (kernelBuildPollInterval) {
+        clearInterval(kernelBuildPollInterval);
+    }
+
+    kernelBuildPollInterval = setInterval(async () => {
+        const { ok, data } = await apiCall('/api/kernels/build/status');
+        if (!ok || !data || data.building === false) {
+            clearInterval(kernelBuildPollInterval);
+            kernelBuildPollInterval = null;
+            return;
+        }
+
+        if (data.state) {
+            updateBuildProgress(data);
+        } else if (data.progress) {
+            updateBuildProgress(data.progress);
+        }
+    }, 2000);
+}
+
+function updateBuildProgress(progress) {
+    const stateSpan = document.getElementById('buildKernelState');
+    const stepSpan = document.getElementById('buildKernelStep');
+    const progressBar = document.getElementById('buildKernelProgressBar');
+    const percentDiv = document.getElementById('buildKernelPercent');
+    const outputDiv = document.getElementById('buildKernelOutput');
+
+    // Update state display
+    const stateLabels = {
+        'pending': 'Pending',
+        'installing_deps': 'Installing Dependencies',
+        'cloning_repo': 'Cloning Repository',
+        'configuring': 'Configuring Kernel',
+        'compiling': 'Compiling',
+        'completed': 'Completed',
+        'failed': 'Failed'
+    };
+    stateSpan.textContent = stateLabels[progress.state] || progress.state;
+    stepSpan.textContent = progress.current_step || '-';
+
+    // Update progress bar
+    progressBar.style.width = progress.progress + '%%';
+    percentDiv.textContent = progress.progress + '%%';
+
+    // Update output (last 20 lines)
+    if (progress.output && progress.output.length > 0) {
+        const lastLines = progress.output.slice(-20);
+        outputDiv.textContent = lastLines.join('\n');
+        outputDiv.scrollTop = outputDiv.scrollHeight;
+    }
+
+    // Handle completion
+    if (progress.state === 'completed') {
+        clearInterval(kernelBuildPollInterval);
+        kernelBuildPollInterval = null;
+        document.getElementById('buildKernelProgress').style.display = 'none';
+        document.getElementById('buildKernelComplete').style.display = 'block';
+        document.getElementById('buildKernelCompleteMsg').textContent =
+            'Kernel built successfully! Path: ' + (progress.kernel_path || 'kernels/vmlinux-6.1-fc.bin');
+        loadKernels(); // Refresh kernel list
+    } else if (progress.state === 'failed') {
+        clearInterval(kernelBuildPollInterval);
+        kernelBuildPollInterval = null;
+        document.getElementById('buildKernelProgress').style.display = 'none';
+        document.getElementById('buildKernelError').style.display = 'block';
+        document.getElementById('buildKernelErrorMsg').textContent =
+            'Build failed: ' + (progress.error || 'Unknown error');
     }
 }
 

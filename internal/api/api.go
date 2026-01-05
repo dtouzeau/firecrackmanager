@@ -25,6 +25,7 @@ import (
 	"firecrackmanager/internal/database"
 	"firecrackmanager/internal/hostnet"
 	"firecrackmanager/internal/kernel"
+	"firecrackmanager/internal/kernelbuilder"
 	"firecrackmanager/internal/kernelupdater"
 	"firecrackmanager/internal/ldap"
 	"firecrackmanager/internal/network"
@@ -77,6 +78,7 @@ type Server struct {
 	upgradeProgressMu           sync.RWMutex
 	ldapClient                  *ldap.Client
 	ldapClientMu                sync.RWMutex
+	kernelBuilder               *kernelbuilder.Builder
 }
 
 // RootFSScanner interface for triggering rootfs scans
@@ -125,6 +127,11 @@ func (s *Server) SetKernelUpdater(ku *kernelupdater.KernelUpdater) {
 // SetAppliancesScanner sets the appliances scanner for exported VMs cache
 func (s *Server) SetAppliancesScanner(scanner AppliancesScanner) {
 	s.appliancesScanner = scanner
+}
+
+// SetKernelBuilder sets the kernel builder for compiling custom kernels
+func (s *Server) SetKernelBuilder(kb *kernelbuilder.Builder) {
+	s.kernelBuilder = kb
 }
 
 // GetBuilderDir returns the current builder directory
@@ -179,6 +186,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/kernels/", s.requirePermission("images", s.handleKernel))
 	s.mux.HandleFunc("/api/kernels/download", s.requirePermission("images", s.handleKernelDownload))
 	s.mux.HandleFunc("/api/kernels/rescan-virtio", s.requireAdmin(s.handleKernelRescanVirtio))
+	s.mux.HandleFunc("/api/kernels/build", s.requireAdmin(s.handleKernelBuild))
+	s.mux.HandleFunc("/api/kernels/build/", s.requireAuth(s.handleKernelBuildProgress))
 
 	// RootFS routes (requires images permission)
 	s.mux.HandleFunc("/api/rootfs", s.requirePermission("images", s.handleRootFSList))
@@ -3380,6 +3389,111 @@ func (s *Server) handleKernelRescanVirtio(w http.ResponseWriter, r *http.Request
 		"message": fmt.Sprintf("Rescanned %d kernels, %d updated", len(kernels), updated),
 		"results": results,
 	})
+}
+
+// handleKernelBuild starts or gets status of a kernel build
+func (s *Server) handleKernelBuild(w http.ResponseWriter, r *http.Request) {
+	if s.kernelBuilder == nil {
+		s.jsonError(w, "Kernel builder not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		// Get current build status
+		if progress := s.kernelBuilder.GetActiveBuild(); progress != nil {
+			s.jsonResponse(w, map[string]interface{}{
+				"building": true,
+				"progress": progress,
+			})
+		} else {
+			s.jsonResponse(w, map[string]interface{}{
+				"building": false,
+				"versions": s.kernelBuilder.GetSupportedVersions(),
+			})
+		}
+
+	case http.MethodPost:
+		// Start a new build
+		if s.kernelBuilder.IsBuilding() {
+			s.jsonError(w, "A build is already in progress", http.StatusConflict)
+			return
+		}
+
+		var req struct {
+			Version string `json:"version"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			// Default to 6.1 if no version specified
+			req.Version = "6.1"
+		}
+
+		// Validate version
+		validVersion := false
+		for _, v := range s.kernelBuilder.GetSupportedVersions() {
+			if v == req.Version {
+				validVersion = true
+				break
+			}
+		}
+		if !validVersion {
+			s.jsonError(w, fmt.Sprintf("Unsupported kernel version: %s", req.Version), http.StatusBadRequest)
+			return
+		}
+
+		progress, err := s.kernelBuilder.StartBuild(req.Version)
+		if err != nil {
+			s.jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.logger("Started kernel build: version=%s, id=%s", req.Version, progress.ID)
+		s.jsonResponse(w, map[string]interface{}{
+			"status":   "started",
+			"build_id": progress.ID,
+			"version":  req.Version,
+		})
+
+	default:
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleKernelBuildProgress returns progress of a specific build
+func (s *Server) handleKernelBuildProgress(w http.ResponseWriter, r *http.Request) {
+	if s.kernelBuilder == nil {
+		s.jsonError(w, "Kernel builder not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		s.jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract build ID from path: /api/kernels/build/{id}
+	path := strings.TrimPrefix(r.URL.Path, "/api/kernels/build/")
+	buildID := strings.TrimSuffix(path, "/")
+
+	if buildID == "" || buildID == "status" {
+		// Return active build status
+		if progress := s.kernelBuilder.GetActiveBuild(); progress != nil {
+			s.jsonResponse(w, progress)
+		} else {
+			s.jsonResponse(w, map[string]interface{}{
+				"building": false,
+			})
+		}
+		return
+	}
+
+	progress := s.kernelBuilder.GetBuildProgress(buildID)
+	if progress == nil {
+		s.jsonError(w, "Build not found", http.StatusNotFound)
+		return
+	}
+
+	s.jsonResponse(w, progress)
 }
 
 // RootFS handlers

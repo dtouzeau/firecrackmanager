@@ -91,6 +91,9 @@ type KernelImage struct {
 	Checksum      string    `json:"checksum"`
 	IsDefault     bool      `json:"is_default"`
 	VirtioSupport bool      `json:"virtio_support"` // true if kernel has virtio drivers built-in
+	FCCompatible  bool      `json:"fc_compatible"`  // true if kernel is Firecracker compatible (DMA, virtio-mmio)
+	VirtioSymbols int       `json:"virtio_symbols"` // count of virtio-related symbols in kernel
+	ScannedAt     time.Time `json:"scanned_at"`     // when compatibility was last checked
 	CreatedAt     time.Time `json:"created_at"`
 }
 
@@ -339,6 +342,9 @@ func (d *DB) migrate() error {
 			checksum TEXT,
 			is_default BOOLEAN DEFAULT 0,
 			virtio_support BOOLEAN DEFAULT 1,
+			fc_compatible BOOLEAN DEFAULT 1,
+			virtio_symbols INTEGER DEFAULT 0,
+			scanned_at DATETIME,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS rootfs (
@@ -613,6 +619,10 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_appliance_privileges_group ON appliance_privileges(group_id)`,
 		// Migration: Add virtio_support column to kernel_images table
 		`ALTER TABLE kernel_images ADD COLUMN virtio_support BOOLEAN DEFAULT 1`,
+		// Migration: Add Firecracker compatibility columns to kernel_images table
+		`ALTER TABLE kernel_images ADD COLUMN fc_compatible BOOLEAN DEFAULT 1`,
+		`ALTER TABLE kernel_images ADD COLUMN virtio_symbols INTEGER DEFAULT 0`,
+		`ALTER TABLE kernel_images ADD COLUMN scanned_at DATETIME`,
 		// Migration: Add SSH detection columns to rootfs table
 		`ALTER TABLE rootfs ADD COLUMN ssh_installed BOOLEAN DEFAULT 0`,
 		`ALTER TABLE rootfs ADD COLUMN ssh_version TEXT DEFAULT ''`,
@@ -955,9 +965,9 @@ func (d *DB) CreateKernelImage(img *KernelImage) error {
 	}
 
 	_, err := d.db.Exec(`
-		INSERT INTO kernel_images (id, name, version, architecture, path, size, checksum, is_default, virtio_support)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		img.ID, img.Name, img.Version, img.Architecture, img.Path, img.Size, img.Checksum, img.IsDefault, img.VirtioSupport)
+		INSERT INTO kernel_images (id, name, version, architecture, path, size, checksum, is_default, virtio_support, fc_compatible, virtio_symbols, scanned_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		img.ID, img.Name, img.Version, img.Architecture, img.Path, img.Size, img.Checksum, img.IsDefault, img.VirtioSupport, img.FCCompatible, img.VirtioSymbols, img.ScannedAt)
 	return err
 }
 
@@ -970,9 +980,9 @@ func (d *DB) UpdateKernelImage(img *KernelImage) error {
 	}
 
 	_, err := d.db.Exec(`
-		UPDATE kernel_images SET name = ?, version = ?, architecture = ?, path = ?, size = ?, checksum = ?, is_default = ?, virtio_support = ?
+		UPDATE kernel_images SET name = ?, version = ?, architecture = ?, path = ?, size = ?, checksum = ?, is_default = ?, virtio_support = ?, fc_compatible = ?, virtio_symbols = ?, scanned_at = ?
 		WHERE id = ?`,
-		img.Name, img.Version, img.Architecture, img.Path, img.Size, img.Checksum, img.IsDefault, img.VirtioSupport, img.ID)
+		img.Name, img.Version, img.Architecture, img.Path, img.Size, img.Checksum, img.IsDefault, img.VirtioSupport, img.FCCompatible, img.VirtioSymbols, img.ScannedAt, img.ID)
 	return err
 }
 
@@ -981,12 +991,16 @@ func (d *DB) GetKernelImage(id string) (*KernelImage, error) {
 	defer d.mu.RUnlock()
 
 	img := &KernelImage{}
+	var scannedAt sql.NullTime
 	err := d.db.QueryRow(`
-		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), created_at
+		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), COALESCE(fc_compatible, 1), COALESCE(virtio_symbols, 0), scanned_at, created_at
 		FROM kernel_images WHERE id = ?`, id).Scan(
-		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.CreatedAt)
+		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.FCCompatible, &img.VirtioSymbols, &scannedAt, &img.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
+	}
+	if scannedAt.Valid {
+		img.ScannedAt = scannedAt.Time
 	}
 	return img, err
 }
@@ -996,12 +1010,16 @@ func (d *DB) GetKernelByPath(path string) (*KernelImage, error) {
 	defer d.mu.RUnlock()
 
 	img := &KernelImage{}
+	var scannedAt sql.NullTime
 	err := d.db.QueryRow(`
-		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), created_at
+		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), COALESCE(fc_compatible, 1), COALESCE(virtio_symbols, 0), scanned_at, created_at
 		FROM kernel_images WHERE path = ?`, path).Scan(
-		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.CreatedAt)
+		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.FCCompatible, &img.VirtioSymbols, &scannedAt, &img.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
+	}
+	if scannedAt.Valid {
+		img.ScannedAt = scannedAt.Time
 	}
 	return img, err
 }
@@ -1011,12 +1029,16 @@ func (d *DB) GetDefaultKernel() (*KernelImage, error) {
 	defer d.mu.RUnlock()
 
 	img := &KernelImage{}
+	var scannedAt sql.NullTime
 	err := d.db.QueryRow(`
-		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), created_at
+		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), COALESCE(fc_compatible, 1), COALESCE(virtio_symbols, 0), scanned_at, created_at
 		FROM kernel_images WHERE is_default = 1 LIMIT 1`).Scan(
-		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.CreatedAt)
+		&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.FCCompatible, &img.VirtioSymbols, &scannedAt, &img.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
+	}
+	if scannedAt.Valid {
+		img.ScannedAt = scannedAt.Time
 	}
 	return img, err
 }
@@ -1026,7 +1048,7 @@ func (d *DB) ListKernelImages() ([]*KernelImage, error) {
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), created_at
+		SELECT id, name, version, architecture, path, size, COALESCE(checksum, ''), is_default, COALESCE(virtio_support, 1), COALESCE(fc_compatible, 1), COALESCE(virtio_symbols, 0), scanned_at, created_at
 		FROM kernel_images ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -1036,8 +1058,12 @@ func (d *DB) ListKernelImages() ([]*KernelImage, error) {
 	var imgs []*KernelImage
 	for rows.Next() {
 		img := &KernelImage{}
-		if err := rows.Scan(&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.CreatedAt); err != nil {
+		var scannedAt sql.NullTime
+		if err := rows.Scan(&img.ID, &img.Name, &img.Version, &img.Architecture, &img.Path, &img.Size, &img.Checksum, &img.IsDefault, &img.VirtioSupport, &img.FCCompatible, &img.VirtioSymbols, &scannedAt, &img.CreatedAt); err != nil {
 			return nil, err
+		}
+		if scannedAt.Valid {
+			img.ScannedAt = scannedAt.Time
 		}
 		imgs = append(imgs, img)
 	}
@@ -1050,6 +1076,16 @@ func (d *DB) UpdateKernelVirtioSupport(id string, hasSupport bool) error {
 	defer d.mu.Unlock()
 
 	_, err := d.db.Exec("UPDATE kernel_images SET virtio_support = ? WHERE id = ?", hasSupport, id)
+	return err
+}
+
+// UpdateKernelCompatibility updates the Firecracker compatibility fields for a kernel
+func (d *DB) UpdateKernelCompatibility(id string, fcCompatible bool, virtioSymbols int, scannedAt time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec("UPDATE kernel_images SET fc_compatible = ?, virtio_symbols = ?, scanned_at = ? WHERE id = ?",
+		fcCompatible, virtioSymbols, scannedAt, id)
 	return err
 }
 
